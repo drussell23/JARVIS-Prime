@@ -1,0 +1,23 @@
+{
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Darwin",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportMissingTypeStubs": false,
+  "useLibraryCodeForTypes": true,
+  "include": [
+    "jarvis_prime",
+    "examples"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "*.egg-info"
+  ]
+}
