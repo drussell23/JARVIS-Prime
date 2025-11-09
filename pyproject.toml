@@ -140,3 +140,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+env = [
+    "TRANSFORMERS_NO_TF=1",
+]
