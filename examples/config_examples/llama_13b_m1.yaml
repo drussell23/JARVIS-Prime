@@ -1,0 +1,116 @@
+# Llama-2-13B Configuration for M1 Mac 16GB Inference
+# Load with: LlamaModelConfig.from_yaml("config_examples/llama_13b_m1.yaml")
+
+# Model identity
+model_name: meta-llama/Llama-2-13b-hf
+model_type: llama
+variant: 13b
+
+# Device settings (M1 Mac)
+device: mps
+device_map: auto
+
+# Dataset (not used for inference)
+dataset_path: null
+dataset_split: train
+max_seq_length: 4096
+
+# Output
+output_dir: ./outputs/llama-13b-inference
+model_save_name: null
+
+# Quantization (8-bit for M1 Mac 16GB)
+quantization:
+  enabled: true
+  bits: 8
+  quant_type: nf4
+  use_double_quant: true
+  compute_dtype: float16
+
+# LoRA (not used for inference, but can load adapters)
+lora:
+  enabled: false
+  rank: 64
+  alpha: 128
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  bias: none
+  task_type: CAUSAL_LM
+
+# Training (not used for inference)
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0002
+  warmup_ratio: 0.03
+  num_epochs: 1
+  max_steps: -1
+  optimizer: adamw_torch
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler_type: cosine
+  gradient_checkpointing: false
+  mixed_precision: no
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  save_total_limit: 1
+  group_by_length: false
+  dataloader_num_workers: 2
+  seed: 42
+
+# Inference settings (optimized for M1)
+inference:
+  max_length: 2048
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.15
+  do_sample: true
+  num_return_sequences: 1
+
+  # Batching (smaller for M1)
+  batch_size: 4
+  max_batch_size: 8
+
+  # Async (enabled for responsive UI)
+  async_enabled: true
+  max_concurrent_requests: 50
+  timeout_seconds: 30.0
+
+# Checkpointing (disabled for inference)
+checkpoint:
+  enabled: false
+  checkpoint_dir: ./checkpoints
+  save_frequency_steps: 1000
+  save_frequency_minutes: 60
+  max_checkpoints: 1
+  preemption_check_interval: 60
+  preemption_signal_file: /tmp/preemption_signal
+  auto_resume: false
+
+# Monitoring (minimal for inference)
+monitoring:
+  # Weights & Biases (disabled)
+  wandb_enabled: false
+  wandb_project: jarvis-prime
+  wandb_entity: null
+  wandb_run_name: null
+
+  # TensorBoard (disabled)
+  tensorboard_enabled: false
+  tensorboard_dir: ./runs
+
+  # Metrics (basic tracking)
+  track_memory: true
+  track_gpu_utilization: false
+  track_throughput: false
+
+  # Alerts
+  alert_on_nan: false
+  alert_on_high_loss: false
+  high_loss_threshold: 10.0

@@ -1,0 +1,129 @@
+# Llama-2-13B Configuration for GCP 32GB Spot VM Training
+# Load with: LlamaModelConfig.from_yaml("config_examples/llama_13b_gcp.yaml")
+
+# Model identity
+model_name: meta-llama/Llama-2-13b-hf
+model_type: llama
+variant: 13b
+
+# Device settings
+device: auto
+device_map: auto
+
+# Dataset
+dataset_path: ./data/jarvis_conversations.jsonl
+dataset_split: train
+max_seq_length: 4096
+
+# Output
+output_dir: ./outputs/llama-13b-jarvis
+model_save_name: llama-13b-jarvis-v1
+
+# Quantization (4-bit for 32GB RAM)
+quantization:
+  enabled: true
+  bits: 4
+  quant_type: nf4
+  use_double_quant: true
+  compute_dtype: bfloat16
+
+# LoRA configuration
+lora:
+  enabled: true
+  rank: 64
+  alpha: 128
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none
+  task_type: CAUSAL_LM
+
+# Training hyperparameters
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0002
+  warmup_ratio: 0.03
+  num_epochs: 3
+  max_steps: -1
+
+  # Optimization
+  optimizer: adamw_torch
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler_type: cosine
+
+  # Memory optimization
+  gradient_checkpointing: true
+  mixed_precision: bf16
+
+  # Logging
+  logging_steps: 10
+  save_steps: 100
+  eval_steps: 100
+  save_total_limit: 3
+
+  # Advanced
+  group_by_length: true
+  dataloader_num_workers: 4
+  seed: 42
+
+# Inference settings
+inference:
+  max_length: 2048
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.15
+  do_sample: true
+  num_return_sequences: 1
+
+  # Batching
+  batch_size: 8
+  max_batch_size: 32
+
+  # Async
+  async_enabled: true
+  max_concurrent_requests: 100
+  timeout_seconds: 30.0
+
+# Checkpointing (critical for Spot VMs!)
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./checkpoints
+  save_frequency_steps: 500
+  save_frequency_minutes: 30
+  max_checkpoints: 5
+
+  # GCP Spot VM settings
+  preemption_check_interval: 60
+  preemption_signal_file: /tmp/preemption_signal
+  auto_resume: true
+
+# Monitoring
+monitoring:
+  # Weights & Biases
+  wandb_enabled: true
+  wandb_project: jarvis-prime
+  wandb_entity: null
+  wandb_run_name: llama-13b-qlora-gcp
+
+  # TensorBoard
+  tensorboard_enabled: true
+  tensorboard_dir: ./runs
+
+  # Metrics
+  track_memory: true
+  track_gpu_utilization: true
+  track_throughput: true
+
+  # Alerts
+  alert_on_nan: true
+  alert_on_high_loss: true
+  high_loss_threshold: 10.0

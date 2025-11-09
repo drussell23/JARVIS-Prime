@@ -1,8 +1,10 @@
 # JARVIS Prime
 
-**Specialized PRIME Models for JARVIS AI Assistant**
+**Advanced LLM Training & Inference Platform**
 
-JARVIS Prime provides trained, optimized language models specifically designed for the JARVIS ecosystem. Built on [Reactor Core](https://github.com/drussell23/reactor-core), it delivers production-ready models for reasoning, chat, and multimodal interactions.
+🚀 Production-ready Llama-2-13B | ⚡ Zero Hardcoding | 🔥 Async by Default | 🎯 QLoRA, DPO, RLHF
+
+JARVIS Prime provides a **robust, dynamic, and async** platform for training and deploying large language models. Train on **GCP 32GB Spot VMs** with automatic recovery, deploy to **M1 Mac 16GB** with optimized inference.
 
 ## What is JARVIS Prime?
 
@@ -34,51 +36,84 @@ pip install jarvis-prime
 pip install jarvis-prime[training]
 ```
 
+## ✨ Key Features
+
+- **🎯 Advanced Llama-2-13B** - Production-ready implementation with QLoRA, DPO, RLHF
+- **⚡ Zero Hardcoding** - All configuration from YAML/JSON/environment variables
+- **🔥 Async by Default** - Concurrent inference with automatic batching
+- **💾 GCP Spot VM Recovery** - Automatic checkpointing and preemption handling
+- **📊 Monitoring Built-in** - W&B, TensorBoard, memory tracking
+- **🎨 Dynamic Configuration** - Load from files, environment, or presets
+- **🚀 M1 Mac Optimized** - Efficient 8-bit inference on 16GB
+
 ## Quick Start
 
-### Using Pre-trained Models
+### 🎓 Training on GCP 32GB (4-bit QLoRA)
 
 ```python
-from jarvis_prime import PrimeModel
+from jarvis_prime.configs import LlamaPresets
+from jarvis_prime.trainer import LlamaTrainer
 
-# Load quantized model for M1 Mac
-model = PrimeModel.from_pretrained(
-    "prime-7b-chat-v1",
-    quantization="8bit",  # 4bit, 8bit, or None
-    device="mps"  # auto-detected
+# Load optimized preset
+config = LlamaPresets.llama_13b_gcp_training()
+config.dataset_path = "./data/jarvis_conversations.jsonl"
+config.output_dir = "./outputs/llama-13b-jarvis"
+
+# Train with automatic checkpointing
+trainer = LlamaTrainer(config)
+trainer.train()
+# ✅ Auto-saves every 30 minutes for Spot VM recovery
+```
+
+**Memory: 6.5GB** with 4-bit quantization ✅
+
+### 💬 Inference on M1 Mac 16GB (8-bit)
+
+```python
+from jarvis_prime.models import load_llama_13b_m1
+
+# Load optimized for M1
+model = load_llama_13b_m1()
+
+# Generate
+response = model.generate(
+    "What is artificial intelligence?",
+    max_length=512,
+    temperature=0.7
 )
-
-# Generate response
-response = model.generate("What is machine learning?")
 print(response)
 ```
 
-### Training Custom PRIME Models
+**Memory: ~13GB** with 8-bit quantization ✅
+
+### ⚡ Async Concurrent Inference
 
 ```python
-from jarvis_prime import PrimeTrainer
-from jarvis_prime.configs import Prime7BChatConfig
+import asyncio
 
-# Configure training
-config = Prime7BChatConfig(
-    base_model="meta-llama/Llama-2-7b-hf",
-    use_lora=True,
-    lora_rank=16,
-    num_epochs=3,
-)
-
-# Train on GCP
-trainer = PrimeTrainer(config)
-trainer.train("./data/jarvis_conversations.jsonl")
+# Concurrent requests
+prompts = ["Explain AI", "What is ML?", "How do transformers work?"]
+tasks = [model.generate_async(p) for p in prompts]
+responses = await asyncio.gather(*tasks)
 ```
 
-## Available Models
+### 🎯 Advanced Training (DPO)
 
-| Model | Size | Use Case | Quantization | M1 Compatible |
-|-------|------|----------|--------------|---------------|
-| prime-7b-chat-v1 | 7B | Chat, Q&A | 4bit/8bit | ✅ |
-| prime-7b-vision-v1 | 7B | Vision + Text | 8bit | ✅ |
-| prime-13b-reasoning-v1 | 13B | Complex reasoning | 8bit | ⚠️ (slow) |
+```python
+# Direct Preference Optimization
+trainer.train_dpo(
+    preference_dataset_path="Anthropic/hh-rlhf",
+    beta=0.1
+)
+```
+
+## 📊 Memory Requirements
+
+| Model | Full Precision | 8-bit | 4-bit (QLoRA) | Recommended |
+|-------|----------------|-------|---------------|-------------|
+| Llama-2-7B | 28 GB | 7 GB | **3.5 GB** ✅ | GCP/M1 |
+| Llama-2-13B | 52 GB | 13 GB | **6.5 GB** ✅ | GCP training, M1 inference |
+| Mistral-7B | 28 GB | 7 GB | **3.5 GB** ✅ | Fast alternative |
 
 ## Environment Support
 
@@ -114,25 +149,47 @@ Example model configs in `jarvis_prime/configs/`:
 - `prime_7b_vision_v1.yaml` - Multimodal model
 - `prime_13b_reasoning_v1.yaml` - Advanced reasoning
 
-## Training Your Own PRIME Model
+## 🎨 Configuration System
+
+### Three Ways to Configure (Zero Hardcoding!)
+
+#### 1️⃣ **Presets** (Recommended)
+
+```python
+from jarvis_prime.configs import LlamaPresets
+
+config = LlamaPresets.llama_13b_gcp_training()  # GCP 32GB
+config = LlamaPresets.llama_13b_m1_inference()   # M1 Mac 16GB
+config = LlamaPresets.llama_7b_fast_training()   # Quick iteration
+```
+
+#### 2️⃣ **YAML/JSON Files**
+
+```python
+from jarvis_prime.configs import LlamaModelConfig
+
+config = LlamaModelConfig.from_yaml("configs/llama_13b_gcp.yaml")
+config = LlamaModelConfig.from_json("configs/llama_13b.json")
+```
+
+#### 3️⃣ **Environment Variables**
 
 ```bash
-# 1. Prepare training data
-python -m jarvis_prime.data.prepare_dataset \
-    --input ./jarvis_logs/ \
-    --output ./data/jarvis_train.jsonl
+export JARVIS_MODEL_NAME="meta-llama/Llama-2-13b-hf"
+export JARVIS_QUANT_BITS=4
+export JARVIS_BATCH_SIZE=4
+export JARVIS_DATASET_PATH="./data/train.jsonl"
+```
 
-# 2. Train on GCP Spot VM (auto-resume enabled)
-python -m jarvis_prime.train \
-    --config configs/prime_7b_chat_v1.yaml \
-    --data ./data/jarvis_train.jsonl \
-    --output ./models/prime-7b-jarvis-custom
+```python
+config = LlamaModelConfig.from_env()
+```
 
-# 3. Export quantized version for M1
-python -m jarvis_prime.quantize \
-    --model ./models/prime-7b-jarvis-custom \
-    --bits 8 \
-    --output ./models/prime-7b-jarvis-custom-8bit
+### 💾 Save Configuration
+
+```python
+config.save_yaml("my_config.yaml")
+config.save_json("my_config.json")
 ```
 
 ## Version Compatibility
@@ -160,11 +217,31 @@ python -m jarvis_prime.quantize \
 
 MIT License
 
-## Links
+## 📚 Documentation
+
+- **[LLAMA_13B_GUIDE.md](LLAMA_13B_GUIDE.md)** - Complete Llama-2-13B implementation guide
+- **[ADVANCED_LLM_INTEGRATION.md](ADVANCED_LLM_INTEGRATION.md)** - LLM library integration details
+- **[examples/](examples/)** - Training and inference examples
+- **[examples/config_examples/](examples/config_examples/)** - YAML configuration templates
+
+## 🔗 Links
 
 - **Reactor Core**: https://github.com/drussell23/reactor-core
 - **JARVIS**: https://github.com/drussell23/JARVIS-AI-Agent
-- **Model Hub**: Coming soon
+
+## 🏆 Summary
+
+JARVIS Prime v0.6.0 delivers:
+
+✅ **Production-ready Llama-2-13B** - Advanced, robust, async
+✅ **Zero hardcoding** - Fully configurable via YAML/JSON/env
+✅ **QLoRA, DPO, RLHF** - State-of-the-art training techniques
+✅ **GCP Spot VM recovery** - Auto-checkpointing and resume
+✅ **M1 Mac optimized** - Efficient 8-bit inference
+✅ **Async by default** - High-performance concurrent inference
+✅ **Monitoring built-in** - W&B, TensorBoard, metrics
+
+**Ready to train on 32GB GCP Spot VMs and deploy to 16GB M1 Mac! 🚀**
 
 ---
 
