@@ -24,33 +24,83 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-    "peft>=0.5.0",
-    "accelerate>=0.20.0",
-    "bitsandbytes>=0.41.0",  # Quantization
-    "safetensors>=0.3.1",
+    # Core LLM framework
+    "torch>=2.1.0",
+    "transformers>=4.35.0",
+
+    # Efficient fine-tuning
+    "peft>=0.7.0",  # LoRA, QLoRA
+    "bitsandbytes>=0.41.0",  # 4-bit/8-bit quantization
+    "accelerate>=0.25.0",  # Distributed training
+
+    # Data processing
+    "datasets>=2.15.0",
+    "tokenizers>=0.15.0",
+
+    # Utilities
+    "safetensors>=0.4.0",
+    "sentencepiece>=0.1.99",
+    "protobuf>=3.20.0",
     "pyyaml>=6.0",
     "tqdm>=4.65.0",
 ]
 
 [project.optional-dependencies]
+# GCP Training (32GB Spot VM)
 training = [
     "reactor-core>=1.0.0",  # Training engine
-    "datasets>=2.12.0",
-    "wandb>=0.15.0",
+    "trl>=0.7.0",  # DPO, RLHF, PPO
+    "wandb>=0.16.0",  # Experiment tracking
+    "tensorboard>=2.15.0",  # Visualization
 ]
 
+# Multi-modal (Vision + Language)
+multimodal = [
+    "torchvision>=0.16.0",
+    "pillow>=10.0.0",
+]
+
+# Fast inference (M1 Mac 16GB)
+fast_inference = [
+    "vllm>=0.2.7",  # Ultra-fast inference
+    "llama-cpp-python>=0.2.0",  # GGML/GGUF for CPU/M1
+    "auto-gptq>=0.5.0",  # GPTQ quantization
+]
+
+# LLM applications
+applications = [
+    "langchain>=0.1.0",  # LLM chains
+    "llama-index>=0.9.0",  # RAG framework
+]
+
+# Speed optimizations
+speed = [
+    "flash-attn>=2.3.0",  # Faster attention (requires CUDA)
+]
+
+# Development tools
 dev = [
     "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
     "black>=23.7.0",
     "isort>=5.12.0",
     "mypy>=1.4.0",
     "ruff>=0.0.280",
 ]
 
+# Full installation (GCP VM)
+gcp = [
+    "jarvis-prime[training,multimodal,applications,speed]",
+]
+
+# M1 Mac installation (lightweight)
+local = [
+    "jarvis-prime[fast_inference,applications]",
+]
+
+# Everything
 all = [
-    "jarvis-prime[training,dev]",
+    "jarvis-prime[training,multimodal,fast_inference,applications,speed,dev]",
 ]
 
 [project.urls]
