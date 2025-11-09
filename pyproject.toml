@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-prime"
+version = "0.6.0"
+description = "Specialized PRIME models for JARVIS AI Assistant"
+authors = [
+    {name = "Derek Russell", email = "derek@example.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "peft>=0.5.0",
+    "accelerate>=0.20.0",
+    "bitsandbytes>=0.41.0",  # Quantization
+    "safetensors>=0.3.1",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+training = [
+    "reactor-core>=1.0.0",  # Training engine
+    "datasets>=2.12.0",
+    "wandb>=0.15.0",
+]
+
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "mypy>=1.4.0",
+    "ruff>=0.0.280",
+]
+
+all = [
+    "jarvis-prime[training,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/drussell23/jarvis-prime"
+Repository = "https://github.com/drussell23/jarvis-prime"
+Documentation = "https://github.com/drussell23/jarvis-prime#readme"
+"Bug Tracker" = "https://github.com/drussell23/jarvis-prime/issues"
+"Reactor Core" = "https://github.com/drussell23/reactor-core"
+"JARVIS" = "https://github.com/drussell23/JARVIS-AI-Agent"
+
+[tool.setuptools]
+packages = ["jarvis_prime"]
+
+[tool.setuptools.package-data]
+jarvis_prime = ["py.typed", "configs/*.yaml"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
