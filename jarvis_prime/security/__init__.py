@@ -10,6 +10,19 @@ depend directly on Tiny Prime's internals when desired.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+# Pylance/static analyzers: `__all__` + `__getattr__` lazy exports.
+if TYPE_CHECKING:
+    from typing import Any
+
+    check_semantic_security: Any
+    check_semantic_security_async: Any
+    get_semantic_guard: Any
+    IntentResult: Any
+    TinyPrimeGuard: Any
+    TinyPrimeConfig: Any
+
 
 def __getattr__(name: str):
     # Lazy to avoid importing heavy ML deps at import time.

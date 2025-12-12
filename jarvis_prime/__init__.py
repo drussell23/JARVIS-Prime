@@ -2,7 +2,33 @@
 JARVIS Prime - Specialized PRIME Models for JARVIS
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 __version__ = "0.6.0"
+
+# Static analyzers (e.g. Pylance) don't infer exports provided via `__getattr__`.
+# Declare type-check-only stubs so names in `__all__` are considered present,
+# without importing heavy ML dependencies at runtime.
+if TYPE_CHECKING:
+    from typing import Any
+
+    PrimeModel: Any
+    PrimeTrainer: Any
+    LlamaModel: Any
+    LlamaTrainer: Any
+    LlamaPresets: Any
+    LlamaModelConfig: Any
+    TinyPrimeConfig: Any
+    TinyPrimeGuard: Any
+    IntentResult: Any
+
+    def check_semantic_security(text: str, *, cfg_path: str | None = None) -> Any: ...
+
+    async def check_semantic_security_async(text: str, *, cfg_path: str | None = None) -> Any: ...
+
+    def get_semantic_guard(*, cfg_path: str | None = None) -> Any: ...
 
 # Lazy imports to avoid loading heavy dependencies at import time
 def __getattr__(name):

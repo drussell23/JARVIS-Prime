@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 __version__ = "0.1.0"
+
+# Pylance/static analyzers: `__all__` + `__getattr__` lazy exports.
+if TYPE_CHECKING:
+    from typing import Any
+
+    TinyPrimeConfig: Any
+    TinyPrimeGuard: Any
 
 # Lazy imports to keep import time light.
 def __getattr__(name: str):
