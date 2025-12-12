@@ -48,6 +48,21 @@ def test_tiny_prime_import():
     cfg = TinyPrimeConfig(raw={"tiny_prime": {"version": "0.1.0"}}, source_path=None)
     print(f"✅ Created Tiny Prime config: v{cfg.get('tiny_prime.version')}")
 
+
+def test_security_hook_import():
+    """Test stable security hook import (should be lazy)"""
+    print("\nTesting security hook imports...")
+    from jarvis_prime.security.check_semantic_security import check_semantic_security
+
+    print("✅ check_semantic_security imported")
+
+def test_top_level_security_export():
+    """Test top-level security exports (should be lazy)"""
+    print("\nTesting top-level security exports...")
+    from jarvis_prime import check_semantic_security
+
+    print("✅ jarvis_prime.check_semantic_security imported")
+
 def test_core_dependencies():
     """Test core dependencies are available"""
     print("\nTesting core dependencies...")
@@ -73,6 +88,8 @@ def main():
         test_core_dependencies()
         test_model_import()
         test_tiny_prime_import()
+        test_security_hook_import()
+        test_top_level_security_export()
 
         print("\n" + "=" * 60)
         print("🎉 All tests passed!")

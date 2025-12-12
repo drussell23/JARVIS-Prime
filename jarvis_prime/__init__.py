@@ -32,6 +32,27 @@ def __getattr__(name):
         from jarvis_prime.tiny_prime import TinyPrimeGuard
 
         return TinyPrimeGuard
+    elif name in {
+        "check_semantic_security",
+        "check_semantic_security_async",
+        "get_semantic_guard",
+        "IntentResult",
+    }:
+        # Stable, top-level exports for the VBI pipeline.
+        # Lazy import: does not import torch/transformers until functions are called.
+        from jarvis_prime.security.check_semantic_security import (  # noqa: WPS433
+            IntentResult,
+            check_semantic_security,
+            check_semantic_security_async,
+            get_semantic_guard,
+        )
+
+        return {
+            "check_semantic_security": check_semantic_security,
+            "check_semantic_security_async": check_semantic_security_async,
+            "get_semantic_guard": get_semantic_guard,
+            "IntentResult": IntentResult,
+        }[name]
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 __all__ = [
@@ -43,5 +64,9 @@ __all__ = [
     "LlamaModelConfig",
     "TinyPrimeConfig",
     "TinyPrimeGuard",
+    "check_semantic_security",
+    "check_semantic_security_async",
+    "get_semantic_guard",
+    "IntentResult",
     "__version__",
 ]
