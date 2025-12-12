@@ -38,6 +38,16 @@ def test_model_import():
     model = LlamaModel(config)
     print(f"✅ Created LlamaModel instance: {model.device}")
 
+
+def test_tiny_prime_import():
+    """Test Tiny Prime imports (no weight loading)"""
+    print("\nTesting Tiny Prime imports...")
+    from jarvis_prime import TinyPrimeConfig, TinyPrimeGuard
+
+    print("✅ TinyPrimeConfig + TinyPrimeGuard imported")
+    cfg = TinyPrimeConfig(raw={"tiny_prime": {"version": "0.1.0"}}, source_path=None)
+    print(f"✅ Created Tiny Prime config: v{cfg.get('tiny_prime.version')}")
+
 def test_core_dependencies():
     """Test core dependencies are available"""
     print("\nTesting core dependencies...")
@@ -62,6 +72,7 @@ def main():
         test_config_import()
         test_core_dependencies()
         test_model_import()
+        test_tiny_prime_import()
 
         print("\n" + "=" * 60)
         print("🎉 All tests passed!")

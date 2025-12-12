@@ -1,0 +1,9 @@
+# Tiny Prime uses the repo's main dependencies from pyproject.toml
+# This file is for convenience when running Tiny Prime standalone.
+
+torch>=2.1.0
+transformers>=4.35.0
+datasets>=2.15.0
+tokenizers>=0.15.0
+pyyaml>=6.0
+tqdm>=4.65.0

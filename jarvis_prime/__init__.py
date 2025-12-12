@@ -24,6 +24,14 @@ def __getattr__(name):
     elif name == "LlamaModelConfig":
         from jarvis_prime.configs import LlamaModelConfig
         return LlamaModelConfig
+    elif name == "TinyPrimeConfig":
+        from jarvis_prime.tiny_prime import TinyPrimeConfig
+
+        return TinyPrimeConfig
+    elif name == "TinyPrimeGuard":
+        from jarvis_prime.tiny_prime import TinyPrimeGuard
+
+        return TinyPrimeGuard
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 __all__ = [
@@ -33,5 +41,7 @@ __all__ = [
     "LlamaTrainer",
     "LlamaPresets",
     "LlamaModelConfig",
+    "TinyPrimeConfig",
+    "TinyPrimeGuard",
     "__version__",
 ]

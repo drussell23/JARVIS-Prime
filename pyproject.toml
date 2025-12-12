@@ -112,10 +112,14 @@ Documentation = "https://github.com/drussell23/jarvis-prime#readme"
 "JARVIS" = "https://github.com/drussell23/JARVIS-AI-Agent"
 
 [tool.setuptools]
-packages = ["jarvis_prime"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jarvis_prime*"]
 
 [tool.setuptools.package-data]
-jarvis_prime = ["py.typed", "configs/*.yaml"]
+jarvis_prime = ["py.typed", "configs/*.yaml", "tiny_prime/config/*.yaml"]
 
 [tool.black]
 line-length = 100

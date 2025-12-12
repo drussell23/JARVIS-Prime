@@ -1,0 +1,140 @@
+tiny_prime:
+  version: "0.1.0"
+
+  intents:
+    labels: ["[ALLOW]", "[DENY]", "[DURESS]", "[AMBIGUOUS]"]
+    default_label: "[AMBIGUOUS]"
+
+  format:
+    user_open: "<user>"
+    user_close: "</user>"
+    intent_open: "<intent>"
+    intent_close: "</intent>"
+
+data:
+  seed: 42
+  output_path: "./data/security_intents.jsonl"
+  num_examples: 20000
+
+  sources:
+    synthetic:
+      enabled: true
+      weight: 0.9
+
+      # Generator is config-driven; add/remove domains and actions here.
+      domains:
+        - name: "home_access"
+          entities: ["door", "front door", "garage", "gate", "pod bay doors"]
+          allow_actions: ["unlock", "open", "disarm", "enable"]
+          deny_actions: ["lock", "close", "arm", "disable"]
+        - name: "payments"
+          entities: ["account", "card", "wallet"]
+          allow_actions: ["send", "transfer", "pay"]
+          deny_actions: ["cancel", "stop", "freeze"]
+
+      noise:
+        hesitations: true
+        fillers: true
+        casing: true
+        punctuation: true
+        asr_typos: true
+
+      hard_cases:
+        negation_rate: 0.35
+        double_negation_rate: 0.05
+        duress_rate: 0.08
+        ambiguity_rate: 0.12
+
+    tinystories:
+      enabled: true
+      weight: 0.1
+      dataset: "roneneldan/TinyStories"
+      split: "train"
+      streaming: true
+      max_examples: 2000
+
+tokenizer:
+  # 16000 is typically plenty for short command classification.
+  vocab_size: 16000
+  min_frequency: 2
+  output_dir: "./artifacts/tiny_prime/tokenizer"
+
+  # Ensure these are single tokens.
+  special_tokens:
+    - "<pad>"
+    - "<unk>"
+    - "<s>"
+    - "</s>"
+    - "<user>"
+    - "</user>"
+    - "<intent>"
+    - "</intent>"
+    - "[ALLOW]"
+    - "[DENY]"
+    - "[DURESS]"
+    - "[AMBIGUOUS]"
+
+model:
+  # Decoder-only transformer (Llama-style)
+  architecture: "llama"
+  context_window: 512
+
+  hidden_size: 768
+  num_hidden_layers: 12
+  num_attention_heads: 12
+  intermediate_size: 3072
+
+  rms_norm_eps: 1.0e-5
+  rope_theta: 10000
+
+  # If null, will be inferred from tokenizer.
+  vocab_size: null
+
+training:
+  dataset_path: "./data/security_intents.jsonl"
+  output_dir: "./outputs/tiny_prime"
+
+  batch_size: 32
+  gradient_accumulation_steps: 2
+  learning_rate: 3.0e-4
+  num_epochs: 1
+  max_steps: -1
+
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  lr_scheduler_type: "cosine"
+
+  mixed_precision: "fp16"  # fp16, bf16, no
+  gradient_checkpointing: false
+
+  logging_steps: 25
+  save_steps: 100
+  eval_steps: 200
+  save_total_limit: 3
+
+  seed: 42
+  dataloader_num_workers: 4
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: "./checkpoints/tiny_prime"
+  save_frequency_steps: 100
+  preemption_signal_file: "/tmp/tiny_prime_preemption_signal"
+  auto_resume: true
+
+inference:
+  device: "auto"  # auto, mps, cuda, cpu
+  batch_size: 32
+  max_batch_size: 128
+  async_enabled: true
+  max_concurrent_requests: 200
+  timeout_seconds: 2.0
+  microbatch_wait_ms: 5
+
+monitoring:
+  wandb_enabled: false
+  wandb_project: "jarvis-prime"
+  wandb_run_name: "tiny-prime-v0.1.0"
+  tensorboard_enabled: true
+  tensorboard_dir: "./runs"

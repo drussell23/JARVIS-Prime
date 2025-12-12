@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-import yaml
 import json
 
 
@@ -192,6 +191,11 @@ class LlamaModelConfig:
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "LlamaModelConfig":
         """Load configuration from YAML file"""
+        try:
+            import yaml  # type: ignore
+        except ImportError as e:
+            raise ImportError("PyYAML is required to load YAML configs. Install with: pip install pyyaml") from e
+
         with open(yaml_path, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -286,6 +290,11 @@ class LlamaModelConfig:
 
     def save_yaml(self, yaml_path: str):
         """Save configuration to YAML"""
+        try:
+            import yaml  # type: ignore
+        except ImportError as e:
+            raise ImportError("PyYAML is required to save YAML configs. Install with: pip install pyyaml") from e
+
         Path(yaml_path).parent.mkdir(parents=True, exist_ok=True)
         with open(yaml_path, 'w') as f:
             yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
