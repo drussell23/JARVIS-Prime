@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-JARVIS-Prime Server - Quick Start Script
-=========================================
+JARVIS-Prime Server - Quick Start Script (v2.0 with Cross-Repo Bridge)
+=======================================================================
 
 Runs JARVIS-Prime with llama-cpp-python backend.
+Integrates with main JARVIS infrastructure for unified cost tracking.
 
 Usage:
     # Default (TinyLlama on port 8000)
@@ -15,10 +16,14 @@ Usage:
     # With Metal GPU (M1/M2/M3)
     python run_server.py --gpu-layers -1
 
+    # Connect to JARVIS infrastructure (default: auto-detect)
+    python run_server.py --bridge-enabled
+
 Endpoints:
     POST /v1/chat/completions  - OpenAI-compatible chat
     POST /generate             - Simple text generation
     GET  /health               - Health check
+    GET  /metrics              - Cost tracking & inference metrics
 """
 
 import argparse
@@ -41,6 +46,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jarvis-prime")
 
+# Cross-repo bridge (lazy import)
+_bridge = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="JARVIS-Prime Server")
@@ -52,10 +60,22 @@ def parse_args():
     parser.add_argument("--gpu-layers", type=int, default=0, help="GPU layers (-1 for all)")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on changes")
     parser.add_argument("--debug", action="store_true", help="Debug logging")
+    parser.add_argument(
+        "--bridge-enabled",
+        action="store_true",
+        default=True,
+        help="Enable cross-repo bridge for JARVIS integration (default: True)"
+    )
+    parser.add_argument(
+        "--no-bridge",
+        action="store_true",
+        help="Disable cross-repo bridge"
+    )
     return parser.parse_args()
 
 
 async def main():
+    global _bridge
     args = parse_args()
 
     if args.debug:
@@ -79,6 +99,27 @@ async def main():
         logger.error("Make sure llama-cpp-python is installed:")
         logger.error("  pip install llama-cpp-python")
         sys.exit(1)
+
+    # Initialize cross-repo bridge for JARVIS integration
+    bridge_enabled = args.bridge_enabled and not args.no_bridge
+    if bridge_enabled:
+        try:
+            from jarvis_prime.core.cross_repo_bridge import (
+                initialize_bridge,
+                shutdown_bridge,
+                record_inference,
+                update_model_status,
+                get_cost_summary,
+            )
+            _bridge = await initialize_bridge(port=args.port)
+            logger.info("Cross-repo bridge initialized - connected to JARVIS infrastructure")
+        except Exception as e:
+            logger.warning(f"Cross-repo bridge initialization failed: {e}")
+            logger.warning("Continuing without cross-repo integration")
+            _bridge = None
+    else:
+        logger.info("Cross-repo bridge disabled")
+        _bridge = None
 
     # Check model exists
     model_path = Path(args.model)
@@ -159,11 +200,32 @@ async def main():
         logger.info(f"Loading model: {model_path}")
         start = time.time()
         await executor.load(model_path)
-        logger.info(f"Model loaded in {time.time() - start:.2f}s")
+        load_time = time.time() - start
+        logger.info(f"Model loaded in {load_time:.2f}s")
+
+        # Notify bridge of model status
+        if _bridge:
+            try:
+                from jarvis_prime.core.cross_repo_bridge import update_model_status
+                update_model_status(loaded=True, model_path=str(model_path))
+                await _bridge.notify_jarvis("model_loaded", {
+                    "model_path": str(model_path),
+                    "load_time_seconds": load_time,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to notify bridge of model status: {e}")
     else:
         logger.warning(f"Model not found: {args.model}")
         logger.warning("Server will start without a model (health checks only)")
         logger.warning("Set MODEL_GCS_URI env var or mount a model to enable inference")
+
+        # Notify bridge of no model
+        if _bridge:
+            try:
+                from jarvis_prime.core.cross_repo_bridge import update_model_status
+                update_model_status(loaded=False, model_path="")
+            except Exception as e:
+                pass  # Silent fail for missing model notification
 
     # Create FastAPI app
     app = FastAPI(
@@ -222,6 +284,23 @@ async def main():
             )
 
             latency = time.time() - start
+            latency_ms = latency * 1000
+
+            # Estimate tokens
+            prompt_tokens = len(prompt.split())
+            completion_tokens = len(response.split())
+
+            # Record inference metrics for cost tracking
+            if _bridge:
+                try:
+                    from jarvis_prime.core.cross_repo_bridge import record_inference
+                    record_inference(
+                        tokens_in=prompt_tokens,
+                        tokens_out=completion_tokens,
+                        latency_ms=latency_ms,
+                    )
+                except Exception:
+                    pass  # Don't fail inference for metrics
 
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -234,11 +313,11 @@ async def main():
                     "finish_reason": "stop",
                 }],
                 "usage": {
-                    "prompt_tokens": len(prompt.split()),
-                    "completion_tokens": len(response.split()),
-                    "total_tokens": len(prompt.split()) + len(response.split()),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 },
-                "x_latency_ms": latency * 1000,
+                "x_latency_ms": latency_ms,
             }
         except Exception as e:
             logger.error(f"Chat error: {e}")
@@ -261,9 +340,27 @@ async def main():
                 temperature=request.temperature,
             )
 
+            latency_ms = (time.time() - start) * 1000
+
+            # Estimate tokens
+            prompt_tokens = len(request.prompt.split())
+            completion_tokens = len(response.split())
+
+            # Record inference metrics
+            if _bridge:
+                try:
+                    from jarvis_prime.core.cross_repo_bridge import record_inference
+                    record_inference(
+                        tokens_in=prompt_tokens,
+                        tokens_out=completion_tokens,
+                        latency_ms=latency_ms,
+                    )
+                except Exception:
+                    pass  # Don't fail inference for metrics
+
             return {
                 "text": response,
-                "latency_ms": (time.time() - start) * 1000,
+                "latency_ms": latency_ms,
             }
         except Exception as e:
             logger.error(f"Generate error: {e}")
@@ -273,13 +370,49 @@ async def main():
     async def health():
         """Health check - always returns healthy for Cloud Run."""
         stats = executor.get_statistics() if executor.is_loaded() else {}
+
+        # Include bridge connection status
+        bridge_info = {}
+        if _bridge:
+            bridge_info = {
+                "jarvis_connected": _bridge.state.connected_to_jarvis,
+                "jarvis_session_id": _bridge.state.jarvis_session_id or None,
+            }
+
         return {
             "status": "healthy",
             "model_loaded": executor.is_loaded(),
             "model_path": str(model_path) if model_path.exists() else None,
             "ready_for_inference": executor.is_loaded(),
+            "bridge_enabled": _bridge is not None,
+            **bridge_info,
             **stats,
         }
+
+    @app.get("/metrics")
+    async def metrics():
+        """Get inference and cost metrics."""
+        if _bridge:
+            try:
+                from jarvis_prime.core.cross_repo_bridge import get_cost_summary
+                cost_summary = get_cost_summary()
+                inference_metrics = _bridge.get_metrics()
+                return {
+                    "status": "ok",
+                    "cost_summary": cost_summary,
+                    "inference_metrics": inference_metrics,
+                    "connected_to_jarvis": _bridge.state.connected_to_jarvis,
+                }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "error": str(e),
+                }
+        else:
+            return {
+                "status": "disabled",
+                "message": "Cross-repo bridge not enabled",
+            }
 
     @app.get("/v1/models")
     async def list_models():
@@ -296,21 +429,59 @@ async def main():
     @app.on_event("shutdown")
     async def shutdown():
         logger.info("Shutting down...")
+
+        # Log final cost summary
+        if _bridge:
+            try:
+                from jarvis_prime.core.cross_repo_bridge import get_cost_summary, shutdown_bridge
+                cost_summary = get_cost_summary()
+
+                if cost_summary.get("total_requests", 0) > 0:
+                    logger.info("=" * 50)
+                    logger.info("JARVIS-Prime Session Cost Summary")
+                    logger.info("=" * 50)
+                    logger.info(f"  Total Requests: {cost_summary.get('total_requests', 0)}")
+                    logger.info(f"  Total Tokens: {cost_summary.get('total_tokens', 0)}")
+                    logger.info(f"  Local Cost: ${cost_summary.get('local_cost_usd', 0):.4f}")
+                    logger.info(f"  Cloud Equivalent: ${cost_summary.get('cloud_equivalent_cost_usd', 0):.4f}")
+                    logger.info(f"  Savings: ${cost_summary.get('savings_usd', 0):.4f} ({cost_summary.get('savings_percent', 0):.1f}%)")
+                    logger.info("=" * 50)
+
+                # Notify JARVIS of shutdown
+                await _bridge.notify_jarvis("shutdown", cost_summary)
+
+                # Shutdown bridge
+                await shutdown_bridge()
+                logger.info("Cross-repo bridge shutdown complete")
+            except Exception as e:
+                logger.warning(f"Bridge shutdown error: {e}")
+
         await executor.close()
 
     # Print startup info
     logger.info("=" * 60)
-    logger.info("JARVIS-Prime Tier-0 Brain Server")
+    logger.info("JARVIS-Prime Tier-0 Brain Server (v2.0)")
     logger.info("=" * 60)
-    logger.info(f"Model: {model_path.name}")
+    logger.info(f"Model: {model_path.name if model_path.exists() else 'Not loaded'}")
     logger.info(f"Context: {args.ctx_size} tokens")
     logger.info(f"GPU layers: {args.gpu_layers}")
     logger.info(f"Listening: http://{args.host}:{args.port}")
+
+    # Bridge status
+    if _bridge:
+        if _bridge.state.connected_to_jarvis:
+            logger.info(f"JARVIS Bridge: Connected (session: {_bridge.state.jarvis_session_id[:8]}...)")
+        else:
+            logger.info("JARVIS Bridge: Enabled (standalone mode)")
+    else:
+        logger.info("JARVIS Bridge: Disabled")
+
     logger.info("")
     logger.info("Endpoints:")
     logger.info(f"  POST http://localhost:{args.port}/v1/chat/completions")
     logger.info(f"  POST http://localhost:{args.port}/generate")
     logger.info(f"  GET  http://localhost:{args.port}/health")
+    logger.info(f"  GET  http://localhost:{args.port}/metrics")
     logger.info("=" * 60)
 
     # Run server
