@@ -92,14 +92,56 @@ async def main():
     if not model_path.exists() and gcs_model_uri:
         logger.info(f"Model not found locally, downloading from GCS: {gcs_model_uri}")
         try:
-            import subprocess
+            # Use Python GCS client (more reliable than gsutil in containers)
+            from google.cloud import storage
+            import re
+
             model_path.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["gsutil", "cp", gcs_model_uri, str(model_path)],
-                check=True,
-                capture_output=True,
-            )
-            logger.info(f"Model downloaded to: {model_path}")
+
+            # Parse GCS URI: gs://bucket/path/to/file.gguf
+            match = re.match(r"gs://([^/]+)/(.+)", gcs_model_uri)
+            if match:
+                bucket_name, blob_path = match.groups()
+                logger.info(f"Downloading from bucket={bucket_name}, path={blob_path}")
+
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_path)
+
+                # Check if blob exists and get metadata
+                if not blob.exists():
+                    logger.error(f"Model not found in GCS: {gcs_model_uri}")
+                else:
+                    # Reload to get size metadata
+                    blob.reload()
+                    size_mb = blob.size / 1024 / 1024 if blob.size else 0
+                    logger.info(f"Downloading {size_mb:.1f}MB model from GCS...")
+
+                    # Download with timeout for large models
+                    blob.download_to_filename(str(model_path))
+
+                    # Verify download
+                    if model_path.exists():
+                        actual_size_mb = model_path.stat().st_size / 1024 / 1024
+                        logger.info(f"Model downloaded successfully: {actual_size_mb:.1f}MB to {model_path}")
+                    else:
+                        logger.error(f"Download completed but model file not found at {model_path}")
+            else:
+                logger.warning(f"Invalid GCS URI format: {gcs_model_uri}")
+
+        except ImportError:
+            # Fallback to gsutil if google-cloud-storage not installed
+            logger.info("GCS Python client not available, trying gsutil...")
+            try:
+                import subprocess
+                subprocess.run(
+                    ["gsutil", "cp", gcs_model_uri, str(model_path)],
+                    check=True,
+                    capture_output=True,
+                )
+                logger.info(f"Model downloaded via gsutil to: {model_path}")
+            except Exception as e:
+                logger.warning(f"gsutil download failed: {e}")
         except Exception as e:
             logger.warning(f"Failed to download model from GCS: {e}")
 

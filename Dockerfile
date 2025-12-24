@@ -67,11 +67,13 @@ ENV PYTHONUNBUFFERED=1 \
 # Create non-root user for security
 RUN groupadd -r jarvis && useradd -r -g jarvis jarvis
 
-# Install minimal runtime dependencies
+# Install minimal runtime dependencies + GCS client
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && apt-get clean \
+    && pip install --no-cache-dir google-cloud-storage
 
 WORKDIR /app
 
