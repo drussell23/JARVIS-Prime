@@ -86,13 +86,24 @@ async def main():
         # Try relative to script
         model_path = Path(__file__).parent / args.model
 
-    if not model_path.exists():
-        logger.error(f"Model not found: {args.model}")
-        logger.error("Download a model with:")
-        logger.error("  python -m jarvis_prime.docker.model_downloader tinyllama-chat")
-        sys.exit(1)
+    # Check if we should try to download from GCS
+    gcs_model_uri = os.getenv("MODEL_GCS_URI")
 
-    # Create executor
+    if not model_path.exists() and gcs_model_uri:
+        logger.info(f"Model not found locally, downloading from GCS: {gcs_model_uri}")
+        try:
+            import subprocess
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["gsutil", "cp", gcs_model_uri, str(model_path)],
+                check=True,
+                capture_output=True,
+            )
+            logger.info(f"Model downloaded to: {model_path}")
+        except Exception as e:
+            logger.warning(f"Failed to download model from GCS: {e}")
+
+    # Create executor (may be unloaded)
     config = LlamaCppConfig(
         n_ctx=args.ctx_size,
         n_threads=args.threads,
@@ -101,11 +112,16 @@ async def main():
     )
     executor = LlamaCppExecutor(config)
 
-    # Load model
-    logger.info(f"Loading model: {model_path}")
-    start = time.time()
-    await executor.load(model_path)
-    logger.info(f"Model loaded in {time.time() - start:.2f}s")
+    # Load model if available
+    if model_path.exists():
+        logger.info(f"Loading model: {model_path}")
+        start = time.time()
+        await executor.load(model_path)
+        logger.info(f"Model loaded in {time.time() - start:.2f}s")
+    else:
+        logger.warning(f"Model not found: {args.model}")
+        logger.warning("Server will start without a model (health checks only)")
+        logger.warning("Set MODEL_GCS_URI env var or mount a model to enable inference")
 
     # Create FastAPI app
     app = FastAPI(
@@ -143,6 +159,11 @@ async def main():
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         """OpenAI-compatible chat completions."""
+        if not executor.is_loaded():
+            raise HTTPException(
+                status_code=503,
+                detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
+            )
         try:
             start = time.time()
 
@@ -184,6 +205,11 @@ async def main():
     @app.post("/generate")
     async def generate(request: GenerateRequest):
         """Simple text generation."""
+        if not executor.is_loaded():
+            raise HTTPException(
+                status_code=503,
+                detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
+            )
         try:
             start = time.time()
 
@@ -203,12 +229,14 @@ async def main():
 
     @app.get("/health")
     async def health():
-        """Health check."""
+        """Health check - always returns healthy for Cloud Run."""
+        stats = executor.get_statistics() if executor.is_loaded() else {}
         return {
             "status": "healthy",
             "model_loaded": executor.is_loaded(),
-            "model_path": str(model_path),
-            **executor.get_statistics(),
+            "model_path": str(model_path) if model_path.exists() else None,
+            "ready_for_inference": executor.is_loaded(),
+            **stats,
         }
 
     @app.get("/v1/models")

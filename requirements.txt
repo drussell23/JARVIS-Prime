@@ -34,6 +34,9 @@ pyyaml>=6.0.0
 # Logging and monitoring
 structlog>=23.2.0
 
+# System monitoring
+psutil>=5.9.0
+
 # Optional: Transformers for HF model loading (only needed for conversion)
 # transformers>=4.35.0
 # torch>=2.1.0
