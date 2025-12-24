@@ -857,4 +857,182 @@ def create_api_app(manager: PrimeModelManager):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    # ========================================================================
+    # Model Swap Endpoint - Phase 2: Hot Swap for JARVIS Prime
+    # ========================================================================
+
+    class ModelSwapRequest(BaseModel):
+        """Request model for hot-swapping to a new model file."""
+        model_path: str  # Path to .gguf model file
+        version_id: Optional[str] = None  # Optional version identifier
+        force: bool = False  # Force swap even if validation fails
+        validate_before_swap: bool = True  # Run validation test before swapping
+
+    class ModelSwapResponse(BaseModel):
+        """Response for model swap operation."""
+        success: bool
+        state: str
+        old_version: Optional[str] = None
+        new_version: Optional[str] = None
+        duration_seconds: float = 0.0
+        memory_freed_mb: float = 0.0
+        error_message: Optional[str] = None
+
+    @app.post("/model/swap", response_model=ModelSwapResponse)
+    async def swap_model(request: ModelSwapRequest):
+        """
+        Hot-swap to a new model file with zero downtime.
+
+        This endpoint is called by JARVIS after Reactor-Core training completes.
+
+        Steps:
+        1. Load new model into standby slot (background)
+        2. Validate new model with test generation
+        3. Drain in-flight requests from primary
+        4. Atomic swap primary ↔ standby
+        5. Unload old model and free memory
+
+        Args:
+            model_path: Absolute path to the .gguf model file
+            version_id: Optional version identifier (auto-generated if not provided)
+            force: Force swap even if validation fails
+            validate_before_swap: Run validation test before swapping
+
+        Returns:
+            ModelSwapResponse with operation details
+        """
+        import os
+        import time
+        from pathlib import Path as PathLib
+        from datetime import datetime
+
+        model_path = PathLib(request.model_path)
+
+        # Validate path exists
+        if not model_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model file not found: {request.model_path}"
+            )
+
+        # Validate file extension
+        if model_path.suffix.lower() not in ('.gguf', '.bin', '.pt', '.safetensors'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported model format: {model_path.suffix}. "
+                       f"Supported: .gguf, .bin, .pt, .safetensors"
+            )
+
+        # Generate version_id if not provided
+        version_id = request.version_id
+        if not version_id:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            version_id = f"v{timestamp}-{model_path.stem[:20]}"
+
+        try:
+            # Check if hot-swap manager is available
+            if not manager._hot_swap:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Hot-swap manager not initialized"
+                )
+
+            # Perform the hot-swap
+            result = await manager._hot_swap.hot_swap(
+                model_path=model_path,
+                version_id=version_id,
+                force=request.force,
+            )
+
+            # Update manager's current version on success
+            if result.success:
+                manager._current_version = version_id
+
+            return ModelSwapResponse(
+                success=result.success,
+                state=result.state.value,
+                old_version=result.old_version,
+                new_version=result.new_version,
+                duration_seconds=result.duration_seconds,
+                memory_freed_mb=result.memory_freed_mb,
+                error_message=result.error_message,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Hot-swap failed: {str(e)}"
+            )
+
+    @app.get("/model/status")
+    async def get_model_status():
+        """Get current model and hot-swap status."""
+        status = {
+            "current_version": manager._current_version,
+            "running": manager._running,
+        }
+
+        if manager._hot_swap:
+            status["hot_swap"] = manager._hot_swap.get_status()
+
+        if manager._registry:
+            status["registry"] = manager._registry.get_status()
+
+        return status
+
+    @app.post("/model/preload")
+    async def preload_model(model_path: str, version_id: Optional[str] = None):
+        """
+        Preload a model into standby slot for faster swapping.
+
+        Useful when you know a swap is coming but want to minimize
+        downtime during the actual swap.
+        """
+        from pathlib import Path as PathLib
+        from datetime import datetime
+
+        path = PathLib(model_path)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"Model not found: {model_path}")
+
+        if not version_id:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            version_id = f"v{timestamp}-{path.stem[:20]}"
+
+        try:
+            success = await manager._hot_swap.preload_standby(
+                model_path=path,
+                version_id=version_id,
+            )
+            return {"success": success, "version_id": version_id}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/model/swap-from-standby")
+    async def swap_from_standby():
+        """
+        Swap to the preloaded standby model.
+
+        Faster than /model/swap because model is already loaded.
+        Call /model/preload first.
+        """
+        try:
+            result = await manager._hot_swap.swap_from_standby()
+            if result.success:
+                manager._current_version = result.new_version
+
+            return ModelSwapResponse(
+                success=result.success,
+                state=result.state.value,
+                old_version=result.old_version,
+                new_version=result.new_version,
+                duration_seconds=result.duration_seconds,
+                memory_freed_mb=result.memory_freed_mb,
+                error_message=result.error_message,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     return app
