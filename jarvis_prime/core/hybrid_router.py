@@ -32,7 +32,172 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+# Safety context integration (v10.3)
+# Reads shared safety state from JARVIS ActionSafetyManager
+SAFETY_CONTEXT_AVAILABLE = True  # Always available via file reading
+
 logger = logging.getLogger(__name__)
+
+# Cross-repo safety state path (v10.3)
+SAFETY_CONTEXT_FILE = Path.home() / ".jarvis" / "cross_repo" / "safety" / "context_for_prime.json"
+
+
+@dataclass
+class SafetyContextSnapshot:
+    """
+    Snapshot of JARVIS safety context read from shared state file.
+
+    This is written by JARVIS ActionSafetyManager and read by Prime
+    for safety-aware routing decisions.
+    """
+    kill_switch_active: bool = False
+    current_risk_level: str = "low"
+    pending_confirmation: bool = False
+    recent_blocks: int = 0
+    recent_confirmations: int = 0
+    recent_denials: int = 0
+    user_trust_level: float = 1.0
+    last_update: str = ""
+    session_start: str = ""
+    total_audits: int = 0
+    total_blocks: int = 0
+    is_stale: bool = False  # True if file hasn't been updated recently
+
+    def get_risk_multiplier(self) -> float:
+        """
+        Get a multiplier for complexity scoring based on safety state.
+
+        Returns:
+            Float multiplier (lower = more cautious user)
+        """
+        # Base multiplier from trust level
+        multiplier = self.user_trust_level
+
+        # Reduce multiplier if user has been denying actions
+        if self.recent_denials > 0:
+            multiplier *= max(0.7, 1.0 - (self.recent_denials * 0.1))
+
+        # Reduce if there have been blocks
+        if self.recent_blocks > 0:
+            multiplier *= max(0.8, 1.0 - (self.recent_blocks * 0.05))
+
+        return max(0.5, multiplier)
+
+    def should_avoid_risky_actions(self) -> bool:
+        """Check if we should route away from risky local actions."""
+        return (
+            self.kill_switch_active
+            or self.current_risk_level in ("high", "critical")
+            or self.recent_denials >= 2
+            or self.user_trust_level < 0.7
+        )
+
+    def to_prompt_context(self) -> str:
+        """Generate context string for prompt injection."""
+        lines = ["[JARVIS SAFETY CONTEXT]"]
+
+        if self.kill_switch_active:
+            lines.append("- KILL SWITCH ACTIVE: All actions paused")
+
+        if self.current_risk_level in ("high", "critical"):
+            lines.append(f"- Risk Level: {self.current_risk_level.upper()}")
+
+        if self.pending_confirmation:
+            lines.append("- Awaiting user confirmation for risky action")
+
+        if self.recent_blocks > 0:
+            lines.append(f"- Recently blocked {self.recent_blocks} risky action(s)")
+
+        if self.recent_denials > 0:
+            lines.append(f"- User denied {self.recent_denials} action(s) recently")
+
+        if self.user_trust_level < 0.7:
+            lines.append("- User exercising caution with risky actions")
+
+        if len(lines) == 1:
+            lines.append("- All clear, normal operation")
+
+        lines.append("[/JARVIS SAFETY CONTEXT]")
+        return "\n".join(lines)
+
+
+class SafetyContextReader:
+    """
+    Reader for JARVIS safety context shared state.
+
+    Reads from the shared file written by ActionSafetyManager
+    to enable safety-aware routing in Prime.
+    """
+
+    def __init__(self, stale_threshold_seconds: float = 60.0):
+        self.stale_threshold_seconds = stale_threshold_seconds
+        self._cache: Optional[SafetyContextSnapshot] = None
+        self._cache_time: float = 0.0
+        self._cache_ttl: float = 1.0  # Re-read file every second
+
+    def read_context(self) -> SafetyContextSnapshot:
+        """Read current safety context from shared file."""
+        now = time.time()
+
+        # Return cached if fresh
+        if self._cache and (now - self._cache_time) < self._cache_ttl:
+            return self._cache
+
+        # Read from file
+        try:
+            if not SAFETY_CONTEXT_FILE.exists():
+                return SafetyContextSnapshot()
+
+            data = json.loads(SAFETY_CONTEXT_FILE.read_text())
+
+            # Check staleness
+            last_update = data.get("last_update", "")
+            is_stale = False
+            if last_update:
+                try:
+                    update_time = datetime.fromisoformat(last_update)
+                    age = (datetime.now() - update_time).total_seconds()
+                    is_stale = age > self.stale_threshold_seconds
+                except Exception:
+                    is_stale = True
+
+            snapshot = SafetyContextSnapshot(
+                kill_switch_active=data.get("kill_switch_active", False),
+                current_risk_level=data.get("current_risk_level", "low"),
+                pending_confirmation=data.get("pending_confirmation", False),
+                recent_blocks=data.get("recent_blocks", 0),
+                recent_confirmations=data.get("recent_confirmations", 0),
+                recent_denials=data.get("recent_denials", 0),
+                user_trust_level=data.get("user_trust_level", 1.0),
+                last_update=last_update,
+                session_start=data.get("session_start", ""),
+                total_audits=data.get("total_audits", 0),
+                total_blocks=data.get("total_blocks", 0),
+                is_stale=is_stale,
+            )
+
+            self._cache = snapshot
+            self._cache_time = now
+            return snapshot
+
+        except Exception as e:
+            logger.warning(f"Failed to read safety context: {e}")
+            return SafetyContextSnapshot()
+
+    def get_prompt_context(self) -> str:
+        """Get safety context formatted for prompt injection."""
+        ctx = self.read_context()
+        return ctx.to_prompt_context()
+
+    def is_kill_switch_active(self) -> bool:
+        """Quick check if kill switch is active."""
+        ctx = self.read_context()
+        return ctx.kill_switch_active
+
+
+def get_safety_context_reader() -> SafetyContextReader:
+    """Factory function to get a SafetyContextReader."""
+    return SafetyContextReader()
 
 
 class TierClassification(Enum):
@@ -309,20 +474,33 @@ class HybridRouter:
         thresholds: Optional[Dict[str, float]] = None,
         history_file: Optional[Path] = None,
         enable_learning: bool = True,
+        enable_safety_context: bool = True,
     ):
         self.analyzer = analyzer or DefaultComplexityAnalyzer()
         self.thresholds = {**self.DEFAULT_THRESHOLDS, **(thresholds or {})}
         self.history_file = history_file
         self.enable_learning = enable_learning
+        self.enable_safety_context = enable_safety_context and SAFETY_CONTEXT_AVAILABLE
 
         # Learning state
         self._prompt_outcomes: Dict[str, Tuple[int, int]] = {}  # hash → (success, total)
         self._load_history()
 
+        # Safety context reader (v10.3)
+        self._safety_reader: Optional[SafetyContextReader] = None
+        if self.enable_safety_context:
+            try:
+                self._safety_reader = get_safety_context_reader()
+                logger.info("Safety context reader initialized for HybridRouter")
+            except Exception as e:
+                logger.warning(f"Failed to initialize safety context reader: {e}")
+                self._safety_reader = None
+
         # Statistics
         self._total_classifications = 0
         self._tier_0_count = 0
         self._tier_1_count = 0
+        self._safety_influenced_count = 0  # Count of decisions influenced by safety
 
         logger.info("HybridRouter initialized")
 
@@ -389,6 +567,26 @@ class HybridRouter:
         # Calculate overall complexity
         complexity_score = self._calculate_complexity_score(signals)
 
+        # Get safety context and apply risk multiplier (v10.3)
+        safety_context = None
+        safety_influenced = False
+        if self._safety_reader:
+            try:
+                safety_context = self._safety_reader.read_context()
+
+                # Apply risk multiplier to complexity score
+                risk_multiplier = safety_context.get_risk_multiplier()
+                if risk_multiplier < 1.0:
+                    # Lower risk multiplier means user is being cautious
+                    # This increases the effective complexity for risky-looking prompts
+                    if self._looks_risky(prompt):
+                        complexity_score = min(1.0, complexity_score / risk_multiplier)
+                        safety_influenced = True
+                        logger.debug(f"Safety context adjusted complexity: {complexity_score:.2f}")
+
+            except Exception as e:
+                logger.warning(f"Failed to read safety context: {e}")
+
         # Determine tier
         if force_tier:
             tier = force_tier
@@ -396,7 +594,7 @@ class HybridRouter:
             reasoning = f"Forced to {force_tier.value}"
         else:
             tier, confidence, reasoning = self._determine_tier(
-                complexity_score, signals, task_type, context
+                complexity_score, signals, task_type, context, safety_context
             )
 
         # Update statistics
@@ -404,6 +602,9 @@ class HybridRouter:
             self._tier_0_count += 1
         else:
             self._tier_1_count += 1
+
+        if safety_influenced:
+            self._safety_influenced_count += 1
 
         # Estimate costs/latencies
         token_estimate = signals.token_count + 500  # Response estimate
@@ -423,6 +624,19 @@ class HybridRouter:
 
         logger.debug(f"Classified prompt: {tier.value} (complexity={complexity_score:.2f})")
         return decision
+
+    def _looks_risky(self, prompt: str) -> bool:
+        """Check if prompt looks like it might involve risky actions."""
+        risky_patterns = [
+            r"\bdelete\b", r"\bremove\b", r"\berase\b", r"\bwipe\b",
+            r"\bformat\b", r"\bkill\b", r"\bterminate\b", r"\bshutdown\b",
+            r"\bexecute\b", r"\brun\b", r"\binstall\b", r"\buninstall\b",
+            r"\bsudo\b", r"\badmin\b", r"\broot\b", r"\bsystem\b",
+            r"\bpassword\b", r"\bcredential\b", r"\bsecret\b",
+            r"\bfile\b.*\bwrite\b", r"\bwrite\b.*\bfile\b",
+        ]
+        prompt_lower = prompt.lower()
+        return any(re.search(p, prompt_lower) for p in risky_patterns)
 
     def _detect_task_type(self, prompt: str, signals: ComplexitySignals) -> TaskType:
         """Detect the task type from prompt content"""
@@ -496,12 +710,27 @@ class HybridRouter:
         signals: ComplexitySignals,
         task_type: TaskType,
         context: Optional[Dict[str, Any]],
+        safety_context: Optional["SafetyContextSnapshot"] = None,
     ) -> Tuple[TierClassification, float, str]:
         """Determine the tier classification"""
         reasons = []
 
         # Check task type preferences
         task_tier = self.TASK_TYPE_TIERS.get(task_type, TierClassification.TIER_0_PREFERRED)
+
+        # Safety context checks (v10.3)
+        if safety_context:
+            # If kill switch is active, route everything to Tier 1 (cloud)
+            # so that risky local actions can be reviewed more carefully
+            if safety_context.kill_switch_active:
+                reasons.append("kill switch active")
+                return TierClassification.TIER_1, 0.95, f"Safety: {', '.join(reasons)}"
+
+            # If user has been denying actions, route to Tier 1 for better reasoning
+            if safety_context.should_avoid_risky_actions():
+                reasons.append("safety caution active")
+                # Boost towards Tier 1 for better safety reasoning
+                complexity_score = min(1.0, complexity_score * 1.3)
 
         # Force Tier 1 for certain conditions
         if task_type == TaskType.MULTIMODAL:
@@ -568,7 +797,7 @@ class HybridRouter:
     def get_statistics(self) -> Dict[str, Any]:
         """Get router statistics"""
         total = self._tier_0_count + self._tier_1_count
-        return {
+        stats = {
             "total_classifications": self._total_classifications,
             "tier_0_count": self._tier_0_count,
             "tier_1_count": self._tier_1_count,
@@ -576,7 +805,53 @@ class HybridRouter:
             "tier_1_ratio": self._tier_1_count / max(total, 1),
             "tracked_prompts": len(self._prompt_outcomes),
             "thresholds": self.thresholds,
+            "safety_influenced_count": self._safety_influenced_count,
+            "safety_context_enabled": self.enable_safety_context,
         }
+
+        # Add current safety context if available
+        if self._safety_reader:
+            try:
+                ctx = self._safety_reader.read_context()
+                stats["current_safety_context"] = {
+                    "kill_switch_active": ctx.kill_switch_active,
+                    "risk_level": ctx.current_risk_level,
+                    "user_trust_level": ctx.user_trust_level,
+                    "is_stale": ctx.is_stale,
+                }
+            except Exception:
+                pass
+
+        return stats
+
+    def get_safety_context_for_prompt(self) -> str:
+        """
+        Get JARVIS safety context for prompt injection.
+
+        This can be prepended to prompts to inform the model about
+        current safety state.
+
+        Returns:
+            Formatted safety context string or empty string if unavailable
+        """
+        if not self._safety_reader:
+            return ""
+
+        try:
+            return self._safety_reader.get_prompt_context()
+        except Exception as e:
+            logger.warning(f"Failed to get safety context for prompt: {e}")
+            return ""
+
+    def is_kill_switch_active(self) -> bool:
+        """Check if JARVIS kill switch is currently active."""
+        if not self._safety_reader:
+            return False
+
+        try:
+            return self._safety_reader.is_kill_switch_active()
+        except Exception:
+            return False
 
     def adjust_threshold(self, key: str, value: float) -> None:
         """Dynamically adjust a routing threshold"""
