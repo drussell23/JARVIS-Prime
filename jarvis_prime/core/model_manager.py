@@ -728,10 +728,11 @@ def create_api_app(manager: PrimeModelManager):
         uvicorn.run(app, host="0.0.0.0", port=8000)
     """
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
         from pydantic import BaseModel
         from typing import List, Optional
+        import json
     except ImportError:
         raise ImportError("FastAPI required: pip install fastapi uvicorn")
 
@@ -740,6 +741,10 @@ def create_api_app(manager: PrimeModelManager):
         description="OpenAI-compatible API for JARVIS-Prime Tier-0 Brain",
         version="1.0.0",
     )
+
+    # WebSocket event subscribers for Neural Mesh integration (v10.3)
+    _event_subscribers: List[WebSocket] = []
+    _event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
     class MessageModel(BaseModel):
         role: str
@@ -838,6 +843,104 @@ def create_api_app(manager: PrimeModelManager):
     async def health():
         """Health check endpoint"""
         return {"status": "healthy", **manager.get_status()}
+
+    # ========================================================================
+    # WebSocket Event Stream for Neural Mesh Integration (v10.3)
+    # ========================================================================
+
+    @app.websocket("/ws/events")
+    async def websocket_events(websocket: WebSocket):
+        """
+        WebSocket endpoint for real-time event streaming to Neural Mesh.
+
+        Events include:
+        - model_loaded: When a model is loaded
+        - model_swapped: When hot-swap completes
+        - inference_complete: After each inference (with telemetry)
+        - error: On errors
+        - heartbeat: Periodic keep-alive
+        """
+        await websocket.accept()
+        _event_subscribers.append(websocket)
+        logger.info(f"[WebSocket] Client connected ({len(_event_subscribers)} active)")
+
+        try:
+            # Send initial connection event
+            await websocket.send_json({
+                "event_type": "connected",
+                "data": {
+                    "status": "healthy",
+                    **manager.get_status(),
+                },
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            # Keep connection alive and send events
+            while True:
+                try:
+                    # Wait for events from queue with timeout for heartbeat
+                    try:
+                        event = await asyncio.wait_for(
+                            _event_queue.get(),
+                            timeout=30.0  # Heartbeat every 30s
+                        )
+                        await websocket.send_json(event)
+                    except asyncio.TimeoutError:
+                        # Send heartbeat
+                        await websocket.send_json({
+                            "event_type": "heartbeat",
+                            "data": {"status": "alive"},
+                            "timestamp": datetime.now().isoformat(),
+                        })
+
+                    # Also check for incoming messages (like ping)
+                    try:
+                        data = await asyncio.wait_for(
+                            websocket.receive_text(),
+                            timeout=0.1
+                        )
+                        if data == "ping":
+                            await websocket.send_text("pong")
+                    except asyncio.TimeoutError:
+                        pass
+
+                except WebSocketDisconnect:
+                    break
+
+        except Exception as e:
+            logger.warning(f"[WebSocket] Connection error: {e}")
+        finally:
+            if websocket in _event_subscribers:
+                _event_subscribers.remove(websocket)
+            logger.info(f"[WebSocket] Client disconnected ({len(_event_subscribers)} active)")
+
+    async def broadcast_event(event_type: str, data: dict):
+        """Broadcast an event to all connected WebSocket clients."""
+        event = {
+            "event_type": event_type,
+            "data": data,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Add to queue for connected clients
+        if not _event_queue.full():
+            await _event_queue.put(event)
+
+        # Direct broadcast to all subscribers
+        disconnected = []
+        for ws in _event_subscribers:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                disconnected.append(ws)
+
+        # Cleanup disconnected
+        for ws in disconnected:
+            if ws in _event_subscribers:
+                _event_subscribers.remove(ws)
+
+    # Attach broadcast function to manager for event emission
+    manager._broadcast_event = broadcast_event
 
     @app.post("/admin/hot-swap")
     async def admin_hot_swap(version_id: str, lineage: Optional[str] = None):
