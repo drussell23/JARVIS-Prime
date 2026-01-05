@@ -123,18 +123,23 @@ async def main():
 
     # v72.0: Initialize PROJECT TRINITY connection for distributed architecture
     # This enables JARVIS Body to detect J-Prime is online via heartbeat files
+    # v73.0: Added inference health tracking integration
     trinity_initialized = False
+    trinity_record_inference = None  # v73.0: Function reference for inference health tracking
     try:
         from jarvis_prime.core.trinity_bridge import (
             initialize_trinity,
             shutdown_trinity,
             update_model_status as trinity_update_model_status,
+            record_inference as _trinity_record_inference,  # v73.0
             TRINITY_ENABLED,
         )
+        trinity_record_inference = _trinity_record_inference  # Store for endpoint use
         if TRINITY_ENABLED:
             trinity_initialized = await initialize_trinity(port=args.port)
             if trinity_initialized:
                 logger.info("PROJECT TRINITY: J-Prime (Mind) connected to Trinity network")
+                logger.info("PROJECT TRINITY: Inference health tracking enabled (v73.0)")
             else:
                 logger.warning("PROJECT TRINITY: Initialization returned False")
         else:
@@ -150,8 +155,10 @@ async def main():
         # Try relative to script
         model_path = Path(__file__).parent / args.model
 
-    # Check if we should try to download from GCS
+    # v73.0: Auto-ensure model exists - download if missing
+    # Priority: 1. GCS (cloud deploy), 2. HuggingFace (local dev), 3. Skip (health-only mode)
     gcs_model_uri = os.getenv("MODEL_GCS_URI")
+    auto_download_model = os.getenv("AUTO_DOWNLOAD_MODEL", "true").lower() == "true"
 
     if not model_path.exists() and gcs_model_uri:
         logger.info(f"Model not found locally, downloading from GCS: {gcs_model_uri}")
@@ -208,6 +215,54 @@ async def main():
                 logger.warning(f"gsutil download failed: {e}")
         except Exception as e:
             logger.warning(f"Failed to download model from GCS: {e}")
+
+    # v73.0: Auto-download from HuggingFace if model still missing and auto-download enabled
+    if not model_path.exists() and auto_download_model:
+        logger.info("Model not found, attempting auto-download from HuggingFace...")
+        try:
+            from jarvis_prime.docker.model_downloader import (
+                download_model,
+                recommend_model,
+                MODEL_CATALOG,
+            )
+
+            # Auto-select best model for available memory (default: TinyLlama for quick start)
+            default_model = os.getenv("DEFAULT_MODEL", "tinyllama-chat")
+
+            if default_model not in MODEL_CATALOG:
+                # Try to recommend based on memory
+                recommended = recommend_model(use_case="balanced", max_memory_gb=8.0)
+                if recommended:
+                    default_model = recommended
+                else:
+                    default_model = "tinyllama-chat"  # Fallback
+
+            logger.info(f"Auto-downloading model: {default_model}")
+            print(f"  📥 Downloading {default_model} from HuggingFace...")
+
+            # Download model (this may take a while for first run)
+            models_dir = Path(__file__).parent / "models"
+            downloaded_path = await download_model(
+                model_key=default_model,
+                models_dir=str(models_dir),
+                set_active=True,
+            )
+
+            # Update model_path to use downloaded model
+            model_path = models_dir / "current.gguf"
+            if model_path.exists():
+                logger.info(f"Model auto-downloaded: {downloaded_path}")
+                print(f"  ✅ Model downloaded successfully: {default_model}")
+            else:
+                logger.warning(f"Auto-download completed but model not at expected path")
+
+        except ImportError as e:
+            logger.warning(f"HuggingFace downloader not available: {e}")
+            logger.warning("Install with: pip install huggingface-hub tqdm")
+        except Exception as e:
+            logger.warning(f"Auto-download from HuggingFace failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Create executor (may be unloaded)
     config = LlamaCppConfig(
@@ -325,6 +380,14 @@ async def main():
                 except Exception:
                     pass  # Don't fail inference for metrics
 
+            # v73.0: Record inference health for Trinity heartbeat
+            # This enables JARVIS Body to detect "Silent Brain Freeze"
+            if trinity_record_inference:
+                try:
+                    trinity_record_inference(latency_ms=latency_ms, success=True)
+                except Exception:
+                    pass  # Don't fail inference for metrics
+
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
                 "object": "chat.completion",
@@ -344,6 +407,12 @@ async def main():
             }
         except Exception as e:
             logger.error(f"Chat error: {e}")
+            # v73.0: Record failed inference
+            if trinity_record_inference:
+                try:
+                    trinity_record_inference(latency_ms=0, success=False)
+                except Exception:
+                    pass
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/generate")
@@ -381,12 +450,25 @@ async def main():
                 except Exception:
                     pass  # Don't fail inference for metrics
 
+            # v73.0: Record inference health for Trinity heartbeat
+            if trinity_record_inference:
+                try:
+                    trinity_record_inference(latency_ms=latency_ms, success=True)
+                except Exception:
+                    pass
+
             return {
                 "text": response,
                 "latency_ms": latency_ms,
             }
         except Exception as e:
             logger.error(f"Generate error: {e}")
+            # v73.0: Record failed inference
+            if trinity_record_inference:
+                try:
+                    trinity_record_inference(latency_ms=0, success=False)
+                except Exception:
+                    pass
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/health")
@@ -402,12 +484,23 @@ async def main():
                 "jarvis_session_id": _bridge.state.jarvis_session_id or None,
             }
 
+        # v73.0: Include inference health from Trinity bridge
+        inference_health = {}
+        if trinity_initialized:
+            try:
+                from jarvis_prime.core.trinity_bridge import get_inference_health
+                inference_health = get_inference_health()
+            except Exception:
+                pass
+
         return {
             "status": "healthy",
             "model_loaded": executor.is_loaded(),
             "model_path": str(model_path) if model_path.exists() else None,
             "ready_for_inference": executor.is_loaded(),
             "bridge_enabled": _bridge is not None,
+            "trinity_enabled": trinity_initialized,
+            "inference_health": inference_health,  # v73.0
             **bridge_info,
             **stats,
         }
