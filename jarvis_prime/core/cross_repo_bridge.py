@@ -35,6 +35,10 @@ PRIME_STATE_FILE = BRIDGE_STATE_DIR / "jarvis_prime_state.json"
 HEARTBEAT_INTERVAL = 30  # seconds
 STALE_THRESHOLD = 120  # seconds - consider stale if no heartbeat
 
+# PROJECT TRINITY: Unified command routing
+TRINITY_DIR = Path.home() / ".jarvis" / "trinity"
+TRINITY_COMMANDS_DIR = TRINITY_DIR / "commands"
+
 
 # ============================================================================
 # Data Classes
@@ -311,6 +315,171 @@ class CrossRepoBridge:
         except Exception as e:
             logger.warning(f"Failed to notify JARVIS: {e}")
             return False
+
+    # =========================================================================
+    # PROJECT TRINITY: Direct command routing to JARVIS Body
+    # =========================================================================
+
+    async def send_trinity_command(
+        self,
+        intent: str,
+        payload: Dict[str, Any],
+        priority: int = 5,
+        requires_ack: bool = True,
+        ttl_seconds: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Send a Trinity command directly to JARVIS Body.
+
+        This is the J-Prime (Mind) -> JARVIS (Body) command pathway through
+        the Trinity file-based transport system.
+
+        Args:
+            intent: Command intent (e.g., "start_surveillance", "bring_back_window")
+            payload: Command payload data
+            priority: Command priority (1-10, lower is higher)
+            requires_ack: Whether to expect ACK response
+            ttl_seconds: Time-to-live for command
+
+        Returns:
+            Dict with success status and command_id
+        """
+        import uuid
+
+        try:
+            # Ensure Trinity directory exists
+            TRINITY_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+
+            command_id = str(uuid.uuid4())
+            timestamp = time.time()
+
+            command = {
+                "id": command_id,
+                "timestamp": timestamp,
+                "source": "j_prime",
+                "intent": intent,
+                "payload": payload,
+                "metadata": {
+                    "prime_instance_id": self.instance_id,
+                    "model_loaded": self.state.model_loaded,
+                },
+                "target": "jarvis_body",
+                "priority": priority,
+                "requires_ack": requires_ack,
+                "ttl_seconds": ttl_seconds,
+            }
+
+            # Write command file
+            filename = f"{int(timestamp * 1000)}_{command_id}.json"
+            filepath = TRINITY_COMMANDS_DIR / filename
+
+            with open(filepath, "w") as f:
+                json.dump(command, f, indent=2)
+
+            logger.info(f"[Trinity] J-Prime sent command: {intent} (id={command_id[:8]})")
+            return {"success": True, "command_id": command_id}
+
+        except Exception as e:
+            logger.error(f"[Trinity] Failed to send command: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def start_surveillance(
+        self,
+        app_name: str,
+        trigger_text: str,
+        all_spaces: bool = True,
+        max_duration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Request JARVIS to start surveillance on an app.
+
+        This is a cognitive decision from J-Prime (Mind) to activate
+        the Ghost Monitor Protocol in JARVIS (Body).
+        """
+        return await self.send_trinity_command(
+            intent="start_surveillance",
+            payload={
+                "app_name": app_name,
+                "trigger_text": trigger_text,
+                "all_spaces": all_spaces,
+                "max_duration": max_duration,
+            },
+        )
+
+    async def stop_surveillance(self, app_name: Optional[str] = None) -> Dict[str, Any]:
+        """Request JARVIS to stop surveillance."""
+        return await self.send_trinity_command(
+            intent="stop_surveillance",
+            payload={"app_name": app_name},
+        )
+
+    async def bring_back_windows(self, app_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Request JARVIS to bring back windows from Ghost Display.
+
+        This is a cognitive decision from J-Prime to restore user visibility.
+        """
+        return await self.send_trinity_command(
+            intent="bring_back_window",
+            payload={"app_name": app_name},
+        )
+
+    async def exile_window(
+        self,
+        app_name: str,
+        window_title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Request JARVIS to exile a window to Ghost Display."""
+        return await self.send_trinity_command(
+            intent="exile_window",
+            payload={
+                "app_name": app_name,
+                "window_title": window_title,
+            },
+        )
+
+    async def freeze_app(self, app_name: str, reason: str = "") -> Dict[str, Any]:
+        """Request JARVIS to freeze an app (SIGSTOP)."""
+        return await self.send_trinity_command(
+            intent="freeze_app",
+            payload={"app_name": app_name, "reason": reason},
+        )
+
+    async def thaw_app(self, app_name: str) -> Dict[str, Any]:
+        """Request JARVIS to thaw a frozen app (SIGCONT)."""
+        return await self.send_trinity_command(
+            intent="thaw_app",
+            payload={"app_name": app_name},
+        )
+
+    async def create_ghost_display(self) -> Dict[str, Any]:
+        """Request JARVIS to create a Ghost Display (virtual display)."""
+        return await self.send_trinity_command(
+            intent="create_ghost_display",
+            payload={},
+        )
+
+    async def execute_plan(
+        self,
+        plan_id: str,
+        steps: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Request JARVIS to execute a multi-step plan.
+
+        This is the primary cognitive output from J-Prime - a reasoned
+        plan of actions for JARVIS to execute.
+        """
+        return await self.send_trinity_command(
+            intent="execute_plan",
+            payload={
+                "plan_id": plan_id,
+                "steps": steps,
+                "context": context or {},
+            },
+            priority=2,  # High priority for plans
+        )
 
     async def _check_jarvis_connection(self) -> None:
         """Check if main JARVIS is running and get session info."""
