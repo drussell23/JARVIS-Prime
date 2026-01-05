@@ -35,6 +35,25 @@ from jarvis_prime.core.model_manager import (
     ModelExecutor,
 )
 
+# PROJECT TRINITY: J-Prime Bridge
+from jarvis_prime.core.trinity_bridge import (
+    initialize_trinity,
+    shutdown_trinity,
+    update_model_status,
+    is_trinity_initialized,
+    get_trinity_status,
+    send_to_jarvis,
+    send_plan_to_jarvis,
+    start_surveillance,
+    stop_surveillance,
+    bring_back_windows,
+    exile_window,
+    freeze_app,
+    thaw_app,
+    get_jarvis_state,
+    is_jarvis_online,
+)
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -56,4 +75,20 @@ __all__ = [
     # Manager
     "PrimeModelManager",
     "ModelExecutor",
+    # PROJECT TRINITY
+    "initialize_trinity",
+    "shutdown_trinity",
+    "update_model_status",
+    "is_trinity_initialized",
+    "get_trinity_status",
+    "send_to_jarvis",
+    "send_plan_to_jarvis",
+    "start_surveillance",
+    "stop_surveillance",
+    "bring_back_windows",
+    "exile_window",
+    "freeze_app",
+    "thaw_app",
+    "get_jarvis_state",
+    "is_jarvis_online",
 ]
