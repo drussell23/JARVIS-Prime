@@ -33,12 +33,145 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger("jarvis-prime.trinity")
+
+
+# =============================================================================
+# v73.0: ATOMIC FILE I/O - Diamond-Hard Protocol
+# =============================================================================
+
+class AtomicTrinityIO:
+    """
+    v73.0: Ensures zero-corruption file operations via Atomic Renames.
+
+    The Problem:
+        Standard file writing (`open('w').write()`) takes non-zero time (e.g., 5ms).
+        If another process tries to read the file during those 5ms, it reads incomplete JSON
+        and crashes with JSONDecodeError.
+
+    The Solution:
+        Write to a temporary file first, then perform an OS-level atomic rename
+        (`os.replace`) to the final filename. This guarantees the file is either
+        *missing* or *perfect*, never partial.
+    """
+
+    @staticmethod
+    def write_json_atomic(filepath: Union[str, Path], data: Dict[str, Any]) -> bool:
+        """
+        Write JSON data atomically to prevent partial reads.
+
+        Args:
+            filepath: Target file path
+            data: JSON-serializable dictionary
+
+        Returns:
+            True if write succeeded, False otherwise
+        """
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_fd = None
+        tmp_name = None
+
+        try:
+            # 1. Create temp file in same directory (required for atomic rename)
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=filepath.parent,
+                prefix=f".{filepath.stem}.",
+                suffix=".tmp"
+            )
+
+            # 2. Write data to temp file
+            with os.fdopen(tmp_fd, 'w') as tmp_file:
+                tmp_fd = None  # os.fdopen takes ownership
+                json.dump(data, tmp_file, indent=2)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())  # Force write to physical disk
+
+            # 3. Atomic swap (OS guarantees this is instantaneous)
+            os.replace(tmp_name, filepath)
+            return True
+
+        except Exception as e:
+            logger.debug(f"[AtomicIO] Write failed: {e}")
+            # Cleanup temp file on failure
+            if tmp_name and os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            return False
+
+        finally:
+            # Ensure fd is closed if not transferred to fdopen
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def read_json_safe(
+        filepath: Union[str, Path],
+        default: Optional[Dict[str, Any]] = None,
+        max_retries: int = 3,
+        retry_delay: float = 0.05
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Read JSON with automatic retry on corruption.
+
+        Args:
+            filepath: File to read
+            default: Value to return if file doesn't exist
+            max_retries: Maximum read attempts
+            retry_delay: Delay between retries in seconds
+
+        Returns:
+            Parsed JSON or default value
+        """
+        filepath = Path(filepath)
+
+        for attempt in range(max_retries):
+            try:
+                if not filepath.exists():
+                    return default
+
+                with open(filepath, 'r') as f:
+                    return json.load(f)
+
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"[AtomicIO] JSON decode retry {attempt + 1}: {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(f"[AtomicIO] JSON decode failed after {max_retries} retries: {e}")
+                    return default
+
+            except Exception as e:
+                logger.debug(f"[AtomicIO] Read failed: {e}")
+                return default
+
+        return default
+
+
+# Convenience functions
+def write_json_atomic(filepath: Union[str, Path], data: Dict[str, Any]) -> bool:
+    """Write JSON atomically. See AtomicTrinityIO.write_json_atomic."""
+    return AtomicTrinityIO.write_json_atomic(filepath, data)
+
+
+def read_json_safe(
+    filepath: Union[str, Path],
+    default: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """Read JSON safely. See AtomicTrinityIO.read_json_safe."""
+    return AtomicTrinityIO.read_json_safe(filepath, default)
 
 
 # =============================================================================
@@ -67,6 +200,12 @@ _start_time = time.time()
 _model_loaded = False
 _model_path = ""
 _port = 8000
+
+# v73.0: Inference Health Metrics
+_last_inference_time: float = 0.0
+_inference_count: int = 0
+_inference_errors: int = 0
+_avg_inference_latency_ms: float = 0.0
 
 # JARVIS state cache (from heartbeats)
 _jarvis_state: Dict[str, Any] = {}
@@ -170,6 +309,51 @@ def update_model_status(loaded: bool, model_path: str = "") -> None:
     _model_path = model_path
 
 
+def record_inference(latency_ms: float, success: bool = True) -> None:
+    """
+    v73.0: Record an inference event for health tracking.
+
+    Call this after each inference to track J-Prime's "brain" health.
+
+    Args:
+        latency_ms: Time taken for inference in milliseconds
+        success: Whether the inference succeeded
+    """
+    global _last_inference_time, _inference_count, _inference_errors, _avg_inference_latency_ms
+
+    _last_inference_time = time.time()
+    _inference_count += 1
+
+    if not success:
+        _inference_errors += 1
+
+    # Rolling average latency (exponential moving average)
+    if _avg_inference_latency_ms == 0:
+        _avg_inference_latency_ms = latency_ms
+    else:
+        alpha = 0.1  # Smoothing factor
+        _avg_inference_latency_ms = alpha * latency_ms + (1 - alpha) * _avg_inference_latency_ms
+
+
+def get_inference_health() -> Dict[str, Any]:
+    """
+    v73.0: Get current inference health metrics.
+
+    Returns:
+        Dict with inference health data
+    """
+    inference_age = time.time() - _last_inference_time if _last_inference_time > 0 else -1
+
+    return {
+        "last_inference_time": _last_inference_time,
+        "inference_age_seconds": inference_age,
+        "inference_count": _inference_count,
+        "inference_errors": _inference_errors,
+        "avg_inference_latency_ms": _avg_inference_latency_ms,
+        "inference_healthy": inference_age < 60.0 if inference_age >= 0 else False,
+    }
+
+
 # =============================================================================
 # COMMAND SENDING
 # =============================================================================
@@ -219,13 +403,13 @@ async def send_to_jarvis(
             "ttl_seconds": timeout,
         }
 
-        # Write command file
+        # Write command file (v73.0: atomic write)
         commands_dir = TRINITY_DIR / "commands"
         filename = f"{int(time.time() * 1000)}_{command_id}.json"
         filepath = commands_dir / filename
 
-        with open(filepath, "w") as f:
-            json.dump(command, f, indent=2)
+        if not write_json_atomic(filepath, command):
+            logger.warning(f"[Trinity] Atomic write failed for command {command_id[:8]}")
 
         logger.info(f"[Trinity] J-Prime sent command: {intent} (id={command_id[:8]})")
         return {"success": True, "command_id": command_id}
@@ -351,7 +535,11 @@ async def _heartbeat_loop() -> None:
 
 
 async def _broadcast_heartbeat() -> None:
-    """Broadcast J-Prime state as heartbeat."""
+    """
+    Broadcast J-Prime state as heartbeat.
+
+    v73.0: Now includes inference health metrics and uses atomic writes.
+    """
     state = {
         "instance_id": JPRIME_INSTANCE_ID,
         "component_type": "j_prime",
@@ -371,27 +559,32 @@ async def _broadcast_heartbeat() -> None:
     except ImportError:
         pass
 
-    # Write to components directory
-    try:
-        components_dir = TRINITY_DIR / "components"
-        state_file = components_dir / "j_prime.json"
-        with open(state_file, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        logger.debug(f"[Trinity] Could not write state: {e}")
+    # v73.0: Inference Health Metrics - Detect "Silent Brain Freeze"
+    inference_health = get_inference_health()
+    state["inference_health"] = inference_health
+    state["last_inference_time"] = inference_health["last_inference_time"]
+    state["inference_healthy"] = inference_health["inference_healthy"]
 
-    # Also write heartbeat file for bridge compatibility
+    # v73.0: Write to components directory using atomic writes
+    components_dir = TRINITY_DIR / "components"
+    state_file = components_dir / "j_prime.json"
+    if not write_json_atomic(state_file, state):
+        logger.debug("[Trinity] Could not write state (atomic write failed)")
+
+    # v73.0: Also write heartbeat file using atomic writes for bridge compatibility
     try:
         heartbeats_dir = TRINITY_DIR / "heartbeats"
         heartbeat_file = heartbeats_dir / f"jprime_{int(time.time() * 1000)}.json"
-        with open(heartbeat_file, "w") as f:
-            json.dump({
-                "id": str(uuid.uuid4()),
-                "timestamp": time.time(),
-                "source": "j_prime",
-                "intent": "heartbeat",
-                "payload": state,
-            }, f, indent=2)
+        heartbeat_data = {
+            "id": str(uuid.uuid4()),
+            "timestamp": time.time(),
+            "source": "j_prime",
+            "intent": "heartbeat",
+            "payload": state,
+        }
+
+        if not write_json_atomic(heartbeat_file, heartbeat_data):
+            logger.debug("[Trinity] Could not write heartbeat (atomic write failed)")
 
         # Cleanup old heartbeats (keep last 10)
         heartbeats = sorted(heartbeats_dir.glob("jprime_*.json"))
@@ -407,16 +600,19 @@ async def _broadcast_heartbeat() -> None:
 # =============================================================================
 
 async def _state_watcher_loop() -> None:
-    """Watch for JARVIS state updates."""
+    """
+    Watch for JARVIS state updates.
+
+    v73.0: Now uses safe JSON reading to handle partial reads gracefully.
+    """
     global _jarvis_state
 
     while _trinity_initialized:
         try:
-            # Read JARVIS component state
+            # v73.0: Read JARVIS component state using safe read with retry
             jarvis_file = TRINITY_DIR / "components" / "jarvis_body.json"
-            if jarvis_file.exists():
-                with open(jarvis_file) as f:
-                    data = json.load(f)
+            data = read_json_safe(jarvis_file, default={})
+            if data:
                 _jarvis_state = data.get("metrics", {})
 
             await asyncio.sleep(2.0)
@@ -479,6 +675,9 @@ __all__ = [
     "update_model_status",
     "is_trinity_initialized",
     "get_trinity_status",
+    # v73.0: Inference Health
+    "record_inference",
+    "get_inference_health",
     # Commands
     "send_to_jarvis",
     "send_plan_to_jarvis",
@@ -492,6 +691,9 @@ __all__ = [
     # State
     "get_jarvis_state",
     "is_jarvis_online",
+    # v73.0: Atomic I/O
+    "write_json_atomic",
+    "read_json_safe",
     # Constants
     "JPRIME_INSTANCE_ID",
 ]
