@@ -85,8 +85,10 @@ async def main():
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import StreamingResponse
         from pydantic import BaseModel
         import uvicorn
+        import json
     except ImportError:
         logger.error("Missing dependencies. Install with:")
         logger.error("  pip install fastapi uvicorn pydantic")
@@ -340,19 +342,117 @@ async def main():
     # Endpoints
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
-        """OpenAI-compatible chat completions."""
+        """OpenAI-compatible chat completions with streaming support."""
         if not executor.is_loaded():
             raise HTTPException(
                 status_code=503,
                 detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
             )
+
+        # Format messages
+        from jarvis_prime.core.model_manager import ChatMessage
+        messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
+        prompt = executor.format_messages(messages)
+        prompt_tokens = len(prompt.split())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        created = int(time.time())
+
+        # v74.0: Streaming Response (SSE format)
+        if request.stream:
+            async def stream_generator():
+                """Generate SSE stream in OpenAI-compatible format."""
+                start = time.time()
+                token_count = 0
+
+                try:
+                    async for token in executor.generate_stream(
+                        prompt=prompt,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                    ):
+                        token_count += 1
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": "jarvis-prime",
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": token},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                    # Final chunk with finish_reason
+                    final_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": "jarvis-prime",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                    # Record metrics after streaming completes
+                    latency_ms = (time.time() - start) * 1000
+
+                    if _bridge:
+                        try:
+                            from jarvis_prime.core.cross_repo_bridge import record_inference
+                            record_inference(
+                                tokens_in=prompt_tokens,
+                                tokens_out=token_count,
+                                latency_ms=latency_ms,
+                            )
+                        except Exception:
+                            pass
+
+                    if trinity_record_inference:
+                        try:
+                            trinity_record_inference(latency_ms=latency_ms, success=True)
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    logger.error(f"Streaming error: {e}")
+                    if trinity_record_inference:
+                        try:
+                            trinity_record_inference(latency_ms=0, success=False)
+                        except Exception:
+                            pass
+                    error_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": "jarvis-prime",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n[Error: {str(e)}]"},
+                            "finish_reason": "error",
+                        }],
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",  # Disable nginx buffering
+                },
+            )
+
+        # Non-streaming response (original behavior)
         try:
             start = time.time()
-
-            # Format messages
-            from jarvis_prime.core.model_manager import ChatMessage
-            messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
-            prompt = executor.format_messages(messages)
 
             # Generate
             response = await executor.generate(
@@ -365,7 +465,6 @@ async def main():
             latency_ms = latency * 1000
 
             # Estimate tokens
-            prompt_tokens = len(prompt.split())
             completion_tokens = len(response.split())
 
             # Record inference metrics for cost tracking
@@ -389,9 +488,9 @@ async def main():
                     pass  # Don't fail inference for metrics
 
             return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                "id": completion_id,
                 "object": "chat.completion",
-                "created": int(time.time()),
+                "created": created,
                 "model": "jarvis-prime",
                 "choices": [{
                     "index": 0,
