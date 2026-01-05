@@ -471,6 +471,8 @@ def get_trinity_status() -> Dict[str, Any]:
 # =============================================================================
 
 __all__ = [
+    # Configuration
+    "TRINITY_ENABLED",
     # Initialization
     "initialize_trinity",
     "shutdown_trinity",

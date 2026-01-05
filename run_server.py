@@ -121,6 +121,29 @@ async def main():
         logger.info("Cross-repo bridge disabled")
         _bridge = None
 
+    # v72.0: Initialize PROJECT TRINITY connection for distributed architecture
+    # This enables JARVIS Body to detect J-Prime is online via heartbeat files
+    trinity_initialized = False
+    try:
+        from jarvis_prime.core.trinity_bridge import (
+            initialize_trinity,
+            shutdown_trinity,
+            update_model_status as trinity_update_model_status,
+            TRINITY_ENABLED,
+        )
+        if TRINITY_ENABLED:
+            trinity_initialized = await initialize_trinity(port=args.port)
+            if trinity_initialized:
+                logger.info("PROJECT TRINITY: J-Prime (Mind) connected to Trinity network")
+            else:
+                logger.warning("PROJECT TRINITY: Initialization returned False")
+        else:
+            logger.info("PROJECT TRINITY: Disabled (TRINITY_ENABLED=false)")
+    except ImportError as e:
+        logger.warning(f"PROJECT TRINITY: Module not available ({e})")
+    except Exception as e:
+        logger.warning(f"PROJECT TRINITY: Initialization failed ({e})")
+
     # Check model exists
     model_path = Path(args.model)
     if not model_path.exists():
@@ -430,6 +453,15 @@ async def main():
     async def shutdown():
         logger.info("Shutting down...")
 
+        # v72.0: Shutdown PROJECT TRINITY connection
+        if trinity_initialized:
+            try:
+                from jarvis_prime.core.trinity_bridge import shutdown_trinity
+                await shutdown_trinity()
+                logger.info("PROJECT TRINITY: J-Prime disconnected from Trinity network")
+            except Exception as e:
+                logger.warning(f"Trinity shutdown error: {e}")
+
         # Log final cost summary
         if _bridge:
             try:
@@ -475,6 +507,12 @@ async def main():
             logger.info("JARVIS Bridge: Enabled (standalone mode)")
     else:
         logger.info("JARVIS Bridge: Disabled")
+
+    # v72.0: Trinity status
+    if trinity_initialized:
+        logger.info("PROJECT TRINITY: Connected (Mind component online)")
+    else:
+        logger.info("PROJECT TRINITY: Not connected")
 
     logger.info("")
     logger.info("Endpoints:")
