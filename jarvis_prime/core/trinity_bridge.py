@@ -355,6 +355,141 @@ def get_inference_health() -> Dict[str, Any]:
 
 
 # =============================================================================
+# v75.0: MODEL HEALTH CHECK - Deep Model Verification
+# =============================================================================
+
+# Callback for test inference (set by run_server.py)
+_model_health_callback: Optional[Callable] = None
+
+
+def set_model_health_callback(callback: Callable) -> None:
+    """
+    v75.0: Set callback for model health verification.
+
+    The callback should perform a test inference and return True if successful.
+
+    Args:
+        callback: Async function that returns bool indicating model health
+    """
+    global _model_health_callback
+    _model_health_callback = callback
+
+
+async def check_model_health(timeout: float = 10.0) -> Dict[str, Any]:
+    """
+    v75.0: Deep model health check - verifies the model can actually generate.
+
+    This goes beyond just checking if the model is loaded. It performs a
+    lightweight test inference to verify the model is actually working.
+
+    Features:
+        - Test inference with minimal prompt
+        - Timeout protection
+        - Error categorization
+        - Health status with details
+
+    Args:
+        timeout: Maximum time to wait for test inference
+
+    Returns:
+        Dict with health status and details
+    """
+    start_time = time.time()
+    result = {
+        "healthy": False,
+        "model_loaded": _model_loaded,
+        "model_path": _model_path,
+        "check_time": start_time,
+        "check_duration_ms": 0,
+        "error": None,
+        "inference_health": get_inference_health(),
+    }
+
+    # Check 1: Model loaded flag
+    if not _model_loaded:
+        result["error"] = "model_not_loaded"
+        result["check_duration_ms"] = (time.time() - start_time) * 1000
+        return result
+
+    # Check 2: Model path exists
+    if _model_path and not Path(_model_path).exists():
+        result["error"] = "model_file_missing"
+        result["check_duration_ms"] = (time.time() - start_time) * 1000
+        return result
+
+    # Check 3: Test inference (if callback available)
+    if _model_health_callback:
+        try:
+            if asyncio.iscoroutinefunction(_model_health_callback):
+                test_result = await asyncio.wait_for(
+                    _model_health_callback(),
+                    timeout=timeout,
+                )
+            else:
+                test_result = _model_health_callback()
+
+            if test_result:
+                result["healthy"] = True
+            else:
+                result["error"] = "test_inference_failed"
+
+        except asyncio.TimeoutError:
+            result["error"] = "test_inference_timeout"
+            logger.warning(f"[Trinity] Model health check timed out after {timeout}s")
+
+        except Exception as e:
+            result["error"] = f"test_inference_error: {str(e)}"
+            logger.warning(f"[Trinity] Model health check error: {e}")
+    else:
+        # No callback - rely on inference health metrics
+        health = get_inference_health()
+        if health["inference_healthy"] and health["inference_count"] > 0:
+            result["healthy"] = True
+        elif health["inference_count"] == 0:
+            result["error"] = "no_inference_yet"
+            result["healthy"] = _model_loaded  # Assume OK if just started
+        else:
+            result["error"] = "inference_unhealthy"
+
+    result["check_duration_ms"] = (time.time() - start_time) * 1000
+    return result
+
+
+async def ensure_model_healthy(
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
+) -> bool:
+    """
+    v75.0: Ensure model is healthy, with retries.
+
+    This function can be called before critical operations to verify
+    the model is ready. It retries with delays to handle transient issues.
+
+    Args:
+        max_retries: Maximum number of health check attempts
+        retry_delay: Delay between retries in seconds
+
+    Returns:
+        True if model is healthy, False otherwise
+    """
+    for attempt in range(max_retries):
+        health = await check_model_health()
+
+        if health["healthy"]:
+            return True
+
+        if attempt < max_retries - 1:
+            logger.warning(
+                f"[Trinity] Model health check failed (attempt {attempt + 1}/{max_retries}): "
+                f"{health.get('error', 'unknown')}"
+            )
+            await asyncio.sleep(retry_delay)
+
+    logger.error("[Trinity] Model health check failed after all retries")
+    return False
+
+
+# =============================================================================
 # COMMAND SENDING
 # =============================================================================
 
@@ -678,6 +813,10 @@ __all__ = [
     # v73.0: Inference Health
     "record_inference",
     "get_inference_health",
+    # v75.0: Model Health Check
+    "set_model_health_callback",
+    "check_model_health",
+    "ensure_model_healthy",
     # Commands
     "send_to_jarvis",
     "send_plan_to_jarvis",
