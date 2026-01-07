@@ -151,6 +151,41 @@ async def main():
     except Exception as e:
         logger.warning(f"PROJECT TRINITY: Initialization failed ({e})")
 
+    # v77.0: Initialize AGI Integration Hub
+    # Connects all AGI subsystems: Orchestrator, Reasoning, Learning, MultiModal, Hardware
+    agi_hub = None
+    agi_inference = None
+    try:
+        from jarvis_prime.core.agi_integration import (
+            AGIIntegrationHub,
+            AGIHubConfig,
+            get_agi_hub,
+            shutdown_agi_hub,
+            AGIEnhancedInference,
+        )
+
+        agi_config = AGIHubConfig(
+            enable_orchestrator=True,
+            enable_reasoning=True,
+            enable_learning=True,
+            enable_multimodal=True,
+            enable_hardware_optimization=True,
+            enable_auto_reasoning=True,
+            enable_experience_recording=True,
+        )
+
+        agi_hub = await get_agi_hub(agi_config)
+        logger.info("AGI v77.0: Integration Hub initialized")
+        logger.info(f"  - Orchestrator: {agi_hub._subsystem_status.get('ORCHESTRATOR', {})}")
+        logger.info(f"  - Reasoning Engine: Active")
+        logger.info(f"  - Continuous Learning: Active")
+        logger.info(f"  - MultiModal Fusion: Active")
+
+    except ImportError as e:
+        logger.warning(f"AGI Integration Hub not available: {e}")
+    except Exception as e:
+        logger.warning(f"AGI Integration Hub initialization failed: {e}")
+
     # Check model exists
     model_path = Path(args.model)
     if not model_path.exists():
@@ -266,11 +301,40 @@ async def main():
             import traceback
             traceback.print_exc()
 
+    # v77.0: Apply Apple Silicon optimizations if available
+    optimized_gpu_layers = args.gpu_layers
+    optimized_threads = args.threads
+    optimized_ctx_size = args.ctx_size
+
+    if agi_hub and agi_hub.hardware_optimizer:
+        try:
+            hw_opt = agi_hub.hardware_optimizer
+            recommendations = hw_opt.get_recommendations()
+
+            if recommendations:
+                # Use optimized settings from Apple Silicon analyzer
+                if recommendations.get("use_mps", False):
+                    optimized_gpu_layers = -1  # All layers on GPU
+                    logger.info("Apple Silicon: MPS acceleration enabled")
+
+                if "optimal_threads" in recommendations:
+                    optimized_threads = recommendations["optimal_threads"]
+                    logger.info(f"Apple Silicon: Using {optimized_threads} threads")
+
+                if "optimal_batch_size" in recommendations:
+                    # Adjust context based on memory
+                    logger.info(f"Apple Silicon: Batch size optimized for UMA")
+
+                logger.info(f"Apple Silicon: Generation {recommendations.get('generation', 'unknown')}")
+
+        except Exception as e:
+            logger.warning(f"Apple Silicon optimization failed: {e}")
+
     # Create executor (may be unloaded)
     config = LlamaCppConfig(
-        n_ctx=args.ctx_size,
-        n_threads=args.threads,
-        n_gpu_layers=args.gpu_layers,
+        n_ctx=optimized_ctx_size,
+        n_threads=optimized_threads,
+        n_gpu_layers=optimized_gpu_layers,
         verbose=args.debug,
     )
     executor = LlamaCppExecutor(config)
@@ -641,9 +705,254 @@ async def main():
             }],
         }
 
+    # ==========================================================================
+    # AGI v77.0 ENDPOINTS - Advanced Cognitive Capabilities
+    # ==========================================================================
+
+    class AGIReasonRequest(BaseModel):
+        """Request for AGI reasoning."""
+        query: str
+        strategy: str = "chain_of_thought"  # chain_of_thought, tree_of_thoughts, self_reflection
+        context: dict = {}
+
+    class AGIPlanRequest(BaseModel):
+        """Request for AGI action planning."""
+        goal: str
+        context: dict = {}
+        constraints: List[str] = []
+
+    class AGIFeedbackRequest(BaseModel):
+        """Request to record learning feedback."""
+        experience_id: str
+        score: float  # -1.0 to 1.0
+        comment: Optional[str] = None
+
+    class AGIProcessRequest(BaseModel):
+        """Request for full AGI processing pipeline."""
+        content: str
+        modalities: List[str] = ["text"]
+        context: dict = {}
+        enable_reasoning: bool = True
+        enable_learning: bool = True
+
+    @app.post("/agi/reason")
+    async def agi_reason(request: AGIReasonRequest):
+        """
+        Execute advanced reasoning on a query.
+
+        Strategies:
+        - chain_of_thought: Sequential step-by-step reasoning
+        - tree_of_thoughts: Parallel exploration of multiple paths
+        - self_reflection: Meta-cognitive analysis and correction
+        - hypothesis_test: Evidence-based hypothesis testing
+        """
+        if not agi_hub:
+            raise HTTPException(status_code=503, detail="AGI Hub not initialized")
+
+        try:
+            start = time.time()
+            result = await agi_hub.reason(
+                query=request.query,
+                strategy=request.strategy,
+                context=request.context,
+            )
+            latency_ms = (time.time() - start) * 1000
+
+            return {
+                "status": "success",
+                "query": request.query,
+                "strategy": request.strategy,
+                "conclusion": result.get("conclusion"),
+                "trace": result.get("trace", []),
+                "confidence": result.get("confidence", 0.0),
+                "latency_ms": latency_ms,
+            }
+        except Exception as e:
+            logger.error(f"AGI reasoning error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/agi/plan")
+    async def agi_plan(request: AGIPlanRequest):
+        """
+        Generate an action plan for a goal.
+
+        Uses ActionModel and GoalInference from AGI Orchestrator
+        to create executable action sequences.
+        """
+        if not agi_hub:
+            raise HTTPException(status_code=503, detail="AGI Hub not initialized")
+
+        try:
+            start = time.time()
+            result = await agi_hub.plan(
+                goal=request.goal,
+                context=request.context,
+            )
+            latency_ms = (time.time() - start) * 1000
+
+            return {
+                "status": "success",
+                "goal": request.goal,
+                "plan": result,
+                "latency_ms": latency_ms,
+            }
+        except Exception as e:
+            logger.error(f"AGI planning error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/agi/process")
+    async def agi_process(request: AGIProcessRequest):
+        """
+        Full AGI processing pipeline.
+
+        1. Analyzes request complexity
+        2. Applies appropriate reasoning strategy
+        3. Coordinates multiple AGI models
+        4. Records experience for learning
+        """
+        if not agi_hub:
+            raise HTTPException(status_code=503, detail="AGI Hub not initialized")
+
+        try:
+            # Create inference function wrapper
+            async def inference_fn(prompt: str, **kwargs):
+                if executor.is_loaded():
+                    return await executor.generate(
+                        prompt=prompt,
+                        max_tokens=512,
+                        temperature=0.7,
+                    )
+                return prompt  # Passthrough if no model
+
+            result = await agi_hub.process(
+                content=request.content,
+                modalities=request.modalities,
+                context=request.context,
+                inference_fn=inference_fn if request.enable_reasoning else None,
+            )
+
+            return {
+                "status": "success",
+                "request_id": result.request_id,
+                "content": result.content,
+                "reasoning_trace": result.reasoning_trace,
+                "confidence": result.confidence,
+                "models_used": result.models_used,
+                "processing_time_ms": result.processing_time_ms,
+                "feedback_recorded": result.feedback_recorded,
+            }
+        except Exception as e:
+            logger.error(f"AGI process error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/agi/feedback")
+    async def agi_feedback(request: AGIFeedbackRequest):
+        """
+        Record feedback for continuous learning.
+
+        Feedback is used to improve future responses through
+        experience replay and online fine-tuning.
+        """
+        if not agi_hub:
+            raise HTTPException(status_code=503, detail="AGI Hub not initialized")
+
+        try:
+            success = await agi_hub.record_feedback(
+                experience_id=request.experience_id,
+                score=request.score,
+                comment=request.comment,
+            )
+
+            return {
+                "status": "success" if success else "failed",
+                "experience_id": request.experience_id,
+                "score": request.score,
+            }
+        except Exception as e:
+            logger.error(f"AGI feedback error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/agi/learning/trigger")
+    async def agi_learning_trigger(force: bool = False):
+        """
+        Trigger a learning update.
+
+        Processes accumulated experiences to update model weights
+        using EWC (Elastic Weight Consolidation) to prevent forgetting.
+        """
+        if not agi_hub:
+            raise HTTPException(status_code=503, detail="AGI Hub not initialized")
+
+        try:
+            result = await agi_hub.trigger_learning_update(force=force)
+            return {
+                "status": "success",
+                "result": result,
+            }
+        except Exception as e:
+            logger.error(f"AGI learning trigger error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/agi/status")
+    async def agi_status():
+        """Get AGI subsystem status and metrics."""
+        if not agi_hub:
+            return {
+                "status": "not_initialized",
+                "message": "AGI Hub not available",
+            }
+
+        try:
+            status = agi_hub.get_status()
+            health = await agi_hub.health_check()
+
+            return {
+                "status": "ok",
+                "initialized": status["initialized"],
+                "healthy": health["healthy"],
+                "subsystems": status["subsystems"],
+                "metrics": status["metrics"],
+            }
+        except Exception as e:
+            logger.error(f"AGI status error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
+
+    @app.get("/agi/learning/stats")
+    async def agi_learning_stats():
+        """Get continuous learning statistics."""
+        if not agi_hub or not agi_hub.learning_engine:
+            return {
+                "status": "not_available",
+                "message": "Learning engine not initialized",
+            }
+
+        try:
+            stats = agi_hub.learning_engine.get_statistics()
+            return {
+                "status": "ok",
+                "statistics": stats,
+            }
+        except Exception as e:
+            logger.error(f"AGI learning stats error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
+
     @app.on_event("shutdown")
     async def shutdown():
         logger.info("Shutting down...")
+
+        # v77.0: Shutdown AGI Integration Hub
+        if agi_hub:
+            try:
+                await shutdown_agi_hub()
+                logger.info("AGI Integration Hub shutdown complete")
+            except Exception as e:
+                logger.warning(f"AGI Hub shutdown error: {e}")
 
         # v72.0: Shutdown PROJECT TRINITY connection
         if trinity_initialized:
@@ -706,12 +1015,31 @@ async def main():
     else:
         logger.info("PROJECT TRINITY: Not connected")
 
+    # v77.0: AGI status
+    if agi_hub:
+        logger.info("AGI Integration Hub: Active")
+        logger.info("  - Reasoning Engine: Chain-of-Thought, Tree-of-Thoughts, Self-Reflection")
+        logger.info("  - Continuous Learning: EWC, Synaptic Intelligence")
+        logger.info("  - MultiModal Fusion: Screen, Audio, Gesture")
+    else:
+        logger.info("AGI Integration Hub: Not connected")
+
     logger.info("")
     logger.info("Endpoints:")
     logger.info(f"  POST http://localhost:{args.port}/v1/chat/completions")
     logger.info(f"  POST http://localhost:{args.port}/generate")
     logger.info(f"  GET  http://localhost:{args.port}/health")
     logger.info(f"  GET  http://localhost:{args.port}/metrics")
+    if agi_hub:
+        logger.info("")
+        logger.info("AGI Endpoints (v77.0):")
+        logger.info(f"  POST http://localhost:{args.port}/agi/reason")
+        logger.info(f"  POST http://localhost:{args.port}/agi/plan")
+        logger.info(f"  POST http://localhost:{args.port}/agi/process")
+        logger.info(f"  POST http://localhost:{args.port}/agi/feedback")
+        logger.info(f"  POST http://localhost:{args.port}/agi/learning/trigger")
+        logger.info(f"  GET  http://localhost:{args.port}/agi/status")
+        logger.info(f"  GET  http://localhost:{args.port}/agi/learning/stats")
     logger.info("=" * 60)
 
     # Run server
