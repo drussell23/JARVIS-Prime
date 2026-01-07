@@ -701,8 +701,10 @@ async def _broadcast_heartbeat() -> None:
     state["inference_healthy"] = inference_health["inference_healthy"]
 
     # v73.0: Write to components directory using atomic writes
+    # CRITICAL: Use "jarvis_prime.json" to match JARVIS health checker expectations
+    # The health checker in JARVIS looks for "jarvis_prime.json", not "j_prime.json"
     components_dir = TRINITY_DIR / "components"
-    state_file = components_dir / "j_prime.json"
+    state_file = components_dir / "jarvis_prime.json"
     if not write_json_atomic(state_file, state):
         logger.debug("[Trinity] Could not write state (atomic write failed)")
 
