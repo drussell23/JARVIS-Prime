@@ -120,22 +120,30 @@ class AtomicTrinityIO:
     def read_json_safe(
         filepath: Union[str, Path],
         default: Optional[Dict[str, Any]] = None,
-        max_retries: int = 3,
-        retry_delay: float = 0.05
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Read JSON with automatic retry on corruption.
+        v79.0: Read JSON with automatic retry on corruption.
+
+        Uses configurable retry settings from TrinityConfig or environment variables.
 
         Args:
             filepath: File to read
             default: Value to return if file doesn't exist
-            max_retries: Maximum read attempts
-            retry_delay: Delay between retries in seconds
+            max_retries: Maximum read attempts (default from config)
+            retry_delay: Delay between retries in seconds (default from config)
 
         Returns:
             Parsed JSON or default value
         """
         filepath = Path(filepath)
+
+        # Use configurable defaults
+        if max_retries is None:
+            max_retries = _get_max_retries() if '_get_max_retries' in dir() else 3
+        if retry_delay is None:
+            retry_delay = _get_retry_delay() if '_get_retry_delay' in dir() else 0.05
 
         for attempt in range(max_retries):
             try:
@@ -147,8 +155,11 @@ class AtomicTrinityIO:
 
             except json.JSONDecodeError as e:
                 if attempt < max_retries - 1:
+                    # v79.0: Add jitter to prevent thundering herd
+                    jitter = retry_delay * 0.1 * (attempt + 1)
+                    actual_delay = retry_delay + jitter
                     logger.debug(f"[AtomicIO] JSON decode retry {attempt + 1}: {e}")
-                    time.sleep(retry_delay)
+                    time.sleep(actual_delay)
                 else:
                     logger.warning(f"[AtomicIO] JSON decode failed after {max_retries} retries: {e}")
                     return default
@@ -175,12 +186,91 @@ def read_json_safe(
 
 
 # =============================================================================
-# CONFIGURATION
+# v79.0: UNIFIED CONFIGURATION - Zero Hardcoding
+# =============================================================================
+#
+# All configuration now sourced from the unified TrinityConfig system.
+# This ensures consistency across all Trinity repos (JARVIS, Prime, Reactor Core).
 # =============================================================================
 
-TRINITY_ENABLED = os.getenv("TRINITY_ENABLED", "true").lower() == "true"
-TRINITY_HEARTBEAT_INTERVAL = float(os.getenv("TRINITY_HEARTBEAT_INTERVAL", "5.0"))
-TRINITY_DIR = Path.home() / ".jarvis" / "trinity"
+# Try to import unified config, fall back to local env vars if not available
+try:
+    import sys
+    # Add JARVIS path to allow cross-repo imports
+    _jarvis_path = Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent"
+    if str(_jarvis_path) not in sys.path:
+        sys.path.insert(0, str(_jarvis_path))
+
+    from backend.core.trinity_config import (
+        get_config,
+        sleep_with_jitter,
+        get_retry_delay,
+        TrinityConfig,
+    )
+    _UNIFIED_CONFIG = True
+    logger.debug("[Trinity] Using unified TrinityConfig")
+except ImportError:
+    _UNIFIED_CONFIG = False
+    logger.debug("[Trinity] Unified config not available, using local defaults")
+
+
+def _get_trinity_config():
+    """Get Trinity configuration with fallback."""
+    if _UNIFIED_CONFIG:
+        return get_config()
+    return None
+
+
+# Configuration with environment variable fallbacks
+def _get_trinity_enabled() -> bool:
+    config = _get_trinity_config()
+    if config:
+        return config.enabled
+    return os.getenv("TRINITY_ENABLED", "true").lower() == "true"
+
+
+def _get_heartbeat_interval() -> float:
+    config = _get_trinity_config()
+    if config:
+        return config.health.heartbeat_interval
+    return float(os.getenv("TRINITY_HEARTBEAT_INTERVAL", "5.0"))
+
+
+def _get_trinity_dir() -> Path:
+    config = _get_trinity_config()
+    if config:
+        return config.trinity_dir
+    return Path(os.getenv("TRINITY_DIR", str(Path.home() / ".jarvis" / "trinity")))
+
+
+def _get_file_timeout() -> float:
+    """v79.0: Get timeout for file operations."""
+    config = _get_trinity_config()
+    if config:
+        return config.timeouts.file_operation
+    return float(os.getenv("TRINITY_FILE_OPERATION_TIMEOUT", "10.0"))
+
+
+def _get_max_retries() -> int:
+    """v79.0: Get max retry attempts."""
+    config = _get_trinity_config()
+    if config:
+        return config.retry.max_retries
+    return int(os.getenv("TRINITY_MAX_RETRIES", "3"))
+
+
+def _get_retry_delay() -> float:
+    """v79.0: Get initial retry delay."""
+    config = _get_trinity_config()
+    if config:
+        return config.retry.initial_delay
+    return float(os.getenv("TRINITY_RETRY_DELAY", "0.05"))
+
+
+# Computed values (dynamic, not hardcoded)
+TRINITY_ENABLED = _get_trinity_enabled()
+TRINITY_HEARTBEAT_INTERVAL = _get_heartbeat_interval()
+TRINITY_DIR = _get_trinity_dir()
 
 # Instance identification
 JPRIME_INSTANCE_ID = os.getenv(
