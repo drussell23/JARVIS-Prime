@@ -54,6 +54,48 @@ from jarvis_prime.core.trinity_bridge import (
     is_jarvis_online,
 )
 
+# AGI v76.0: Advanced Cognitive Systems
+from jarvis_prime.core.agi_models import (
+    AGIModelType,
+    AGIOrchestrator,
+    CognitiveState,
+    ActionModel,
+    MetaReasoner,
+    CausalEngine,
+    WorldModel,
+    MemoryConsolidator,
+    GoalInference,
+    SelfModel,
+)
+from jarvis_prime.core.reasoning_engine import (
+    ReasoningEngine,
+    ReasoningStrategy,
+    Thought,
+    ThoughtTree,
+    ReasoningResult,
+)
+from jarvis_prime.core.apple_silicon_optimizer import (
+    AppleSiliconOptimizer,
+    AppleSiliconGeneration,
+    MPSOptimizer,
+    CoreMLOptimizer,
+    UMAOptimizer,
+)
+from jarvis_prime.core.continuous_learning import (
+    ContinuousLearningEngine,
+    ExperienceBuffer,
+    ElasticWeightConsolidation,
+    SynapticIntelligence,
+    ABTestManager,
+)
+from jarvis_prime.core.multimodal_fusion import (
+    MultiModalFusionEngine,
+    Modality,
+    FusionStrategy,
+    SpatialReasoner,
+    TemporalReasoner,
+)
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -91,4 +133,39 @@ __all__ = [
     "thaw_app",
     "get_jarvis_state",
     "is_jarvis_online",
+    # AGI Models
+    "AGIModelType",
+    "AGIOrchestrator",
+    "CognitiveState",
+    "ActionModel",
+    "MetaReasoner",
+    "CausalEngine",
+    "WorldModel",
+    "MemoryConsolidator",
+    "GoalInference",
+    "SelfModel",
+    # Reasoning Engine
+    "ReasoningEngine",
+    "ReasoningStrategy",
+    "Thought",
+    "ThoughtTree",
+    "ReasoningResult",
+    # Apple Silicon Optimization
+    "AppleSiliconOptimizer",
+    "AppleSiliconGeneration",
+    "MPSOptimizer",
+    "CoreMLOptimizer",
+    "UMAOptimizer",
+    # Continuous Learning
+    "ContinuousLearningEngine",
+    "ExperienceBuffer",
+    "ElasticWeightConsolidation",
+    "SynapticIntelligence",
+    "ABTestManager",
+    # Multi-Modal Fusion
+    "MultiModalFusionEngine",
+    "Modality",
+    "FusionStrategy",
+    "SpatialReasoner",
+    "TemporalReasoner",
 ]
