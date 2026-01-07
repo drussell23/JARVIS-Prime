@@ -3,18 +3,31 @@
 JARVIS Unified Supervisor - Cross-Repository Orchestration
 =============================================================
 
-v76.0 - Advanced AGI System Orchestrator
+v80.0 - Ultra-Advanced AGI System Orchestrator with Full Trinity Integration
 
 This supervisor connects and orchestrates all JARVIS ecosystem components:
 - JARVIS (Body): Main orchestrator, computer use, action execution
 - JARVIS-Prime (Mind): LLM inference, reasoning, cognitive processing
 - Reactor-Core (Training): Model training, fine-tuning, deployment
 
+NEW IN v80.0:
+    - Automatic cross-repo detection and path resolution
+    - Graceful shutdown with async signal handlers
+    - Hot-reload configuration watching
+    - Distributed tracing (OpenTelemetry)
+    - Zero-copy memory-mapped IPC
+    - Predictive caching with ML
+    - Adaptive rate limiting
+    - Graph-based routing optimization
+    - Advanced async primitives
+    - Dependency graph resolution
+
 USAGE:
     python3 run_supervisor.py                    # Start all components
     python3 run_supervisor.py --prime-only       # Start only JARVIS-Prime
     python3 run_supervisor.py --components prime,jarvis  # Specific components
     python3 run_supervisor.py --config config.yaml       # Custom config
+    python3 run_supervisor.py --enable-tracing   # Enable distributed tracing
 
 ARCHITECTURE:
     Supervisor
@@ -946,7 +959,85 @@ Examples:
         help="Path to YAML configuration file",
     )
 
+    parser.add_argument(
+        "--advanced-orchestrator",
+        action="store_true",
+        help="Use v80.0 advanced cross-repo orchestrator (EXPERIMENTAL)",
+    )
+
+    parser.add_argument(
+        "--enable-tracing",
+        action="store_true",
+        help="Enable distributed tracing with OpenTelemetry",
+    )
+
+    parser.add_argument(
+        "--enable-hot-reload",
+        action="store_true",
+        help="Enable hot-reload configuration watching",
+    )
+
     return parser.parse_args()
+
+
+async def main_v80_orchestrator(args):
+    """
+    Main entry point using v80.0 advanced orchestrator.
+
+    This provides:
+    - Automatic repo detection
+    - Graceful shutdown
+    - Hot-reload config
+    - Distributed tracing
+    - Zero-copy IPC
+    - And more...
+    """
+    logger.info("=" * 70)
+    logger.info("JARVIS Trinity Orchestrator v80.0 - Starting")
+    logger.info("=" * 70)
+
+    # Set environment variables based on args
+    if args.enable_tracing:
+        os.environ["TRACING_ENABLED"] = "true"
+
+    if args.enable_hot_reload:
+        os.environ["ENABLE_HOT_RELOAD"] = "true"
+
+    try:
+        # Import advanced orchestrator
+        from jarvis_prime.core.cross_repo_orchestrator import get_orchestrator
+
+        # Get orchestrator
+        orchestrator = await get_orchestrator()
+
+        # Start all components
+        success = await orchestrator.start_all()
+
+        if not success:
+            logger.error("Failed to start all components")
+            return
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("🚀 JARVIS Trinity Ecosystem is ONLINE")
+        logger.info("=" * 70)
+        logger.info("")
+        logger.info("Press Ctrl+C to shut down gracefully")
+        logger.info("")
+
+        # Run until shutdown signal
+        await orchestrator.run_until_shutdown()
+
+    except ImportError as e:
+        logger.error(f"Advanced orchestrator not available: {e}")
+        logger.error("Please ensure all dependencies are installed:")
+        logger.error("  pip install watchdog networkx opentelemetry-api opentelemetry-sdk")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Orchestrator error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 async def main():
@@ -957,6 +1048,12 @@ async def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Check if using advanced orchestrator
+    if args.advanced_orchestrator:
+        await main_v80_orchestrator(args)
+        return
+
+    # Original supervisor implementation
     # Create supervisor
     supervisor = UnifiedSupervisor()
 

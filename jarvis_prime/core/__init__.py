@@ -224,6 +224,80 @@ from jarvis_prime.core.model_server import (
     batch_infer,
 )
 
+# Advanced Async Primitives (v80.0)
+from jarvis_prime.core.advanced_async_primitives import (
+    AdaptiveTimeoutManager,
+    AsyncRLock,
+    PriorityAsyncQueue,
+    AsyncObjectPool,
+    StructuredTaskGroup,
+    DeadlockDetector,
+    adaptive_timeout,
+    get_adaptive_timeout_manager,
+    set_request_context,
+    get_request_context,
+)
+
+# Zero-Copy IPC (v80.0)
+from jarvis_prime.core.zero_copy_ipc import (
+    ZeroCopyIPCTransport,
+    SharedRingBuffer,
+    SharedMemoryConfig,
+    MessageSize,
+    get_zero_copy_transport,
+)
+
+# Distributed Tracing (v80.0)
+from jarvis_prime.core.distributed_tracing import (
+    DistributedTracer,
+    TracingConfig,
+    tracer,
+    with_span,
+    with_span_sync,
+    add_span_attributes,
+    add_span_event,
+    record_exception,
+)
+
+# Predictive Cache (v80.0)
+from jarvis_prime.core.predictive_cache import (
+    PredictiveCache,
+    EvictionPolicy,
+    get_predictive_cache,
+)
+
+# Adaptive Rate Limiter (v80.0)
+from jarvis_prime.core.adaptive_rate_limiter import (
+    AdaptiveRateLimiter,
+    RateLimitConfig,
+    RateLimitStrategy,
+    TokenBucket,
+    SlidingWindowCounter,
+    get_rate_limiter,
+)
+
+# Cross-Repo Orchestrator (v80.0)
+from jarvis_prime.core.cross_repo_orchestrator import (
+    CrossRepoOrchestrator,
+    RepoConfig,
+    RepoType,
+    OrchestratorConfig,
+    SignalHandler,
+    FileWatcher,
+    DependencyResolver,
+    get_orchestrator,
+)
+
+# Graph Routing (v80.0)
+from jarvis_prime.core.graph_routing import (
+    GraphRouter,
+    Route,
+    Edge,
+    EdgeType,
+    RoutingObjective,
+    get_graph_router,
+)
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -400,4 +474,57 @@ __all__ = [
     "get_model_server",
     "infer",
     "batch_infer",
+    # Advanced Async Primitives (v80.0)
+    "AdaptiveTimeoutManager",
+    "AsyncRLock",
+    "PriorityAsyncQueue",
+    "AsyncObjectPool",
+    "StructuredTaskGroup",
+    "DeadlockDetector",
+    "adaptive_timeout",
+    "get_adaptive_timeout_manager",
+    "set_request_context",
+    "get_request_context",
+    # Zero-Copy IPC (v80.0)
+    "ZeroCopyIPCTransport",
+    "SharedRingBuffer",
+    "SharedMemoryConfig",
+    "MessageSize",
+    "get_zero_copy_transport",
+    # Distributed Tracing (v80.0)
+    "DistributedTracer",
+    "TracingConfig",
+    "tracer",
+    "with_span",
+    "with_span_sync",
+    "add_span_attributes",
+    "add_span_event",
+    "record_exception",
+    # Predictive Cache (v80.0)
+    "PredictiveCache",
+    "EvictionPolicy",
+    "get_predictive_cache",
+    # Adaptive Rate Limiter (v80.0)
+    "AdaptiveRateLimiter",
+    "RateLimitConfig",
+    "RateLimitStrategy",
+    "TokenBucket",
+    "SlidingWindowCounter",
+    "get_rate_limiter",
+    # Cross-Repo Orchestrator (v80.0)
+    "CrossRepoOrchestrator",
+    "RepoConfig",
+    "RepoType",
+    "OrchestratorConfig",
+    "SignalHandler",
+    "FileWatcher",
+    "DependencyResolver",
+    "get_orchestrator",
+    # Graph Routing (v80.0)
+    "GraphRouter",
+    "Route",
+    "Edge",
+    "EdgeType",
+    "RoutingObjective",
+    "get_graph_router",
 ]
