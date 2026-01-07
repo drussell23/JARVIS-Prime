@@ -421,9 +421,102 @@ class DefaultComplexityAnalyzer(ComplexityAnalyzer):
         return max_depth
 
 
+class AGIEnhancedAnalyzer(ComplexityAnalyzer):
+    """
+    AGI-Enhanced complexity analyzer using cognitive models.
+
+    v77.0: Uses MetaReasoner and GoalInference for intelligent routing.
+    Falls back to heuristics if AGI hub is not available.
+    """
+
+    def __init__(self) -> None:
+        self._agi_hub = None
+        self._fallback = DefaultComplexityAnalyzer()
+        self._initialized = False
+
+    async def _ensure_agi_hub(self) -> bool:
+        """Lazily initialize AGI hub connection."""
+        if self._initialized:
+            return self._agi_hub is not None
+
+        try:
+            from jarvis_prime.core.agi_integration import get_agi_hub
+            self._agi_hub = await get_agi_hub()
+            self._initialized = True
+            return True
+        except Exception as e:
+            logger.warning(f"AGI hub not available for routing: {e}")
+            self._initialized = True
+            return False
+
+    async def analyze(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> ComplexitySignals:
+        """Analyze prompt using AGI models or fallback to heuristics."""
+        # Get baseline signals from heuristics
+        signals = await self._fallback.analyze(prompt, context)
+
+        # Try to enhance with AGI analysis
+        if await self._ensure_agi_hub() and self._agi_hub:
+            try:
+                # Use AGI request analyzer for deeper understanding
+                from jarvis_prime.core.agi_integration import AGIRequest, RequestAnalyzer, AGIHubConfig
+
+                analyzer = RequestAnalyzer(AGIHubConfig())
+                request = AGIRequest(content=prompt, context=context or {})
+                analyzed = await analyzer.analyze(request)
+
+                # Enhance signals based on AGI analysis
+                if analyzed.complexity:
+                    complexity_map = {
+                        "TRIVIAL": 0.1,
+                        "SIMPLE": 0.3,
+                        "MODERATE": 0.5,
+                        "COMPLEX": 0.75,
+                        "EXPERT": 0.95,
+                    }
+                    agi_complexity = complexity_map.get(analyzed.complexity.name, 0.5)
+
+                    # Blend heuristic and AGI signals
+                    signals.reasoning_indicators = max(
+                        signals.reasoning_indicators,
+                        agi_complexity * 0.8
+                    )
+
+                if analyzed.reasoning_requirement:
+                    reasoning_map = {
+                        "NONE": 0.0,
+                        "CHAIN": 0.3,
+                        "TREE": 0.7,
+                        "CAUSAL": 0.6,
+                        "PLANNING": 0.65,
+                        "META": 0.8,
+                    }
+                    agi_reasoning = reasoning_map.get(analyzed.reasoning_requirement.name, 0.3)
+                    signals.multi_step_indicators = max(
+                        signals.multi_step_indicators,
+                        agi_reasoning
+                    )
+
+                # Check if AGI models are required
+                if analyzed.required_models:
+                    # More required models = higher complexity
+                    model_complexity = min(len(analyzed.required_models) * 0.2, 1.0)
+                    signals.domain_specificity = max(
+                        signals.domain_specificity,
+                        model_complexity
+                    )
+
+            except Exception as e:
+                logger.debug(f"AGI analysis failed, using heuristics: {e}")
+
+        return signals
+
+
 class HybridRouter:
     """
     Intelligent router for Tier 0/1 classification.
+
+    v77.0: Enhanced with AGI Integration Hub for cognitive-aware routing.
+    Uses MetaReasoner for strategy selection and GoalInference for intent.
 
     Classifies prompts and routes to local (JARVIS-Prime) or cloud APIs
     based on complexity, cost, and capability requirements.
@@ -859,3 +952,66 @@ class HybridRouter:
             old_value = self.thresholds[key]
             self.thresholds[key] = value
             logger.info(f"Adjusted threshold {key}: {old_value} → {value}")
+
+
+# =============================================================================
+# FACTORY FUNCTIONS
+# =============================================================================
+
+
+def create_agi_enhanced_router(
+    thresholds: Optional[Dict[str, float]] = None,
+    history_file: Optional[Path] = None,
+    enable_learning: bool = True,
+    enable_safety_context: bool = True,
+) -> HybridRouter:
+    """
+    Create a HybridRouter with AGI-enhanced analysis.
+
+    v77.0: Uses AGI Integration Hub for cognitive-aware routing.
+
+    Args:
+        thresholds: Custom routing thresholds
+        history_file: Path for learning history
+        enable_learning: Enable outcome learning
+        enable_safety_context: Enable safety context integration
+
+    Returns:
+        HybridRouter with AGI-enhanced analyzer
+    """
+    return HybridRouter(
+        analyzer=AGIEnhancedAnalyzer(),
+        thresholds=thresholds,
+        history_file=history_file,
+        enable_learning=enable_learning,
+        enable_safety_context=enable_safety_context,
+    )
+
+
+def create_standard_router(
+    thresholds: Optional[Dict[str, float]] = None,
+    history_file: Optional[Path] = None,
+    enable_learning: bool = True,
+    enable_safety_context: bool = True,
+) -> HybridRouter:
+    """
+    Create a HybridRouter with standard heuristic analysis.
+
+    Faster but less intelligent routing.
+
+    Args:
+        thresholds: Custom routing thresholds
+        history_file: Path for learning history
+        enable_learning: Enable outcome learning
+        enable_safety_context: Enable safety context integration
+
+    Returns:
+        HybridRouter with default analyzer
+    """
+    return HybridRouter(
+        analyzer=DefaultComplexityAnalyzer(),
+        thresholds=thresholds,
+        history_file=history_file,
+        enable_learning=enable_learning,
+        enable_safety_context=enable_safety_context,
+    )

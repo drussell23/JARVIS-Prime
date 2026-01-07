@@ -95,6 +95,22 @@ from jarvis_prime.core.multimodal_fusion import (
     SpatialReasoner,
     TemporalReasoner,
 )
+from jarvis_prime.core.agi_integration import (
+    AGIIntegrationHub,
+    AGIHubConfig,
+    AGIRequest,
+    AGIResponse,
+    AGIEnhancedInference,
+    get_agi_hub,
+    shutdown_agi_hub,
+    agi_process,
+    enhance_inference,
+)
+from jarvis_prime.core.hybrid_router import (
+    create_agi_enhanced_router,
+    create_standard_router,
+    AGIEnhancedAnalyzer,
+)
 
 __all__ = [
     # Registry
@@ -168,4 +184,18 @@ __all__ = [
     "FusionStrategy",
     "SpatialReasoner",
     "TemporalReasoner",
+    # AGI Integration Hub
+    "AGIIntegrationHub",
+    "AGIHubConfig",
+    "AGIRequest",
+    "AGIResponse",
+    "AGIEnhancedInference",
+    "get_agi_hub",
+    "shutdown_agi_hub",
+    "agi_process",
+    "enhance_inference",
+    # AGI-Enhanced Routing
+    "create_agi_enhanced_router",
+    "create_standard_router",
+    "AGIEnhancedAnalyzer",
 ]
