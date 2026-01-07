@@ -2,11 +2,17 @@
 JARVIS Prime Bridge - Main JARVIS Integration
 ===============================================
 
-v78.0 - Seamless integration between JARVIS (LAM) and JARVIS-Prime (LLM)
+v79.1 - Enhanced with circuit breakers and fallback chains
 
 This bridge connects the main JARVIS action execution system with
 JARVIS-Prime's AGI capabilities, replacing direct Claude API calls
 with local cognitive processing.
+
+CHANGES in v79.1:
+    - Added circuit breaker for AGI component protection
+    - Implemented fallback chain for graceful degradation
+    - Added response caching for repeated failures
+    - Enhanced error classification and recovery
 
 INTEGRATION POINTS:
     1. Command Processing: Route commands through AGI orchestrator
@@ -49,12 +55,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -66,6 +74,112 @@ from typing import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v79.1: CIRCUIT BREAKER AND FALLBACK CONFIGURATION
+# =============================================================================
+
+@dataclass
+class BridgeResilienceConfig:
+    """Configuration for bridge resilience features."""
+
+    # Circuit breaker settings
+    circuit_failure_threshold: int = int(os.getenv(
+        "JARVIS_BRIDGE_CIRCUIT_FAILURES", "5"
+    ))
+    circuit_recovery_timeout_sec: float = float(os.getenv(
+        "JARVIS_BRIDGE_CIRCUIT_RECOVERY_SEC", "30.0"
+    ))
+    circuit_half_open_requests: int = int(os.getenv(
+        "JARVIS_BRIDGE_CIRCUIT_HALF_OPEN", "3"
+    ))
+
+    # Retry settings
+    max_retries: int = int(os.getenv("JARVIS_BRIDGE_MAX_RETRIES", "3"))
+    retry_base_delay_ms: int = int(os.getenv(
+        "JARVIS_BRIDGE_RETRY_DELAY_MS", "500"
+    ))
+    retry_jitter: float = float(os.getenv("JARVIS_BRIDGE_RETRY_JITTER", "0.3"))
+
+    # Fallback settings
+    enable_simple_fallback: bool = os.getenv(
+        "JARVIS_BRIDGE_SIMPLE_FALLBACK", "true"
+    ).lower() == "true"
+    enable_cache_fallback: bool = os.getenv(
+        "JARVIS_BRIDGE_CACHE_FALLBACK", "true"
+    ).lower() == "true"
+    cache_ttl_seconds: int = int(os.getenv(
+        "JARVIS_BRIDGE_CACHE_TTL", "300"
+    ))
+
+    # Timeout settings
+    command_timeout_seconds: float = float(os.getenv(
+        "JARVIS_BRIDGE_COMMAND_TIMEOUT", "60.0"
+    ))
+
+
+class ResponseCache:
+    """
+    v79.1: LRU cache for responses to support fallback on failures.
+
+    Stores successful responses and can return cached versions
+    when the AGI system is unavailable.
+    """
+
+    def __init__(self, max_size: int = 500, ttl_seconds: int = 300):
+        self._cache: Dict[str, Tuple[PrimeResponse, float]] = {}
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._access_order: List[str] = []  # For LRU eviction
+
+    def _make_key(self, command: "JARVISCommand") -> str:
+        """Create a cache key from command content."""
+        # Hash the command content for cache key
+        content_hash = hashlib.sha256(
+            f"{command.command_type.name}:{command.content}".encode()
+        ).hexdigest()[:16]
+        return content_hash
+
+    def get(self, command: "JARVISCommand") -> Optional["PrimeResponse"]:
+        """Get cached response if available and not expired."""
+        key = self._make_key(command)
+
+        if key in self._cache:
+            response, timestamp = self._cache[key]
+            if time.time() - timestamp < self._ttl:
+                # Update access order for LRU
+                if key in self._access_order:
+                    self._access_order.remove(key)
+                self._access_order.append(key)
+                logger.debug(f"Cache hit for command {command.id}")
+                return response
+            else:
+                # Expired
+                del self._cache[key]
+
+        return None
+
+    def put(self, command: "JARVISCommand", response: "PrimeResponse") -> None:
+        """Store a response in the cache."""
+        # Only cache successful responses
+        if not response.success:
+            return
+
+        key = self._make_key(command)
+
+        # Evict if at capacity
+        while len(self._cache) >= self._max_size and self._access_order:
+            oldest_key = self._access_order.pop(0)
+            self._cache.pop(oldest_key, None)
+
+        self._cache[key] = (response, time.time())
+        self._access_order.append(key)
+
+    def clear(self) -> None:
+        """Clear the cache."""
+        self._cache.clear()
+        self._access_order.clear()
 
 
 # =============================================================================
@@ -360,14 +474,22 @@ class JARVISPrimeBridge:
     """
     Bridge connecting JARVIS (Body) to JARVIS-Prime (Mind).
 
+    v79.1: Enhanced with circuit breaker and fallback chains for resilience.
+
     Replaces direct Claude API calls with local AGI processing,
     providing reasoning, planning, and safety-aware responses.
+
+    Resilience Features:
+        - Circuit breaker for AGI component protection
+        - Fallback chain: AGI → Simple Model → Cache → Default
+        - Response caching for graceful degradation
+        - Retry with exponential backoff and jitter
 
     Usage:
         bridge = JARVISPrimeBridge()
         await bridge.initialize()
 
-        # Process command
+        # Process command (with automatic fallback on failures)
         response = await bridge.process_command(JARVISCommand(
             id="cmd-123",
             command_type=CommandType.NATURAL_LANGUAGE,
@@ -382,8 +504,13 @@ class JARVISPrimeBridge:
         await bridge.record_feedback(response.command_id, success=True)
     """
 
-    def __init__(self, config: Optional[BridgeConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[BridgeConfig] = None,
+        resilience_config: Optional[BridgeResilienceConfig] = None,
+    ) -> None:
         self._config = config or BridgeConfig()
+        self._resilience = resilience_config or BridgeResilienceConfig()
 
         # AGI components (lazy loaded)
         self._agi_hub = None
@@ -399,11 +526,31 @@ class JARVISPrimeBridge:
         self._initialized = False
         self._init_lock = asyncio.Lock()
 
+        # v79.1: Circuit breaker for AGI protection
+        from jarvis_prime.core.agi_error_handler import CircuitBreaker, CircuitBreakerConfig
+        self._circuit_breaker = CircuitBreaker(
+            name="jarvis_bridge_agi",
+            config=CircuitBreakerConfig(
+                failure_threshold=self._resilience.circuit_failure_threshold,
+                timeout_seconds=self._resilience.circuit_recovery_timeout_sec,
+                half_open_max_requests=self._resilience.circuit_half_open_requests,
+            ),
+        )
+
+        # v79.1: Response cache for fallback
+        self._response_cache = ResponseCache(
+            max_size=500,
+            ttl_seconds=self._resilience.cache_ttl_seconds,
+        )
+
         # Metrics
         self._commands_processed = 0
         self._successful_commands = 0
         self._failed_commands = 0
         self._confirmations_requested = 0
+        self._cache_hits = 0
+        self._fallback_uses = 0
+        self._circuit_opens = 0
 
         # Command history for learning
         self._command_history: Dict[str, JARVISCommand] = {}
@@ -442,6 +589,14 @@ class JARVISPrimeBridge:
         """
         Process a command from JARVIS.
 
+        v79.1: Enhanced with circuit breaker and fallback chain.
+
+        Fallback Chain:
+            1. Primary: Full AGI processing (with circuit breaker)
+            2. Fallback 1: Cached response (if available)
+            3. Fallback 2: Simple direct processing (minimal reasoning)
+            4. Fallback 3: Error response with recovery suggestions
+
         This is the main entry point for all JARVIS commands.
         """
         if not self._initialized:
@@ -461,18 +616,8 @@ class JARVISPrimeBridge:
             if safety_context.kill_switch_active:
                 return self._create_kill_switch_response(command)
 
-            # Determine processing mode
-            mode = self._determine_mode(command, safety_context)
-
-            # Process based on mode
-            if mode == ProcessingMode.DIRECT:
-                response = await self._process_direct(command)
-            elif mode == ProcessingMode.REASONED:
-                response = await self._process_with_reasoning(command, safety_context)
-            elif mode == ProcessingMode.PLANNED:
-                response = await self._process_with_planning(command, safety_context)
-            else:  # CAUTIOUS
-                response = await self._process_cautious(command, safety_context)
+            # v79.1: Try with circuit breaker and fallback chain
+            response = await self._process_with_resilience(command, safety_context)
 
             # Analyze action risk
             if response.actions:
@@ -493,6 +638,10 @@ class JARVISPrimeBridge:
             # Store response for learning
             self._response_history[command.id] = response
 
+            # v79.1: Cache successful responses for fallback
+            if response.success:
+                self._response_cache.put(command, response)
+
             # Trim history if needed
             self._trim_history()
 
@@ -508,6 +657,15 @@ class JARVISPrimeBridge:
             return response
 
         except asyncio.TimeoutError:
+            self._failed_commands += 1
+            # Try cache fallback on timeout
+            cached = self._response_cache.get(command)
+            if cached:
+                self._cache_hits += 1
+                cached.warning = "Response from cache (processing timed out)"
+                cached.processing_time_ms = (time.time() - start_time) * 1000
+                return cached
+
             return PrimeResponse(
                 command_id=command.id,
                 success=False,
@@ -523,6 +681,165 @@ class JARVISPrimeBridge:
                 error=str(e),
                 processing_time_ms=(time.time() - start_time) * 1000,
             )
+
+    async def _process_with_resilience(
+        self,
+        command: JARVISCommand,
+        safety_context: SafetyContext,
+    ) -> PrimeResponse:
+        """
+        v79.1: Process command with circuit breaker and fallback chain.
+
+        Fallback Chain:
+            1. Full AGI processing (with circuit breaker)
+            2. Cached response (if available)
+            3. Simple direct processing
+            4. Default error response
+        """
+        # Acquire circuit breaker permit
+        permit = await self._circuit_breaker.acquire_permit()
+
+        if permit:
+            # Circuit is allowing requests - try full AGI processing
+            try:
+                # Wrap in timeout
+                response = await asyncio.wait_for(
+                    self._process_primary(command, safety_context),
+                    timeout=self._resilience.command_timeout_seconds,
+                )
+
+                # Success - release permit and return
+                await self._circuit_breaker.release_permit(permit, success=True)
+                return response
+
+            except Exception as e:
+                # Failed - release permit with failure
+                await self._circuit_breaker.release_permit(permit, success=False)
+                logger.warning(f"Primary processing failed: {e}")
+
+                # Fall through to fallback chain
+
+        else:
+            # Circuit is open - log and fall through
+            self._circuit_opens += 1
+            logger.warning("Circuit breaker is open, using fallback chain")
+
+        # Fallback 1: Try cache
+        if self._resilience.enable_cache_fallback:
+            cached = self._response_cache.get(command)
+            if cached:
+                self._cache_hits += 1
+                self._fallback_uses += 1
+                logger.info(f"Using cached response for command {command.id}")
+                cached.warning = "Response from cache (AGI unavailable)"
+                return cached
+
+        # Fallback 2: Simple direct processing
+        if self._resilience.enable_simple_fallback:
+            try:
+                self._fallback_uses += 1
+                logger.info(f"Using simple fallback for command {command.id}")
+                return await self._process_simple_fallback(command)
+            except Exception as e:
+                logger.warning(f"Simple fallback failed: {e}")
+
+        # Fallback 3: Default error response
+        self._fallback_uses += 1
+        return PrimeResponse(
+            command_id=command.id,
+            success=False,
+            error="AGI system is currently unavailable. Please try again later.",
+            warning="All fallback options exhausted",
+        )
+
+    async def _process_primary(
+        self,
+        command: JARVISCommand,
+        safety_context: SafetyContext,
+    ) -> PrimeResponse:
+        """Primary processing with full AGI capabilities."""
+        # Determine processing mode
+        mode = self._determine_mode(command, safety_context)
+
+        # Process based on mode
+        if mode == ProcessingMode.DIRECT:
+            return await self._process_direct(command)
+        elif mode == ProcessingMode.REASONED:
+            return await self._process_with_reasoning(command, safety_context)
+        elif mode == ProcessingMode.PLANNED:
+            return await self._process_with_planning(command, safety_context)
+        else:  # CAUTIOUS
+            return await self._process_cautious(command, safety_context)
+
+    async def _process_simple_fallback(
+        self,
+        command: JARVISCommand,
+    ) -> PrimeResponse:
+        """
+        v79.1: Simple fallback processing without full AGI.
+
+        Uses basic pattern matching and predefined responses
+        for common command types.
+        """
+        # Simple query detection
+        if command.command_type == CommandType.QUERY:
+            return PrimeResponse(
+                command_id=command.id,
+                success=True,
+                response_text=(
+                    "I'm operating in limited mode. "
+                    "Please try a simpler command or wait for full functionality."
+                ),
+                confidence=0.3,
+                warning="Processed in fallback mode (limited capabilities)",
+            )
+
+        # Simple action detection patterns
+        content_lower = command.content.lower()
+
+        # Common simple actions that can be handled minimally
+        if "open" in content_lower and any(app in content_lower for app in [
+            "safari", "chrome", "finder", "terminal", "notes", "calendar"
+        ]):
+            # Extract app name
+            apps = ["safari", "chrome", "finder", "terminal", "notes", "calendar"]
+            app = next((a for a in apps if a in content_lower), "application")
+
+            return PrimeResponse(
+                command_id=command.id,
+                success=True,
+                response_text=f"Opening {app.title()}...",
+                actions=[{
+                    "type": "open_app",
+                    "app_name": app.title(),
+                    "fallback_mode": True,
+                }],
+                confidence=0.6,
+                warning="Action suggested in fallback mode (verify before execution)",
+            )
+
+        # Default: can't handle in fallback mode
+        return PrimeResponse(
+            command_id=command.id,
+            success=False,
+            error="This command requires full AGI capabilities which are currently unavailable.",
+            warning="Fallback mode cannot handle this command type",
+        )
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get bridge statistics including resilience metrics."""
+        return {
+            "commands_processed": self._commands_processed,
+            "successful_commands": self._successful_commands,
+            "failed_commands": self._failed_commands,
+            "confirmations_requested": self._confirmations_requested,
+            # v79.1: Resilience metrics
+            "cache_hits": self._cache_hits,
+            "fallback_uses": self._fallback_uses,
+            "circuit_opens": self._circuit_opens,
+            "circuit_state": self._circuit_breaker.state.name,
+            "circuit_active_permits": self._circuit_breaker.active_permits_count,
+        }
 
     def _determine_mode(
         self,

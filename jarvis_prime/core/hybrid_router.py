@@ -23,8 +23,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1015,3 +1017,841 @@ def create_standard_router(
         enable_learning=enable_learning,
         enable_safety_context=enable_safety_context,
     )
+
+
+# =============================================================================
+# COGNITIVE ROUTER - v79.0 "CORPUS CALLOSUM"
+# =============================================================================
+# The bridge connecting JARVIS (Body) to JARVIS-Prime (Mind)
+# Enables intelligent delegation of complex cognitive tasks
+# =============================================================================
+
+
+@dataclass
+class CognitiveRouterConfig:
+    """
+    Dynamic configuration for the Cognitive Router.
+
+    All values can be overridden via environment variables:
+        COGNITIVE_ROUTER_PRIME_URL, COGNITIVE_ROUTER_COMPLEXITY_THRESHOLD, etc.
+    """
+    # Prime connection
+    prime_url: str = field(default_factory=lambda: os.getenv(
+        "COGNITIVE_ROUTER_PRIME_URL", "http://localhost:8000"
+    ))
+    prime_health_endpoint: str = field(default_factory=lambda: os.getenv(
+        "COGNITIVE_ROUTER_PRIME_HEALTH", "/health"
+    ))
+    prime_reason_endpoint: str = field(default_factory=lambda: os.getenv(
+        "COGNITIVE_ROUTER_PRIME_REASON", "/v1/reason"
+    ))
+
+    # Timeouts (milliseconds for precision, converted to seconds internally)
+    connection_timeout_ms: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_CONNECT_TIMEOUT_MS", "2000"
+    )))
+    read_timeout_ms: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_READ_TIMEOUT_MS", "60000"
+    )))
+    health_check_interval_ms: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_HEALTH_INTERVAL_MS", "5000"
+    )))
+
+    # Complexity thresholds (0.0-1.0)
+    complexity_threshold_prime: float = field(default_factory=lambda: float(os.getenv(
+        "COGNITIVE_ROUTER_COMPLEXITY_THRESHOLD", "0.65"
+    )))
+    complexity_threshold_reflex: float = field(default_factory=lambda: float(os.getenv(
+        "COGNITIVE_ROUTER_REFLEX_THRESHOLD", "0.35"
+    )))
+
+    # Circuit breaker
+    circuit_failure_threshold: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_CIRCUIT_FAILURES", "5"
+    )))
+    circuit_recovery_timeout_seconds: float = field(default_factory=lambda: float(os.getenv(
+        "COGNITIVE_ROUTER_CIRCUIT_RECOVERY_SEC", "30.0"
+    )))
+
+    # Retry configuration
+    max_retries: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_MAX_RETRIES", "3"
+    )))
+    retry_base_delay_ms: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_RETRY_DELAY_MS", "1000"
+    )))
+    retry_jitter_factor: float = field(default_factory=lambda: float(os.getenv(
+        "COGNITIVE_ROUTER_RETRY_JITTER", "0.3"
+    )))
+
+    # Keywords that indicate cognitive tasks (loaded from env or defaults)
+    cognitive_keywords: List[str] = field(default_factory=lambda: os.getenv(
+        "COGNITIVE_ROUTER_KEYWORDS",
+        "plan,analyze,research,design,architect,reason,explain why,compare,evaluate,synthesize"
+    ).split(","))
+
+    # Minimum word count to consider for Prime delegation
+    min_words_for_prime: int = field(default_factory=lambda: int(os.getenv(
+        "COGNITIVE_ROUTER_MIN_WORDS", "15"
+    )))
+
+    # Enable adaptive threshold learning
+    enable_adaptive_thresholds: bool = field(default_factory=lambda: os.getenv(
+        "COGNITIVE_ROUTER_ADAPTIVE", "true"
+    ).lower() == "true")
+
+    # State persistence
+    state_file: Optional[Path] = field(default_factory=lambda: Path(os.getenv(
+        "COGNITIVE_ROUTER_STATE_FILE",
+        str(Path.home() / ".jarvis" / "cognitive_router_state.json")
+    )) if os.getenv("COGNITIVE_ROUTER_STATE_FILE", "") else None)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary for serialization."""
+        return {
+            "prime_url": self.prime_url,
+            "connection_timeout_ms": self.connection_timeout_ms,
+            "read_timeout_ms": self.read_timeout_ms,
+            "complexity_threshold_prime": self.complexity_threshold_prime,
+            "complexity_threshold_reflex": self.complexity_threshold_reflex,
+            "circuit_failure_threshold": self.circuit_failure_threshold,
+            "max_retries": self.max_retries,
+            "cognitive_keywords": self.cognitive_keywords,
+            "min_words_for_prime": self.min_words_for_prime,
+            "enable_adaptive_thresholds": self.enable_adaptive_thresholds,
+        }
+
+
+@dataclass
+class CognitiveRoutingDecision:
+    """Enhanced routing decision with cognitive context."""
+
+    route_to_prime: bool
+    complexity_score: float
+    confidence: float
+    reasoning: str
+
+    # Cognitive signals
+    has_cognitive_keywords: bool = False
+    word_count: int = 0
+    estimated_reasoning_depth: int = 1
+
+    # Safety context
+    safety_adjusted: bool = False
+    safety_reasoning: Optional[str] = None
+
+    # Timing
+    decision_time_ms: float = 0.0
+
+    # Metadata
+    decision_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+class AdaptiveThresholdManager:
+    """
+    Manages adaptive thresholds that learn from routing outcomes.
+
+    Uses exponential moving average to adjust thresholds based on:
+    - Success rate of Prime vs Reflex routing
+    - Response latency
+    - User feedback (if available)
+    """
+
+    def __init__(
+        self,
+        initial_prime_threshold: float = 0.65,
+        initial_reflex_threshold: float = 0.35,
+        learning_rate: float = 0.05,
+        min_samples_for_adjustment: int = 10,
+    ):
+        self._prime_threshold = initial_prime_threshold
+        self._reflex_threshold = initial_reflex_threshold
+        self._learning_rate = learning_rate
+        self._min_samples = min_samples_for_adjustment
+
+        # Outcome tracking
+        self._prime_outcomes: List[Tuple[bool, float]] = []  # (success, complexity)
+        self._reflex_outcomes: List[Tuple[bool, float]] = []
+
+        # Statistics
+        self._total_adjustments = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def prime_threshold(self) -> float:
+        return self._prime_threshold
+
+    @property
+    def reflex_threshold(self) -> float:
+        return self._reflex_threshold
+
+    async def record_outcome(
+        self,
+        routed_to_prime: bool,
+        success: bool,
+        complexity_score: float,
+    ) -> None:
+        """Record an outcome for threshold adjustment."""
+        async with self._lock:
+            if routed_to_prime:
+                self._prime_outcomes.append((success, complexity_score))
+                # Keep only last 100 samples
+                if len(self._prime_outcomes) > 100:
+                    self._prime_outcomes = self._prime_outcomes[-100:]
+            else:
+                self._reflex_outcomes.append((success, complexity_score))
+                if len(self._reflex_outcomes) > 100:
+                    self._reflex_outcomes = self._reflex_outcomes[-100:]
+
+            # Attempt threshold adjustment
+            await self._maybe_adjust_thresholds()
+
+    async def _maybe_adjust_thresholds(self) -> None:
+        """Adjust thresholds if we have enough samples."""
+        if len(self._prime_outcomes) < self._min_samples:
+            return
+        if len(self._reflex_outcomes) < self._min_samples:
+            return
+
+        # Calculate success rates
+        prime_successes = sum(1 for s, _ in self._prime_outcomes if s)
+        prime_rate = prime_successes / len(self._prime_outcomes)
+
+        reflex_successes = sum(1 for s, _ in self._reflex_outcomes if s)
+        reflex_rate = reflex_successes / len(self._reflex_outcomes)
+
+        # Calculate average complexity at each tier
+        prime_avg_complexity = sum(c for _, c in self._prime_outcomes) / len(self._prime_outcomes)
+        reflex_avg_complexity = sum(c for _, c in self._reflex_outcomes) / len(self._reflex_outcomes)
+
+        # Adjust thresholds based on outcomes
+        # If Prime is succeeding at lower complexities, lower the threshold
+        if prime_rate > 0.8 and prime_avg_complexity < self._prime_threshold:
+            adjustment = (self._prime_threshold - prime_avg_complexity) * self._learning_rate
+            self._prime_threshold = max(0.4, self._prime_threshold - adjustment)
+            self._total_adjustments += 1
+            logger.info(f"Lowered Prime threshold to {self._prime_threshold:.3f}")
+
+        # If Reflex is failing at higher complexities, lower the threshold
+        elif reflex_rate < 0.7 and reflex_avg_complexity > self._reflex_threshold:
+            adjustment = (reflex_avg_complexity - self._reflex_threshold) * self._learning_rate
+            self._reflex_threshold = min(0.5, self._reflex_threshold + adjustment)
+            self._total_adjustments += 1
+            logger.info(f"Raised Reflex threshold to {self._reflex_threshold:.3f}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get threshold manager statistics."""
+        return {
+            "prime_threshold": self._prime_threshold,
+            "reflex_threshold": self._reflex_threshold,
+            "prime_samples": len(self._prime_outcomes),
+            "reflex_samples": len(self._reflex_outcomes),
+            "total_adjustments": self._total_adjustments,
+        }
+
+
+class PrimeBridge:
+    """
+    The Nervous System connection between JARVIS (Body) and Prime (Mind).
+
+    Uses advanced async patterns for robust communication:
+    - Connection pooling with aiohttp
+    - Circuit breaker for failure protection
+    - Exponential backoff with jitter for retries
+    - Health monitoring with adaptive intervals
+
+    v79.0: "Corpus Callosum" implementation
+    """
+
+    def __init__(self, config: CognitiveRouterConfig):
+        self._config = config
+        self._is_healthy = False
+        self._last_health_check = 0.0
+        self._session: Optional[Any] = None  # aiohttp.ClientSession
+        self._health_task: Optional[asyncio.Task] = None
+
+        # Circuit breaker for Prime connection
+        from jarvis_prime.core.agi_error_handler import CircuitBreaker, CircuitBreakerConfig
+        self._circuit_breaker = CircuitBreaker(
+            name="prime_bridge",
+            config=CircuitBreakerConfig(
+                failure_threshold=config.circuit_failure_threshold,
+                timeout_seconds=config.circuit_recovery_timeout_seconds,
+            ),
+        )
+
+        # Connection state
+        self._connection_lock = asyncio.Lock()
+        self._shutdown_event = asyncio.Event()
+
+        # Statistics
+        self._request_count = 0
+        self._success_count = 0
+        self._failure_count = 0
+        self._total_latency_ms = 0.0
+
+        logger.info(f"PrimeBridge initialized: {config.prime_url}")
+
+    @property
+    def is_healthy(self) -> bool:
+        return self._is_healthy and not self._circuit_breaker.is_open
+
+    async def start(self) -> None:
+        """Start the bridge with health monitoring."""
+        import aiohttp
+
+        # Create persistent session with connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=5,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+        )
+
+        timeout = aiohttp.ClientTimeout(
+            total=self._config.read_timeout_ms / 1000,
+            connect=self._config.connection_timeout_ms / 1000,
+        )
+
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+        )
+
+        # Initial health check
+        await self.check_health()
+
+        # Start background health monitoring
+        self._health_task = asyncio.create_task(self._health_monitor_loop())
+
+        logger.info(f"PrimeBridge started, healthy={self._is_healthy}")
+
+    async def stop(self) -> None:
+        """Gracefully stop the bridge."""
+        self._shutdown_event.set()
+
+        if self._health_task:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+        logger.info("PrimeBridge stopped")
+
+    async def check_health(self) -> bool:
+        """Check if Prime is reachable and healthy."""
+        if not self._session:
+            self._is_healthy = False
+            return False
+
+        try:
+            url = f"{self._config.prime_url}{self._config.prime_health_endpoint}"
+
+            async with self._session.get(url) as response:
+                self._is_healthy = response.status == 200
+                self._last_health_check = time.time()
+                return self._is_healthy
+
+        except Exception as e:
+            logger.debug(f"Prime health check failed: {e}")
+            self._is_healthy = False
+            return False
+
+    async def _health_monitor_loop(self) -> None:
+        """Background health monitoring with adaptive intervals."""
+        consecutive_failures = 0
+        base_interval = self._config.health_check_interval_ms / 1000
+
+        while not self._shutdown_event.is_set():
+            try:
+                healthy = await self.check_health()
+
+                if healthy:
+                    consecutive_failures = 0
+                    interval = base_interval
+                else:
+                    consecutive_failures += 1
+                    # Exponential backoff on failures (max 60s)
+                    interval = min(base_interval * (2 ** consecutive_failures), 60)
+
+                await asyncio.sleep(interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                await asyncio.sleep(base_interval)
+
+    async def delegate_reasoning(
+        self,
+        user_command: str,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Delegate a cognitive task to Prime for reasoning.
+
+        Returns:
+            Structured response from Prime, or None (triggering fallback)
+        """
+        if not self.is_healthy:
+            logger.warning("Prime is unreachable. Triggering fallback to reflex.")
+            return None
+
+        if not self._session:
+            logger.error("PrimeBridge session not initialized")
+            return None
+
+        # Acquire circuit breaker permit
+        permit = await self._circuit_breaker.acquire_permit()
+        if not permit:
+            logger.warning("Circuit breaker is open. Triggering fallback.")
+            return None
+
+        start_time = time.time()
+        self._request_count += 1
+
+        try:
+            payload = {
+                "intent": "cognitive_task",
+                "command": user_command,
+                "context": context,
+                "required_capabilities": ["planning", "reasoning"],
+                "request_id": str(uuid.uuid4()),
+                "timestamp": datetime.now().isoformat(),
+            }
+
+            url = f"{self._config.prime_url}{self._config.prime_reason_endpoint}"
+
+            # Retry with exponential backoff and jitter
+            last_error = None
+            for attempt in range(self._config.max_retries):
+                try:
+                    async with self._session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            result = await response.json()
+
+                            # Record success
+                            latency_ms = (time.time() - start_time) * 1000
+                            self._success_count += 1
+                            self._total_latency_ms += latency_ms
+
+                            await self._circuit_breaker.release_permit(permit, success=True)
+
+                            logger.debug(f"Prime delegation succeeded in {latency_ms:.1f}ms")
+                            return result
+
+                        elif response.status >= 500:
+                            # Server error, worth retrying
+                            last_error = f"HTTP {response.status}"
+                        else:
+                            # Client error, don't retry
+                            logger.error(f"Prime rejected request: {response.status}")
+                            await self._circuit_breaker.release_permit(permit, success=False)
+                            return None
+
+                except asyncio.TimeoutError:
+                    last_error = "timeout"
+                except Exception as e:
+                    last_error = str(e)
+
+                # Calculate backoff with jitter
+                if attempt < self._config.max_retries - 1:
+                    base_delay = (self._config.retry_base_delay_ms / 1000) * (2 ** attempt)
+                    jitter = base_delay * self._config.retry_jitter_factor * (0.5 + time.time() % 1)
+                    delay = base_delay + jitter
+                    logger.debug(f"Retry {attempt + 1}/{self._config.max_retries} after {delay:.2f}s: {last_error}")
+                    await asyncio.sleep(delay)
+
+            # All retries failed
+            self._failure_count += 1
+            await self._circuit_breaker.release_permit(permit, success=False)
+            logger.error(f"Prime delegation failed after {self._config.max_retries} retries: {last_error}")
+            return None
+
+        except Exception as e:
+            self._failure_count += 1
+            await self._circuit_breaker.release_permit(permit, success=False)
+            logger.error(f"Prime delegation error: {e}")
+            return None
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get bridge statistics."""
+        return {
+            "is_healthy": self._is_healthy,
+            "circuit_state": self._circuit_breaker.state.name,
+            "request_count": self._request_count,
+            "success_count": self._success_count,
+            "failure_count": self._failure_count,
+            "success_rate": self._success_count / max(self._request_count, 1),
+            "avg_latency_ms": self._total_latency_ms / max(self._success_count, 1),
+            "last_health_check": self._last_health_check,
+        }
+
+
+class CognitiveRouter:
+    """
+    The "Corpus Callosum" - Cognitive Router for JARVIS ↔ Prime delegation.
+
+    v79.0: Intelligent command routing with:
+    - Advanced complexity scoring
+    - Adaptive threshold learning
+    - Circuit breaker protection
+    - Safety-aware routing
+    - Parallel async execution
+    - No hardcoding (fully configurable)
+
+    Usage:
+        router = CognitiveRouter()
+        await router.start()
+
+        result = await router.process_command(
+            "Plan a comprehensive refactoring of the authentication system",
+            user_id="derek"
+        )
+
+        if result.routed_to_prime:
+            # Complex task was handled by Prime (Mind)
+            print(result.prime_response)
+        else:
+            # Simple task, handle locally (Reflex)
+            response = await local_model.generate(...)
+    """
+
+    def __init__(
+        self,
+        config: Optional[CognitiveRouterConfig] = None,
+        hybrid_router: Optional[HybridRouter] = None,
+    ):
+        self._config = config or CognitiveRouterConfig()
+
+        # Use existing HybridRouter for tier classification
+        self._hybrid_router = hybrid_router or create_agi_enhanced_router(
+            enable_safety_context=True,
+            enable_learning=True,
+        )
+
+        # Prime bridge for delegation
+        self._prime_bridge = PrimeBridge(self._config)
+
+        # Adaptive threshold manager
+        self._threshold_manager = AdaptiveThresholdManager(
+            initial_prime_threshold=self._config.complexity_threshold_prime,
+            initial_reflex_threshold=self._config.complexity_threshold_reflex,
+        ) if self._config.enable_adaptive_thresholds else None
+
+        # State
+        self._started = False
+        self._lock = asyncio.Lock()
+
+        # Statistics
+        self._total_requests = 0
+        self._prime_delegations = 0
+        self._reflex_fallbacks = 0
+        self._prime_failures = 0
+
+        logger.info("CognitiveRouter initialized (Corpus Callosum v79.0)")
+
+    async def start(self) -> None:
+        """Start the cognitive router."""
+        async with self._lock:
+            if self._started:
+                return
+
+            await self._prime_bridge.start()
+            self._started = True
+
+            logger.info(f"🧠 CognitiveRouter started, Prime healthy={self._prime_bridge.is_healthy}")
+
+    async def stop(self) -> None:
+        """Stop the cognitive router."""
+        async with self._lock:
+            if not self._started:
+                return
+
+            await self._prime_bridge.stop()
+            self._save_state()
+            self._started = False
+
+            logger.info("CognitiveRouter stopped")
+
+    async def process_command(
+        self,
+        command: str,
+        user_id: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        The Main Entry Point - Routes command to Prime (Mind) or Reflex (Claude).
+
+        Args:
+            command: User command to process
+            user_id: User identifier
+            context: Optional additional context
+
+        Returns:
+            Dict with routing decision and response
+        """
+        if not self._started:
+            await self.start()
+
+        start_time = time.time()
+        self._total_requests += 1
+
+        # Step 1: Determine complexity and routing decision
+        routing_decision = await self._make_routing_decision(command, context)
+
+        result = {
+            "command": command,
+            "routing_decision": routing_decision,
+            "routed_to_prime": False,
+            "prime_response": None,
+            "fallback_to_reflex": False,
+            "processing_time_ms": 0.0,
+        }
+
+        # Step 2: Route based on decision
+        if routing_decision.route_to_prime and self._prime_bridge.is_healthy:
+            logger.info(f"🧠 Routing '{command[:30]}...' to JARVIS-Prime (Cognitive Layer)")
+
+            prime_context = {
+                "user_id": user_id,
+                "complexity_score": routing_decision.complexity_score,
+                "reasoning_depth": routing_decision.estimated_reasoning_depth,
+                **(context or {}),
+            }
+
+            prime_result = await self._prime_bridge.delegate_reasoning(command, prime_context)
+
+            if prime_result:
+                result["routed_to_prime"] = True
+                result["prime_response"] = prime_result
+                self._prime_delegations += 1
+
+                # Record success for adaptive thresholds
+                if self._threshold_manager:
+                    await self._threshold_manager.record_outcome(
+                        routed_to_prime=True,
+                        success=True,
+                        complexity_score=routing_decision.complexity_score,
+                    )
+            else:
+                # Prime failed, fallback to reflex
+                logger.warning("⚠️ Prime failed/timed out. Fallback to Reflex (Claude).")
+                result["fallback_to_reflex"] = True
+                self._prime_failures += 1
+
+                if self._threshold_manager:
+                    await self._threshold_manager.record_outcome(
+                        routed_to_prime=True,
+                        success=False,
+                        complexity_score=routing_decision.complexity_score,
+                    )
+        else:
+            # Reflex path
+            logger.info(f"⚡ Routing '{command[:30]}...' to Reflex Layer (Claude)")
+            self._reflex_fallbacks += 1
+
+            if self._threshold_manager:
+                await self._threshold_manager.record_outcome(
+                    routed_to_prime=False,
+                    success=True,  # Assume reflex succeeds
+                    complexity_score=routing_decision.complexity_score,
+                )
+
+        result["processing_time_ms"] = (time.time() - start_time) * 1000
+        return result
+
+    async def _make_routing_decision(
+        self,
+        command: str,
+        context: Optional[Dict[str, Any]],
+    ) -> CognitiveRoutingDecision:
+        """Make an intelligent routing decision."""
+        start_time = time.time()
+
+        # Get complexity analysis from hybrid router
+        hybrid_decision = await self._hybrid_router.classify(command, context)
+
+        # Check for cognitive keywords
+        command_lower = command.lower()
+        has_cognitive_keywords = any(
+            kw.strip().lower() in command_lower
+            for kw in self._config.cognitive_keywords
+        )
+
+        # Word count analysis
+        word_count = len(command.split())
+
+        # Estimate reasoning depth based on signals
+        estimated_depth = 1
+        if hybrid_decision.signals.multi_step_indicators > 0.3:
+            estimated_depth = 2
+        if hybrid_decision.signals.reasoning_indicators > 0.5:
+            estimated_depth = 3
+        if hybrid_decision.complexity_score > 0.7:
+            estimated_depth = 4
+
+        # Get current thresholds (adaptive or configured)
+        if self._threshold_manager:
+            prime_threshold = self._threshold_manager.prime_threshold
+            reflex_threshold = self._threshold_manager.reflex_threshold
+        else:
+            prime_threshold = self._config.complexity_threshold_prime
+            reflex_threshold = self._config.complexity_threshold_reflex
+
+        # Decision logic
+        route_to_prime = False
+        reasoning_parts = []
+
+        # High complexity → Prime
+        if hybrid_decision.complexity_score >= prime_threshold:
+            route_to_prime = True
+            reasoning_parts.append(f"complexity {hybrid_decision.complexity_score:.2f} >= {prime_threshold:.2f}")
+
+        # Cognitive keywords → Prime
+        elif has_cognitive_keywords:
+            route_to_prime = True
+            reasoning_parts.append("cognitive keywords detected")
+
+        # Long commands with multi-step indicators → Prime
+        elif word_count >= self._config.min_words_for_prime and hybrid_decision.signals.multi_step_indicators > 0.3:
+            route_to_prime = True
+            reasoning_parts.append(f"long command ({word_count} words) with multi-step indicators")
+
+        # High reasoning indicators → Prime
+        elif hybrid_decision.signals.reasoning_indicators > 0.6:
+            route_to_prime = True
+            reasoning_parts.append(f"high reasoning indicators ({hybrid_decision.signals.reasoning_indicators:.2f})")
+
+        # Low complexity → Reflex
+        elif hybrid_decision.complexity_score < reflex_threshold:
+            route_to_prime = False
+            reasoning_parts.append(f"low complexity {hybrid_decision.complexity_score:.2f} < {reflex_threshold:.2f}")
+
+        # Default to reflex for medium complexity
+        else:
+            route_to_prime = False
+            reasoning_parts.append(f"medium complexity, defaulting to reflex")
+
+        # Safety override
+        safety_adjusted = False
+        safety_reasoning = None
+        if self._hybrid_router.is_kill_switch_active():
+            # Kill switch active → route to Prime for careful handling
+            if route_to_prime is False and hybrid_decision.complexity_score > 0.3:
+                route_to_prime = True
+                safety_adjusted = True
+                safety_reasoning = "kill switch active, routing to Prime for safety review"
+                reasoning_parts.append(safety_reasoning)
+
+        decision_time_ms = (time.time() - start_time) * 1000
+
+        return CognitiveRoutingDecision(
+            route_to_prime=route_to_prime,
+            complexity_score=hybrid_decision.complexity_score,
+            confidence=hybrid_decision.confidence,
+            reasoning="; ".join(reasoning_parts),
+            has_cognitive_keywords=has_cognitive_keywords,
+            word_count=word_count,
+            estimated_reasoning_depth=estimated_depth,
+            safety_adjusted=safety_adjusted,
+            safety_reasoning=safety_reasoning,
+            decision_time_ms=decision_time_ms,
+        )
+
+    def _save_state(self) -> None:
+        """Save router state for persistence."""
+        if not self._config.state_file:
+            return
+
+        try:
+            state = {
+                "timestamp": datetime.now().isoformat(),
+                "statistics": self.get_statistics(),
+            }
+
+            if self._threshold_manager:
+                state["thresholds"] = self._threshold_manager.get_statistics()
+
+            self._config.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._config.state_file.write_text(json.dumps(state, indent=2))
+
+        except Exception as e:
+            logger.warning(f"Failed to save router state: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get comprehensive router statistics."""
+        stats = {
+            "total_requests": self._total_requests,
+            "prime_delegations": self._prime_delegations,
+            "reflex_fallbacks": self._reflex_fallbacks,
+            "prime_failures": self._prime_failures,
+            "prime_delegation_rate": self._prime_delegations / max(self._total_requests, 1),
+            "prime_success_rate": (
+                (self._prime_delegations - self._prime_failures) / max(self._prime_delegations, 1)
+            ),
+            "config": self._config.to_dict(),
+            "prime_bridge": self._prime_bridge.get_statistics(),
+            "hybrid_router": self._hybrid_router.get_statistics(),
+        }
+
+        if self._threshold_manager:
+            stats["adaptive_thresholds"] = self._threshold_manager.get_statistics()
+
+        return stats
+
+
+# =============================================================================
+# COGNITIVE ROUTER SINGLETON
+# =============================================================================
+
+_cognitive_router: Optional[CognitiveRouter] = None
+_cognitive_router_lock = asyncio.Lock()
+_cognitive_router_condition = asyncio.Condition()
+
+
+async def get_cognitive_router(
+    config: Optional[CognitiveRouterConfig] = None,
+) -> CognitiveRouter:
+    """
+    Get or create the global CognitiveRouter singleton.
+
+    v79.0: Uses asyncio.Condition for proper wait/notify pattern
+    to prevent thundering herd during initialization.
+    """
+    global _cognitive_router
+
+    # Fast path: already initialized
+    if _cognitive_router is not None:
+        return _cognitive_router
+
+    # Slow path: acquire condition and initialize
+    async with _cognitive_router_condition:
+        # Re-check under condition (another coroutine may have initialized)
+        if _cognitive_router is not None:
+            return _cognitive_router
+
+        # Initialize
+        _cognitive_router = CognitiveRouter(config)
+        await _cognitive_router.start()
+
+        # Notify all waiters
+        _cognitive_router_condition.notify_all()
+
+        return _cognitive_router
+
+
+async def shutdown_cognitive_router() -> None:
+    """Shutdown the global CognitiveRouter."""
+    global _cognitive_router
+
+    async with _cognitive_router_condition:
+        if _cognitive_router is not None:
+            await _cognitive_router.stop()
+            _cognitive_router = None

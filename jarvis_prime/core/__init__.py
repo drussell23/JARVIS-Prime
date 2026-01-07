@@ -124,11 +124,11 @@ from jarvis_prime.core.hybrid_router import (
     AGIEnhancedAnalyzer,
 )
 
-# AGI v78.0: Advanced Integration Layer
+# AGI v79.1: Advanced Integration Layer
 from jarvis_prime.core.trinity_protocol import (
     TrinityMessage,
     MessageType,
-    TrinityTransport,
+    Transport as TrinityTransport,  # Aliased for backward compatibility
     FileIPCTransport,
     WebSocketTransport,
     TrinityClient,
@@ -151,11 +151,7 @@ from jarvis_prime.core.agi_persistence import (
     ModelComponent,
     SemanticVersion,
     ModelMetadata,
-    CheckpointType,
     get_persistence_manager,
-    save_model,
-    load_model,
-    create_checkpoint,
 )
 from jarvis_prime.core.agi_error_handler import (
     AGIErrorHandler,
@@ -338,11 +334,7 @@ __all__ = [
     "ModelComponent",
     "SemanticVersion",
     "ModelMetadata",
-    "CheckpointType",
     "get_persistence_manager",
-    "save_model",
-    "load_model",
-    "create_checkpoint",
     # AGI Error Handler (v78.0)
     "AGIErrorHandler",
     "AGIError",

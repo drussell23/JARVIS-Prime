@@ -465,8 +465,11 @@ class FileIPCTransport(Transport):
     """
     File-based IPC transport for cross-process communication.
 
-    Uses a shared directory with inbox/outbox folders for each node.
-    Supports atomic writes and file locking for reliability.
+    v79.1: Fixed race conditions and improved reliability:
+    - Uses OrderedDict for proper FIFO eviction of processed IDs
+    - Bounded message queue to prevent memory exhaustion
+    - File locking to prevent concurrent read conflicts
+    - Adaptive polling interval to reduce CPU when idle
 
     Directory structure:
     ~/.jarvis/trinity/
@@ -481,16 +484,31 @@ class FileIPCTransport(Transport):
         └── outbox/
     """
 
+    # Configurable limits (can be overridden via environment)
+    MAX_QUEUE_SIZE = int(os.getenv("TRINITY_MAX_QUEUE_SIZE", "10000"))
+    MAX_PROCESSED_IDS = int(os.getenv("TRINITY_MAX_PROCESSED_IDS", "10000"))
+    MIN_POLL_INTERVAL = float(os.getenv("TRINITY_MIN_POLL_INTERVAL", "0.05"))
+    MAX_POLL_INTERVAL = float(os.getenv("TRINITY_MAX_POLL_INTERVAL", "1.0"))
+
     def __init__(self, config: TrinityConfig) -> None:
         self._config = config
         self._node = config.node_type
         self._base_dir = config.ipc_base_dir
         self._connected = False
         self._receive_task: Optional[asyncio.Task] = None
-        self._message_queue: asyncio.Queue[TrinityMessage] = asyncio.Queue()
+        # v79.1: Bounded queue to prevent memory exhaustion
+        self._message_queue: asyncio.Queue[TrinityMessage] = asyncio.Queue(
+            maxsize=self.MAX_QUEUE_SIZE
+        )
         self._shutdown = asyncio.Event()
-        self._processed_ids: Set[str] = set()
-        self._max_processed_ids = 10000
+        # v79.1: Use OrderedDict for proper FIFO eviction (preserves insertion order)
+        from collections import OrderedDict
+        self._processed_ids: OrderedDict[str, float] = OrderedDict()  # id -> timestamp
+        self._max_processed_ids = self.MAX_PROCESSED_IDS
+        # v79.1: Adaptive polling interval
+        self._current_poll_interval = self.MIN_POLL_INTERVAL
+        # v79.1: File lock for inbox processing (platform-specific)
+        self._inbox_lock = asyncio.Lock()
 
     @property
     def inbox_dir(self) -> Path:
@@ -587,56 +605,161 @@ class FileIPCTransport(Transport):
                 continue
 
     async def _receive_loop(self) -> None:
-        """Background loop to check inbox for messages."""
+        """
+        Background loop to check inbox for messages.
+
+        v79.1: Uses adaptive polling interval to reduce CPU when idle.
+        """
         while not self._shutdown.is_set():
             try:
-                await self._check_inbox()
-                await asyncio.sleep(0.1)  # 100ms polling
+                had_messages = await self._check_inbox()
+
+                # Adaptive polling: speed up when busy, slow down when idle
+                if had_messages:
+                    self._current_poll_interval = self.MIN_POLL_INTERVAL
+                else:
+                    # Exponential backoff when idle (max 1 second)
+                    self._current_poll_interval = min(
+                        self._current_poll_interval * 1.5,
+                        self.MAX_POLL_INTERVAL
+                    )
+
+                await asyncio.sleep(self._current_poll_interval)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in receive loop: {e}")
                 await asyncio.sleep(1.0)
 
-    async def _check_inbox(self) -> None:
-        """Check inbox for new messages."""
-        loop = asyncio.get_event_loop()
+    async def _check_inbox(self) -> bool:
+        """
+        Check inbox for new messages.
 
-        # Get sorted list of message files
-        msg_files = sorted(self.inbox_dir.glob("*.msg"))
+        v79.1: Added file locking to prevent concurrent read conflicts.
 
-        for filepath in msg_files:
+        Returns:
+            True if any messages were processed, False otherwise.
+        """
+        # Use lock to prevent concurrent inbox processing
+        async with self._inbox_lock:
+            loop = asyncio.get_event_loop()
+            processed_any = False
+
+            # Get sorted list of message files
             try:
-                # Read and parse
-                content = await loop.run_in_executor(None, filepath.read_text)
-                data = json.loads(content)
-                message = TrinityMessage.from_dict(data)
-
-                # Check if already processed
-                if message.id in self._processed_ids:
-                    await loop.run_in_executor(None, filepath.unlink)
-                    continue
-
-                # Check if expired
-                if message.is_expired():
-                    logger.warning(f"Dropping expired message {message.id}")
-                    await loop.run_in_executor(None, filepath.unlink)
-                    continue
-
-                # Queue message
-                await self._message_queue.put(message)
-
-                # Mark as processed
-                self._processed_ids.add(message.id)
-                if len(self._processed_ids) > self._max_processed_ids:
-                    # Remove oldest half
-                    self._processed_ids = set(list(self._processed_ids)[self._max_processed_ids // 2:])
-
-                # Delete file
-                await loop.run_in_executor(None, filepath.unlink)
-
+                msg_files = sorted(self.inbox_dir.glob("*.msg"))
             except Exception as e:
-                logger.error(f"Error processing message file {filepath}: {e}")
+                logger.debug(f"Error listing inbox: {e}")
+                return False
+
+            for filepath in msg_files:
+                try:
+                    # v79.1: Try to acquire file lock before reading
+                    # This prevents race conditions when multiple readers exist
+                    content = await loop.run_in_executor(
+                        None,
+                        self._read_with_lock,
+                        filepath
+                    )
+
+                    if content is None:
+                        # Another process is reading this file, skip it
+                        continue
+
+                    data = json.loads(content)
+                    message = TrinityMessage.from_dict(data)
+
+                    # Check if already processed (using OrderedDict for O(1) lookup)
+                    if message.id in self._processed_ids:
+                        await loop.run_in_executor(None, self._safe_unlink, filepath)
+                        continue
+
+                    # Check if expired
+                    if message.is_expired():
+                        logger.warning(f"Dropping expired message {message.id}")
+                        await loop.run_in_executor(None, self._safe_unlink, filepath)
+                        continue
+
+                    # Queue message (with timeout to handle full queue)
+                    try:
+                        await asyncio.wait_for(
+                            self._message_queue.put(message),
+                            timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Message queue full, dropping message {message.id}")
+                        continue
+
+                    # Mark as processed with timestamp (OrderedDict preserves order)
+                    self._processed_ids[message.id] = time.time()
+
+                    # v79.1: FIFO eviction - remove oldest entries when over limit
+                    while len(self._processed_ids) > self._max_processed_ids:
+                        self._processed_ids.popitem(last=False)  # Remove oldest (FIFO)
+
+                    # Delete file
+                    await loop.run_in_executor(None, self._safe_unlink, filepath)
+                    processed_any = True
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON in message file {filepath}: {e}")
+                    # Move corrupted file to error directory
+                    await loop.run_in_executor(None, self._quarantine_file, filepath)
+                except Exception as e:
+                    logger.error(f"Error processing message file {filepath}: {e}")
+
+            return processed_any
+
+    def _read_with_lock(self, filepath: Path) -> Optional[str]:
+        """
+        Read file with advisory file lock.
+
+        v79.1: Prevents race conditions when multiple processes read.
+        """
+        import fcntl
+
+        try:
+            with open(filepath, 'r') as f:
+                # Try to acquire exclusive lock (non-blocking)
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # Another process has the lock
+                    return None
+
+                try:
+                    content = f.read()
+                    return content
+                finally:
+                    # Release lock
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        except FileNotFoundError:
+            # File was deleted by another process
+            return None
+        except Exception as e:
+            logger.debug(f"Error reading {filepath}: {e}")
+            return None
+
+    def _safe_unlink(self, filepath: Path) -> None:
+        """Safely delete a file, ignoring if already deleted."""
+        try:
+            filepath.unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug(f"Error unlinking {filepath}: {e}")
+
+    def _quarantine_file(self, filepath: Path) -> None:
+        """Move corrupted file to error directory for debugging."""
+        try:
+            error_dir = self._base_dir / "errors"
+            error_dir.mkdir(parents=True, exist_ok=True)
+            dest = error_dir / f"{time.time():.6f}_{filepath.name}"
+            filepath.rename(dest)
+            logger.info(f"Quarantined corrupted file to {dest}")
+        except Exception as e:
+            logger.debug(f"Error quarantining {filepath}: {e}")
+            self._safe_unlink(filepath)
 
     @property
     def is_connected(self) -> bool:

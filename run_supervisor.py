@@ -181,8 +181,56 @@ class ComponentState:
     stderr_buffer: List[str] = field(default_factory=list)
 
 
+class HealthCheckPool:
+    """
+    Connection pool for health checks.
+
+    v79.1: Reuses HTTP sessions to avoid TCP overhead on every health check.
+    """
+
+    def __init__(self):
+        self._sessions: Dict[str, Any] = {}  # component_name -> aiohttp.ClientSession
+        self._lock = asyncio.Lock()
+
+    async def get_session(self, component_name: str) -> Any:
+        """Get or create a session for a component."""
+        async with self._lock:
+            if component_name not in self._sessions:
+                try:
+                    import aiohttp
+                    connector = aiohttp.TCPConnector(
+                        limit=2,
+                        ttl_dns_cache=300,
+                        use_dns_cache=True,
+                    )
+                    self._sessions[component_name] = aiohttp.ClientSession(
+                        connector=connector,
+                        timeout=aiohttp.ClientTimeout(total=5, connect=2),
+                    )
+                except ImportError:
+                    return None
+            return self._sessions[component_name]
+
+    async def close_all(self) -> None:
+        """Close all sessions."""
+        async with self._lock:
+            for session in self._sessions.values():
+                await session.close()
+            self._sessions.clear()
+
+
 class ComponentManager:
     """Manages lifecycle of a single component."""
+
+    # Shared health check pool across all managers
+    _health_pool: Optional[HealthCheckPool] = None
+
+    @classmethod
+    def get_health_pool(cls) -> HealthCheckPool:
+        """Get shared health check pool."""
+        if cls._health_pool is None:
+            cls._health_pool = HealthCheckPool()
+        return cls._health_pool
 
     def __init__(
         self,
@@ -301,7 +349,11 @@ class ComponentManager:
         return await self.start()
 
     async def health_check(self) -> bool:
-        """Check component health."""
+        """
+        Check component health.
+
+        v79.1: Uses pooled connections for efficiency.
+        """
         if self.state.process is None or self.state.process.returncode is not None:
             self.state.status = ComponentStatus.STOPPED
             return False
@@ -310,18 +362,39 @@ class ComponentManager:
             return True
 
         try:
-            import aiohttp
+            # Use pooled session for efficiency
+            session = await self.get_health_pool().get_session(self.config.name)
+            if session is None:
+                # Fallback if aiohttp not available
+                return True
 
             url = f"http://{self.config.host}:{self.config.port}{self.config.health_endpoint}"
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status == 200:
-                        self.state.status = ComponentStatus.HEALTHY
-                        self.state.consecutive_failures = 0
-                        self.state.last_health_check = time.time()
-                        return True
+            async with session.get(url) as response:
+                if response.status == 200:
+                    self.state.status = ComponentStatus.HEALTHY
+                    self.state.consecutive_failures = 0
+                    self.state.last_health_check = time.time()
 
+                    # Deep health check: verify response content
+                    try:
+                        data = await response.json()
+                        if isinstance(data, dict):
+                            # Check for degraded status
+                            if data.get("status") == "degraded":
+                                logger.warning(f"{self.config.name} is degraded: {data.get('reason', 'unknown')}")
+                            # Track subsystem health if available
+                            if "subsystems" in data:
+                                self.state.metrics["subsystems"] = data["subsystems"]
+                    except Exception:
+                        pass  # JSON parsing optional
+
+                    return True
+                else:
+                    logger.debug(f"Health check returned {response.status} for {self.config.name}")
+
+        except asyncio.TimeoutError:
+            logger.debug(f"Health check timeout for {self.config.name}")
         except Exception as e:
             logger.debug(f"Health check failed for {self.config.name}: {e}")
 
@@ -416,10 +489,15 @@ class UnifiedSupervisor:
     """
     Unified supervisor for the JARVIS ecosystem.
 
+    v79.1: Enhanced with CognitiveRouter integration for Body-Mind connection.
+
     Orchestrates all components across repositories:
     - JARVIS (Body): macOS integration and action execution
     - JARVIS-Prime (Mind): LLM inference and reasoning
     - Reactor-Core (Training): Model training pipeline
+
+    The supervisor now also initializes the CognitiveRouter which acts as
+    the "Corpus Callosum" connecting the Body to the Mind.
     """
 
     def __init__(
@@ -431,6 +509,7 @@ class UnifiedSupervisor:
         self._running = False
         self._health_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
+        self._cognitive_router = None
 
         # Ensure directories exist
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
@@ -511,11 +590,13 @@ class UnifiedSupervisor:
         """
         Start the supervisor and all components.
 
+        v79.1: Now includes CognitiveRouter (Corpus Callosum) initialization.
+
         Args:
             components: Specific components to start (None = all enabled)
         """
         logger.info("=" * 60)
-        logger.info("JARVIS Unified Supervisor - Starting")
+        logger.info("JARVIS Unified Supervisor v79.1 - Starting")
         logger.info("=" * 60)
 
         self._running = True
@@ -525,6 +606,15 @@ class UnifiedSupervisor:
 
         # Write supervisor state
         await self._write_state()
+
+        # Initialize CognitiveRouter (Corpus Callosum) for Body-Mind connection
+        try:
+            from jarvis_prime.core.hybrid_router import get_cognitive_router
+            self._cognitive_router = await get_cognitive_router()
+            prime_healthy = self._cognitive_router._prime_bridge.is_healthy
+            logger.info(f"🧠 CognitiveRouter (Corpus Callosum) initialized, Prime healthy={prime_healthy}")
+        except Exception as e:
+            logger.warning(f"CognitiveRouter initialization deferred: {e}")
 
         # Determine components to start
         if components:
@@ -562,9 +652,13 @@ class UnifiedSupervisor:
         return success
 
     async def stop(self) -> None:
-        """Stop all components and the supervisor."""
+        """
+        Stop all components and the supervisor.
+
+        v79.1: Also cleans up CognitiveRouter and connection pools.
+        """
         logger.info("=" * 60)
-        logger.info("JARVIS Unified Supervisor - Stopping")
+        logger.info("JARVIS Unified Supervisor v79.1 - Stopping")
         logger.info("=" * 60)
 
         self._running = False
@@ -577,6 +671,15 @@ class UnifiedSupervisor:
             except asyncio.CancelledError:
                 pass
 
+        # Stop CognitiveRouter (Corpus Callosum)
+        if self._cognitive_router is not None:
+            try:
+                from jarvis_prime.core.hybrid_router import shutdown_cognitive_router
+                await shutdown_cognitive_router()
+                logger.info("🧠 CognitiveRouter (Corpus Callosum) stopped")
+            except Exception as e:
+                logger.warning(f"CognitiveRouter shutdown error: {e}")
+
         # Stop components in reverse order
         stop_order = list(reversed(self.config.startup_order))
 
@@ -585,6 +688,11 @@ class UnifiedSupervisor:
                 manager = self._managers[name]
                 if manager.state.status in (ComponentStatus.RUNNING, ComponentStatus.HEALTHY):
                     await manager.stop(timeout=self.config.shutdown_timeout_seconds)
+
+        # Close health check connection pool
+        if ComponentManager._health_pool is not None:
+            await ComponentManager._health_pool.close_all()
+            logger.info("Health check connection pool closed")
 
         # Write final state
         await self._write_state()

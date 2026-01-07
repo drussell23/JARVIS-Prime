@@ -2,7 +2,13 @@
 AGI Error Handler - Graceful Degradation and Recovery
 =======================================================
 
-v78.0 - Intelligent error handling for AGI systems
+v79.0 - Intelligent error handling for AGI systems
+
+CHANGES in v79.0:
+    - Fixed circuit breaker race condition with permit-based pattern
+    - Added ExecutionPermit class for atomic acquire/release
+    - Deprecated can_execute() in favor of acquire_permit()
+    - Added active_permits_count property for monitoring
 
 Provides multi-level fallback strategies when AGI components fail:
 1. Retry with backoff
@@ -265,12 +271,45 @@ class CircuitBreakerConfig:
     half_open_max_requests: int = 3
 
 
+@dataclass
+class ExecutionPermit:
+    """
+    v79.0: Atomic execution permit for circuit breaker.
+
+    RACE CONDITION FIX: Previous implementation checked can_execute() separately
+    from execution, allowing state changes between check and execution.
+
+    This permit atomically reserves a slot and must be released after execution.
+    """
+    permit_id: str
+    circuit_name: str
+    acquired_at: float = field(default_factory=time.time)
+    state_at_acquisition: CircuitState = CircuitState.CLOSED
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass  # Cleanup handled by circuit breaker
+
+
 class CircuitBreaker:
     """
     Circuit breaker for component protection.
 
+    v79.0: Permit-based execution to prevent race conditions.
+
     Prevents cascade failures by temporarily blocking requests
     to failing components.
+
+    Usage:
+        permit = await breaker.acquire_permit()
+        if permit:
+            try:
+                result = await do_operation()
+                await breaker.release_permit(permit, success=True)
+            except Exception:
+                await breaker.release_permit(permit, success=False)
     """
 
     def __init__(
@@ -285,6 +324,8 @@ class CircuitBreaker:
         self._success_count = 0
         self._last_failure_time = 0.0
         self._half_open_requests = 0
+        self._active_permits: Dict[str, ExecutionPermit] = {}
+        self._permit_counter = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -295,8 +336,92 @@ class CircuitBreaker:
     def is_open(self) -> bool:
         return self._state == CircuitState.OPEN
 
+    @property
+    def active_permits_count(self) -> int:
+        return len(self._active_permits)
+
+    async def acquire_permit(self) -> Optional[ExecutionPermit]:
+        """
+        v79.0: Atomically acquire a permit to execute.
+
+        Returns:
+            ExecutionPermit if allowed, None if circuit is blocking.
+
+        This is the ONLY way to check and reserve execution atomically.
+        """
+        async with self._lock:
+            await self._check_state_transition()
+
+            if self._state == CircuitState.OPEN:
+                return None
+
+            if self._state == CircuitState.HALF_OPEN:
+                if self._half_open_requests >= self._config.half_open_max_requests:
+                    return None
+                self._half_open_requests += 1
+
+            # Issue permit
+            self._permit_counter += 1
+            permit_id = f"{self._name}-{self._permit_counter}-{int(time.time() * 1000)}"
+            permit = ExecutionPermit(
+                permit_id=permit_id,
+                circuit_name=self._name,
+                state_at_acquisition=self._state,
+            )
+            self._active_permits[permit_id] = permit
+            return permit
+
+    async def release_permit(
+        self,
+        permit: ExecutionPermit,
+        success: bool,
+        error: Optional[AGIError] = None,
+    ) -> None:
+        """
+        v79.0: Release a permit and record the outcome.
+
+        Args:
+            permit: The permit to release
+            success: Whether the operation succeeded
+            error: Optional error if failed
+        """
+        async with self._lock:
+            # Remove from active permits
+            self._active_permits.pop(permit.permit_id, None)
+
+            if success:
+                await self._record_success_locked()
+            else:
+                await self._record_failure_locked(error)
+
+    async def _record_success_locked(self) -> None:
+        """Record success (must be called with lock held)."""
+        if self._state == CircuitState.HALF_OPEN:
+            self._success_count += 1
+            if self._success_count >= self._config.success_threshold:
+                self._transition_to(CircuitState.CLOSED)
+        elif self._state == CircuitState.CLOSED:
+            self._failure_count = max(0, self._failure_count - 1)
+
+    async def _record_failure_locked(self, error: Optional[AGIError] = None) -> None:
+        """Record failure (must be called with lock held)."""
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+
+        if self._state == CircuitState.HALF_OPEN:
+            self._transition_to(CircuitState.OPEN)
+        elif self._state == CircuitState.CLOSED:
+            if self._failure_count >= self._config.failure_threshold:
+                self._transition_to(CircuitState.OPEN)
+
+    # Legacy compatibility methods (deprecated, use acquire_permit/release_permit)
     async def can_execute(self) -> bool:
-        """Check if execution is allowed."""
+        """
+        DEPRECATED: Use acquire_permit() instead.
+
+        Check if execution is allowed. Note: This has a race condition
+        between check and execution. Use acquire_permit() for atomic checks.
+        """
         async with self._lock:
             await self._check_state_transition()
 
@@ -311,26 +436,14 @@ class CircuitBreaker:
                 return False
 
     async def record_success(self) -> None:
-        """Record a successful execution."""
+        """DEPRECATED: Use release_permit(permit, success=True) instead."""
         async with self._lock:
-            if self._state == CircuitState.HALF_OPEN:
-                self._success_count += 1
-                if self._success_count >= self._config.success_threshold:
-                    self._transition_to(CircuitState.CLOSED)
-            elif self._state == CircuitState.CLOSED:
-                self._failure_count = max(0, self._failure_count - 1)
+            await self._record_success_locked()
 
     async def record_failure(self, error: Optional[AGIError] = None) -> None:
-        """Record a failed execution."""
+        """DEPRECATED: Use release_permit(permit, success=False) instead."""
         async with self._lock:
-            self._failure_count += 1
-            self._last_failure_time = time.time()
-
-            if self._state == CircuitState.HALF_OPEN:
-                self._transition_to(CircuitState.OPEN)
-            elif self._state == CircuitState.CLOSED:
-                if self._failure_count >= self._config.failure_threshold:
-                    self._transition_to(CircuitState.OPEN)
+            await self._record_failure_locked(error)
 
     async def _check_state_transition(self) -> None:
         """Check if we should transition states."""

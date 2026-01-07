@@ -1047,33 +1047,124 @@ class AGIIntegrationHub:
 
 
 # =============================================================================
-# SINGLETON INSTANCE
+# =============================================================================
+# SINGLETON INSTANCE - v79.1: Condition-Based Wait/Notify Pattern
+# =============================================================================
+#
+# RACE CONDITION FIX v79.1: Previous v79.0 implementation used recursive call
+# with sleep, which could cause thundering herd when multiple coroutines wake
+# up simultaneously.
+#
+# The new pattern uses asyncio.Condition for proper wait/notify:
+# 1. Fast path without lock (99% of calls)
+# 2. Condition-based waiting for initialization
+# 3. notify_all() to wake waiters when ready
+# 4. No recursive calls, no thundering herd
 # =============================================================================
 
 
 _global_hub: Optional[AGIIntegrationHub] = None
-_hub_lock = asyncio.Lock()
+_hub_condition: Optional[asyncio.Condition] = None
+_hub_initializing = False
+
+
+def _get_hub_condition() -> asyncio.Condition:
+    """Lazy-initialize the condition (must be created in event loop)."""
+    global _hub_condition
+    if _hub_condition is None:
+        _hub_condition = asyncio.Condition()
+    return _hub_condition
 
 
 async def get_agi_hub(config: Optional[AGIHubConfig] = None) -> AGIIntegrationHub:
-    """Get or create the global AGI Integration Hub singleton."""
-    global _global_hub
+    """
+    Get or create the global AGI Integration Hub singleton.
 
-    async with _hub_lock:
-        if _global_hub is None:
-            _global_hub = AGIIntegrationHub(config)
-            await _global_hub.initialize()
+    v79.1: Uses asyncio.Condition for proper wait/notify pattern.
 
+    Thread Safety:
+        - Fast path: Returns existing hub without lock acquisition
+        - Slow path: Waiters use Condition.wait() instead of sleep+retry
+        - notify_all() wakes all waiters atomically when ready
+        - No thundering herd, no recursive calls
+        - Handles initialization failures gracefully
+    """
+    global _global_hub, _hub_initializing
+
+    # Fast path: Already initialized (no lock needed)
+    if _global_hub is not None and _global_hub._initialized:
         return _global_hub
+
+    # Slow path: Use condition for proper synchronization
+    condition = _get_hub_condition()
+
+    async with condition:
+        # Check again under lock
+        if _global_hub is not None and _global_hub._initialized:
+            return _global_hub
+
+        # If someone else is initializing, wait for them
+        if _hub_initializing:
+            logger.debug("[AGI Hub] Waiting for ongoing initialization...")
+            # Wait on condition - will be notified when init completes
+            while _hub_initializing:
+                await condition.wait()
+
+            # After waking, check if initialization succeeded
+            if _global_hub is not None and _global_hub._initialized:
+                return _global_hub
+            else:
+                # Previous initialization failed, we'll try again
+                pass
+
+        # We're the initializer
+        _hub_initializing = True
+
+    # Initialize OUTSIDE the lock to avoid blocking waiters during slow init
+    try:
+        new_hub = AGIIntegrationHub(config)
+        await new_hub.initialize()
+
+        # Update global state under lock
+        async with condition:
+            _global_hub = new_hub
+            _hub_initializing = False
+            condition.notify_all()  # Wake all waiters
+
+        logger.info("[AGI Hub] Singleton initialized successfully")
+        return _global_hub
+
+    except Exception as e:
+        # Cleanup on failure and notify waiters
+        async with condition:
+            _global_hub = None
+            _hub_initializing = False
+            condition.notify_all()  # Wake waiters so they can retry
+
+        logger.error(f"[AGI Hub] Initialization failed: {e}")
+        raise
 
 
 async def shutdown_agi_hub() -> None:
-    """Shutdown the global AGI Integration Hub."""
-    global _global_hub
+    """
+    Shutdown the global AGI Integration Hub.
 
-    if _global_hub is not None:
-        await _global_hub.shutdown()
-        _global_hub = None
+    v79.1: Thread-safe shutdown with condition notification.
+    """
+    global _global_hub, _hub_initializing
+
+    condition = _get_hub_condition()
+
+    async with condition:
+        if _global_hub is not None:
+            try:
+                await _global_hub.shutdown()
+            except Exception as e:
+                logger.error(f"[AGI Hub] Shutdown error: {e}")
+            finally:
+                _global_hub = None
+                _hub_initializing = False
+                condition.notify_all()  # Wake any waiters
 
 
 # =============================================================================
