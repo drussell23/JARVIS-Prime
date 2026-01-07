@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Static analyzers (e.g. Pylance) don't infer exports provided via `__getattr__`.
 # Declare type-check-only stubs so names in `__all__` are considered present,
@@ -23,6 +23,13 @@ if TYPE_CHECKING:
     TinyPrimeConfig: Any
     TinyPrimeGuard: Any
     IntentResult: Any
+
+    # AGI v0.7.0 Components
+    AGIOrchestrator: Any
+    ReasoningEngine: Any
+    AppleSiliconOptimizer: Any
+    ContinuousLearningEngine: Any
+    MultiModalFusionEngine: Any
 
     def check_semantic_security(text: str, *, cfg_path: str | None = None) -> Any: ...
 
@@ -79,6 +86,22 @@ def __getattr__(name):
             "get_semantic_guard": get_semantic_guard,
             "IntentResult": IntentResult,
         }[name]
+    # AGI v0.7.0 Components - Lazy loaded to avoid heavy imports
+    elif name == "AGIOrchestrator":
+        from jarvis_prime.core.agi_models import AGIOrchestrator
+        return AGIOrchestrator
+    elif name == "ReasoningEngine":
+        from jarvis_prime.core.reasoning_engine import ReasoningEngine
+        return ReasoningEngine
+    elif name == "AppleSiliconOptimizer":
+        from jarvis_prime.core.apple_silicon_optimizer import AppleSiliconOptimizer
+        return AppleSiliconOptimizer
+    elif name == "ContinuousLearningEngine":
+        from jarvis_prime.core.continuous_learning import ContinuousLearningEngine
+        return ContinuousLearningEngine
+    elif name == "MultiModalFusionEngine":
+        from jarvis_prime.core.multimodal_fusion import MultiModalFusionEngine
+        return MultiModalFusionEngine
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 __all__ = [
@@ -94,5 +117,11 @@ __all__ = [
     "check_semantic_security_async",
     "get_semantic_guard",
     "IntentResult",
+    # AGI v0.7.0 Components
+    "AGIOrchestrator",
+    "ReasoningEngine",
+    "AppleSiliconOptimizer",
+    "ContinuousLearningEngine",
+    "MultiModalFusionEngine",
     "__version__",
 ]
