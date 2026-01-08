@@ -301,11 +301,12 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    # v77.0: Apply Apple Silicon optimizations if available
+    # v80.0: Apply hardware optimizations with auto-detection
     optimized_gpu_layers = args.gpu_layers
     optimized_threads = args.threads
     optimized_ctx_size = args.ctx_size
 
+    # Try AGI Hub hardware optimizer first (v77.0)
     if agi_hub and agi_hub.hardware_optimizer:
         try:
             hw_opt = agi_hub.hardware_optimizer
@@ -330,12 +331,36 @@ async def main():
         except Exception as e:
             logger.warning(f"Apple Silicon optimization failed: {e}")
 
-    # Create executor (may be unloaded)
+    # v80.0: Use new HardwareDetector as fallback
+    else:
+        try:
+            from jarvis_prime.core.llama_cpp_executor import HardwareDetector, HardwareBackend
+
+            hw = HardwareDetector.detect()
+            logger.info(f"Hardware detected: {hw.backend.name}")
+            logger.info(f"  GPU: {hw.gpu_name or 'None'}")
+            logger.info(f"  Memory: {hw.total_memory_gb:.1f} GB")
+
+            if hw.backend == HardwareBackend.METAL:
+                optimized_gpu_layers = -1  # All layers to Metal GPU
+                optimized_threads = hw.performance_cores or args.threads
+                logger.info(f"Metal GPU: Enabled (all layers offloaded)")
+                logger.info(f"Threads: {optimized_threads} (performance cores)")
+            elif hw.backend == HardwareBackend.CUDA:
+                optimized_gpu_layers = -1
+                logger.info("CUDA GPU: Enabled")
+
+        except Exception as e:
+            logger.warning(f"Hardware auto-detection failed: {e}")
+
+    # Create executor with optimized config
     config = LlamaCppConfig(
         n_ctx=optimized_ctx_size,
         n_threads=optimized_threads,
         n_gpu_layers=optimized_gpu_layers,
         verbose=args.debug,
+        flash_attn=True,  # v80.0: Enable flash attention
+        cache_prompt=True,  # v80.0: Cache prompts for faster re-generation
     )
     executor = LlamaCppExecutor(config)
 
