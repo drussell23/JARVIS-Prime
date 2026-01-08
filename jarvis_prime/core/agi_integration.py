@@ -70,6 +70,10 @@ class AGISubsystem(Enum):
     LEARNING = auto()
     MULTIMODAL = auto()
     HARDWARE = auto()
+    # v80.0 AGI Models
+    AGI_MODELS = auto()
+    CONTINUAL_LEARNING = auto()
+    SELF_IMPROVEMENT = auto()
 
 
 class RequestComplexity(Enum):
@@ -322,6 +326,13 @@ class AGIIntegrationHub:
         self._learning_engine: Optional[Any] = None
         self._multimodal_engine: Optional[Any] = None
         self._hardware_optimizer: Optional[Any] = None
+        # v80.0 AGI Models
+        self._agi_model_manager: Optional[Any] = None
+        self._continual_learner: Optional[Any] = None
+        self._self_modifier: Optional[Any] = None
+        self._knowledge_distiller: Optional[Any] = None
+        self._active_learner: Optional[Any] = None
+        self._nas_engine: Optional[Any] = None
 
         # State
         self._initialized = False
@@ -369,6 +380,9 @@ class AGIIntegrationHub:
 
                 if self._config.enable_multimodal:
                     init_tasks.append(self._init_multimodal())
+
+                # v80.0: Initialize advanced AGI models
+                init_tasks.append(self._init_agi_models_v80())
 
                 results = await asyncio.gather(*init_tasks, return_exceptions=True)
 
@@ -553,6 +567,142 @@ class AGIIntegrationHub:
                 error=str(e),
             )
             return False
+
+    async def _init_agi_models_v80(self) -> bool:
+        """
+        Initialize v80.0 AGI Models subsystems.
+
+        Includes:
+            - AGI Model Manager (MoE, specialized models)
+            - Continual Learning Engine (experience replay, RAG)
+            - Self-Modification Engine (meta-learning, NAS)
+            - Knowledge Distillation Engine
+            - Active Learning Engine
+        """
+        try:
+            # Import v80.0 models
+            from jarvis_prime.models import (
+                get_model_manager,
+                get_continual_learner,
+                get_self_modifier,
+                KnowledgeDistillationEngine,
+                ActiveLearningEngine,
+                NeuralArchitectureSearch,
+            )
+
+            # Initialize AGI Model Manager
+            try:
+                self._agi_model_manager = await get_model_manager()
+                logger.info("v80.0 AGI Model Manager initialized")
+            except Exception as e:
+                logger.warning(f"AGI Model Manager init failed: {e}")
+
+            # Initialize Continual Learning
+            try:
+                self._continual_learner = await get_continual_learner()
+                logger.info("v80.0 Continual Learning Engine initialized")
+            except Exception as e:
+                logger.warning(f"Continual Learning init failed: {e}")
+
+            # Initialize Self-Modification Engine
+            try:
+                self._self_modifier = await get_self_modifier()
+                logger.info("v80.0 Self-Modification Engine initialized")
+            except Exception as e:
+                logger.warning(f"Self-Modification init failed: {e}")
+
+            # Initialize Knowledge Distillation
+            try:
+                self._knowledge_distiller = KnowledgeDistillationEngine()
+                logger.info("v80.0 Knowledge Distillation Engine initialized")
+            except Exception as e:
+                logger.warning(f"Knowledge Distillation init failed: {e}")
+
+            # Initialize Active Learning
+            try:
+                self._active_learner = ActiveLearningEngine()
+                logger.info("v80.0 Active Learning Engine initialized")
+            except Exception as e:
+                logger.warning(f"Active Learning init failed: {e}")
+
+            # Initialize NAS Engine
+            try:
+                self._nas_engine = NeuralArchitectureSearch()
+                logger.info("v80.0 Neural Architecture Search initialized")
+            except Exception as e:
+                logger.warning(f"NAS init failed: {e}")
+
+            # Update status
+            self._subsystem_status[AGISubsystem.AGI_MODELS] = SubsystemStatus(
+                name="agi_models_v80",
+                initialized=self._agi_model_manager is not None,
+                healthy=True,
+                last_check=time.time(),
+            )
+
+            self._subsystem_status[AGISubsystem.CONTINUAL_LEARNING] = SubsystemStatus(
+                name="continual_learning_v80",
+                initialized=self._continual_learner is not None,
+                healthy=True,
+                last_check=time.time(),
+            )
+
+            self._subsystem_status[AGISubsystem.SELF_IMPROVEMENT] = SubsystemStatus(
+                name="self_improvement_v80",
+                initialized=self._self_modifier is not None,
+                healthy=True,
+                last_check=time.time(),
+            )
+
+            logger.info("v80.0 AGI Models subsystems initialized successfully")
+            return True
+
+        except ImportError as e:
+            logger.warning(f"v80.0 AGI Models not available: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to initialize v80.0 AGI Models: {e}")
+            self._subsystem_status[AGISubsystem.AGI_MODELS] = SubsystemStatus(
+                name="agi_models_v80",
+                initialized=False,
+                healthy=False,
+                error=str(e),
+            )
+            return False
+
+    # -------------------------------------------------------------------------
+    # V80.0 AGI MODEL ACCESSORS
+    # -------------------------------------------------------------------------
+
+    @property
+    def agi_model_manager(self) -> Optional[Any]:
+        """Get AGI Model Manager (v80.0)."""
+        return self._agi_model_manager
+
+    @property
+    def continual_learner(self) -> Optional[Any]:
+        """Get Continual Learning Engine (v80.0)."""
+        return self._continual_learner
+
+    @property
+    def self_modifier(self) -> Optional[Any]:
+        """Get Self-Modification Engine (v80.0)."""
+        return self._self_modifier
+
+    @property
+    def knowledge_distiller(self) -> Optional[Any]:
+        """Get Knowledge Distillation Engine (v80.0)."""
+        return self._knowledge_distiller
+
+    @property
+    def active_learner(self) -> Optional[Any]:
+        """Get Active Learning Engine (v80.0)."""
+        return self._active_learner
+
+    @property
+    def nas_engine(self) -> Optional[Any]:
+        """Get Neural Architecture Search Engine (v80.0)."""
+        return self._nas_engine
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all subsystems."""

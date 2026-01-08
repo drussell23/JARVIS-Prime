@@ -706,6 +706,87 @@ async def main():
         }
 
     # ==========================================================================
+    # MODEL HOT-RELOAD ENDPOINT - Reactor-Core Integration
+    # ==========================================================================
+    # Called by Reactor-Core after training to hot-swap the model without restart.
+
+    class ModelReloadRequest(BaseModel):
+        """Request to reload model from Reactor-Core."""
+        model_path: str
+        model_version: str = "unknown"
+        model_id: str = ""
+
+    @app.post("/api/v1/models/reload")
+    async def reload_model(request: ModelReloadRequest):
+        """
+        Hot-reload model from Reactor-Core.
+
+        This endpoint is called after Reactor-Core completes training and
+        deploys a new model. It allows JARVIS-Prime to reload without restart.
+        """
+        nonlocal model_path
+
+        logger.info(f"Model reload requested: {request.model_path} (v{request.model_version})")
+
+        try:
+            new_model_path = Path(request.model_path)
+
+            if not new_model_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Model file not found: {request.model_path}"
+                )
+
+            # Unload current model
+            if executor.is_loaded():
+                logger.info("Unloading current model...")
+                await executor.close()
+
+            # Load new model
+            logger.info(f"Loading new model: {new_model_path}")
+            start = time.time()
+            await executor.load(new_model_path)
+            load_time = time.time() - start
+
+            # Update model_path reference
+            model_path = new_model_path
+
+            # Notify bridges
+            if _bridge:
+                try:
+                    from jarvis_prime.core.cross_repo_bridge import update_model_status
+                    update_model_status(loaded=True, model_path=str(model_path))
+                    await _bridge.notify_jarvis("model_reloaded", {
+                        "model_path": str(model_path),
+                        "model_version": request.model_version,
+                        "load_time_seconds": load_time,
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to notify bridge: {e}")
+
+            if trinity_initialized:
+                try:
+                    from jarvis_prime.core.trinity_bridge import update_model_status as trinity_update
+                    trinity_update(loaded=True, model_path=str(model_path))
+                except Exception as e:
+                    logger.warning(f"Failed to notify Trinity: {e}")
+
+            logger.info(f"Model reloaded in {load_time:.2f}s: {model_path}")
+
+            return {
+                "status": "success",
+                "model_path": str(model_path),
+                "model_version": request.model_version,
+                "load_time_seconds": load_time,
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Model reload failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ==========================================================================
     # AGI v77.0 ENDPOINTS - Advanced Cognitive Capabilities
     # ==========================================================================
 

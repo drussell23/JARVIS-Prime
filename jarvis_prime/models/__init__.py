@@ -46,7 +46,7 @@ from jarvis_prime.models.agi_model_orchestrator import (
     get_moe_router,
 )
 
-# Continual Learning System - Experience Replay and RAG
+# Continual Learning System - Experience Replay, RAG, Knowledge Distillation, Active Learning
 from jarvis_prime.models.continual_learning_system import (
     ContinualLearningEngine,
     ExperienceReplayBuffer,
@@ -56,14 +56,41 @@ from jarvis_prime.models.continual_learning_system import (
     VectorStore,
     RetrievalStrategy,
     get_rag_engine,
+    # Knowledge Distillation (v80.0)
+    KnowledgeDistillationEngine,
+    DistillationMode,
+    DistillationConfig,
+    # Active Learning (v80.0)
+    ActiveLearningEngine,
+    ActiveLearningStrategy,
+    ActiveLearningConfig,
+    # Infrastructure Integration (v80.0)
+    InfrastructureIntegration,
+    get_infrastructure,
 )
 
-# Self-Improving Agent - Safe Self-Modification with Meta-Learning
+# Self-Improving Agent - Safe Self-Modification, NAS, Optimization
 from jarvis_prime.models.self_improving_agent import (
     SelfModificationEngine,
     SafetyConstraints,
     ModificationStrategy,
     get_self_modifier,
+    # Neural Architecture Search (v80.0)
+    NeuralArchitectureSearch,
+    NASSearchStrategy,
+    NASSearchSpace,
+    Architecture,
+    # Bayesian Optimization (v80.0)
+    BayesianOptimizer,
+    AcquisitionFunction,
+    HyperparameterSpace,
+    # Evolutionary Optimization (v80.0)
+    EvolutionaryOptimizer,
+    EvolutionaryConfig,
+    SelectionMethod,
+    # Infrastructure Integration (v80.0)
+    SelfImprovementInfrastructure,
+    get_improvement_infrastructure,
 )
 
 __all__ = [
@@ -104,4 +131,30 @@ __all__ = [
     "SafetyConstraints",
     "ModificationStrategy",
     "get_self_modifier",
+    # Knowledge Distillation (v80.0)
+    "KnowledgeDistillationEngine",
+    "DistillationMode",
+    "DistillationConfig",
+    # Active Learning (v80.0)
+    "ActiveLearningEngine",
+    "ActiveLearningStrategy",
+    "ActiveLearningConfig",
+    # Neural Architecture Search (v80.0)
+    "NeuralArchitectureSearch",
+    "NASSearchStrategy",
+    "NASSearchSpace",
+    "Architecture",
+    # Bayesian Optimization (v80.0)
+    "BayesianOptimizer",
+    "AcquisitionFunction",
+    "HyperparameterSpace",
+    # Evolutionary Optimization (v80.0)
+    "EvolutionaryOptimizer",
+    "EvolutionaryConfig",
+    "SelectionMethod",
+    # Infrastructure Integration (v80.0)
+    "InfrastructureIntegration",
+    "get_infrastructure",
+    "SelfImprovementInfrastructure",
+    "get_improvement_infrastructure",
 ]
