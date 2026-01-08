@@ -44,6 +44,26 @@ from jarvis_prime.models.agi_model_orchestrator import (
     ExpertOutput,
     GatingNetwork,
     get_moe_router,
+    # Sparse MoE (v80.0 Advanced)
+    SparseMoERouter,
+    SparseMoEConfig,
+    SparseGatingMechanism,
+    # Sparse Transformers (v80.0 Advanced)
+    SparseTransformerBlock,
+    SparseTransformerConfig,
+    SparseAttentionPattern,
+    # Reactor Core Training Pipeline (v80.0 Advanced)
+    ReactorCoreTrainingPipeline,
+    TrainingJobConfig,
+    TrainingJob,
+    TrainingJobStatus,
+    # HuggingFace Model Publisher (v80.0 Advanced)
+    HuggingFaceModelPublisher,
+    ModelCardConfig,
+    # Comprehensive Benchmark Suite (v80.0 Advanced)
+    ComprehensiveBenchmarkSuite,
+    ComprehensiveBenchmarkResult,
+    BenchmarkCategory,
 )
 
 # Continual Learning System - Experience Replay, RAG, Knowledge Distillation, Active Learning
@@ -157,4 +177,24 @@ __all__ = [
     "get_infrastructure",
     "SelfImprovementInfrastructure",
     "get_improvement_infrastructure",
+    # Sparse MoE (v80.0 Advanced)
+    "SparseMoERouter",
+    "SparseMoEConfig",
+    "SparseGatingMechanism",
+    # Sparse Transformers (v80.0 Advanced)
+    "SparseTransformerBlock",
+    "SparseTransformerConfig",
+    "SparseAttentionPattern",
+    # Reactor Core Training Pipeline (v80.0 Advanced)
+    "ReactorCoreTrainingPipeline",
+    "TrainingJobConfig",
+    "TrainingJob",
+    "TrainingJobStatus",
+    # HuggingFace Model Publisher (v80.0 Advanced)
+    "HuggingFaceModelPublisher",
+    "ModelCardConfig",
+    # Comprehensive Benchmark Suite (v80.0 Advanced)
+    "ComprehensiveBenchmarkSuite",
+    "ComprehensiveBenchmarkResult",
+    "BenchmarkCategory",
 ]
