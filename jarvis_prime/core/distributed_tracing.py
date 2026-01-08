@@ -185,7 +185,7 @@ class DistributedTracer:
         tracer_provider.add_span_processor(
             BatchSpanProcessor(
                 span_exporter,
-                export_interval_millis=self.config.export_interval_ms,
+                schedule_delay_millis=self.config.export_interval_ms,
             )
         )
 

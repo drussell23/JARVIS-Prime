@@ -164,8 +164,6 @@ from jarvis_prime.core.agi_error_handler import (
     FallbackStrategy,
     ErrorClassifier,
     get_error_handler,
-    handle_error,
-    with_error_handling,
 )
 from jarvis_prime.core.agi_config import (
     AGIConfig,
@@ -194,11 +192,8 @@ from jarvis_prime.core.agi_metrics import (
     Timer,
     Summary,
     HealthStatus,
-    ComponentHealth,
-    get_metrics_collector,
+    get_metrics as get_metrics_collector,
     get_health_checker,
-    record_metric,
-    check_health,
 )
 from jarvis_prime.core.data_collector import (
     JARVISDataCollector,
@@ -208,8 +203,6 @@ from jarvis_prime.core.data_collector import (
     PIIRedactor,
     AutoLabeler,
     get_data_collector,
-    collect_sample,
-    get_training_batch,
 )
 from jarvis_prime.core.model_server import (
     AGIModelServer,
@@ -220,8 +213,6 @@ from jarvis_prime.core.model_server import (
     PriorityQueue,
     RequestBatcher,
     get_model_server,
-    infer,
-    batch_infer,
 )
 
 # Advanced Async Primitives (v80.0)
@@ -420,8 +411,6 @@ __all__ = [
     "FallbackStrategy",
     "ErrorClassifier",
     "get_error_handler",
-    "handle_error",
-    "with_error_handling",
     # AGI Configuration (v78.0)
     "AGIConfig",
     "ConfigManager",
@@ -448,11 +437,8 @@ __all__ = [
     "Timer",
     "Summary",
     "HealthStatus",
-    "ComponentHealth",
     "get_metrics_collector",
     "get_health_checker",
-    "record_metric",
-    "check_health",
     # Data Collector (v78.0)
     "JARVISDataCollector",
     "TrinityDataCollector",
@@ -461,8 +447,6 @@ __all__ = [
     "PIIRedactor",
     "AutoLabeler",
     "get_data_collector",
-    "collect_sample",
-    "get_training_batch",
     # Model Server (v78.0)
     "AGIModelServer",
     "InferenceRequest",
@@ -472,8 +456,6 @@ __all__ = [
     "PriorityQueue",
     "RequestBatcher",
     "get_model_server",
-    "infer",
-    "batch_infer",
     # Advanced Async Primitives (v80.0)
     "AdaptiveTimeoutManager",
     "AsyncRLock",
