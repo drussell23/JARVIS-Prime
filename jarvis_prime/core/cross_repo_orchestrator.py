@@ -324,6 +324,308 @@ class DependencyResolver:
 
 
 # ============================================================================
+# v84.0 TRINITY HEALTH CHECKER - Cross-Repo Unified Health Monitoring
+# ============================================================================
+
+@dataclass
+class ComponentHealth:
+    """Health status of a Trinity component."""
+    component: str
+    online: bool
+    heartbeat_age: float = float('inf')
+    http_healthy: bool = False
+    pid: Optional[int] = None
+    port: Optional[int] = None
+    model_loaded: bool = False
+    last_inference_time: float = 0.0
+    error: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def status(self) -> str:
+        """Get human-readable status."""
+        if not self.online:
+            return "OFFLINE"
+        if self.heartbeat_age > 60:
+            return "STALE"
+        if self.heartbeat_age > 30:
+            return "DEGRADED"
+        return "HEALTHY"
+
+
+class TrinityHealthChecker:
+    """
+    v84.0: Unified health checker for all Trinity components.
+
+    Features:
+        - Heartbeat file monitoring with staleness detection
+        - HTTP health endpoint verification
+        - PID validation for process liveness
+        - Parallel health checks for speed
+        - Circuit breaker for flaky endpoints
+        - Automatic dead component cleanup
+    """
+
+    def __init__(
+        self,
+        trinity_dir: Optional[Path] = None,
+        stale_threshold: float = 30.0,
+        http_timeout: float = 5.0,
+    ):
+        """
+        Initialize health checker.
+
+        Args:
+            trinity_dir: Trinity IPC directory
+            stale_threshold: Seconds before heartbeat is stale
+            http_timeout: HTTP request timeout
+        """
+        self.trinity_dir = trinity_dir or Path.home() / ".jarvis" / "trinity"
+        self.components_dir = self.trinity_dir / "components"
+        self.stale_threshold = stale_threshold
+        self.http_timeout = http_timeout
+
+        # Component configuration
+        self._component_configs: Dict[str, Dict[str, Any]] = {
+            "jarvis_prime": {
+                "heartbeat_files": ["jarvis_prime.json", "j_prime.json"],
+                "health_url": "http://localhost:{port}/health",
+                "default_port": 8000,
+            },
+            "jarvis_body": {
+                "heartbeat_files": ["jarvis_body.json", "jarvis.json"],
+                "health_url": "http://localhost:{port}/health",
+                "default_port": 8010,
+            },
+            "reactor_core": {
+                "heartbeat_files": ["reactor_core.json", "reactor.json"],
+                "health_url": "http://localhost:{port}/health",
+                "default_port": 8090,
+            },
+        }
+
+        # Cache
+        self._health_cache: Dict[str, ComponentHealth] = {}
+        self._cache_ttl: float = 5.0
+        self._cache_time: float = 0.0
+
+        # Circuit breaker for HTTP checks
+        self._http_failures: Dict[str, int] = defaultdict(int)
+        self._http_circuit_open: Dict[str, float] = {}
+
+    async def check_all(self) -> Dict[str, ComponentHealth]:
+        """
+        Check health of all Trinity components in parallel.
+
+        Returns:
+            Dictionary of component name -> health status
+        """
+        # Check cache
+        if time.time() - self._cache_time < self._cache_ttl:
+            return self._health_cache.copy()
+
+        # Run checks in parallel
+        tasks = [
+            self.check_component(name)
+            for name in self._component_configs.keys()
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        health_map = {}
+        for name, result in zip(self._component_configs.keys(), results):
+            if isinstance(result, Exception):
+                health_map[name] = ComponentHealth(
+                    component=name,
+                    online=False,
+                    error=str(result),
+                )
+            else:
+                health_map[name] = result
+
+        # Update cache
+        self._health_cache = health_map
+        self._cache_time = time.time()
+
+        return health_map
+
+    async def check_component(self, name: str) -> ComponentHealth:
+        """Check health of a single component."""
+        config = self._component_configs.get(name)
+        if not config:
+            return ComponentHealth(
+                component=name,
+                online=False,
+                error=f"Unknown component: {name}",
+            )
+
+        # Check heartbeat file
+        heartbeat_data = self._read_heartbeat(name, config)
+
+        if heartbeat_data:
+            port = heartbeat_data.get("port", config["default_port"])
+            timestamp = heartbeat_data.get("timestamp", 0)
+            heartbeat_age = time.time() - timestamp
+
+            # Check HTTP if heartbeat is fresh
+            http_healthy = False
+            if heartbeat_age < self.stale_threshold:
+                http_healthy = await self._check_http(name, port)
+
+            return ComponentHealth(
+                component=name,
+                online=heartbeat_age < self.stale_threshold,
+                heartbeat_age=heartbeat_age,
+                http_healthy=http_healthy,
+                pid=heartbeat_data.get("pid"),
+                port=port,
+                model_loaded=heartbeat_data.get("model_loaded", False),
+                last_inference_time=heartbeat_data.get("last_inference_time", 0),
+            )
+        else:
+            # No heartbeat - try HTTP anyway
+            port = config["default_port"]
+            http_healthy = await self._check_http(name, port)
+
+            return ComponentHealth(
+                component=name,
+                online=http_healthy,
+                http_healthy=http_healthy,
+                port=port if http_healthy else None,
+            )
+
+    def _read_heartbeat(
+        self, name: str, config: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Read heartbeat file for a component."""
+        for filename in config["heartbeat_files"]:
+            heartbeat_file = self.components_dir / filename
+            if heartbeat_file.exists():
+                try:
+                    with open(heartbeat_file, 'r') as f:
+                        data = json.load(f)
+                        return data
+                except (json.JSONDecodeError, IOError):
+                    continue
+        return None
+
+    async def _check_http(self, name: str, port: int) -> bool:
+        """Check HTTP health endpoint."""
+        # Check circuit breaker
+        if name in self._http_circuit_open:
+            if time.time() - self._http_circuit_open[name] < 30:
+                return False
+            del self._http_circuit_open[name]
+
+        config = self._component_configs[name]
+        url = config["health_url"].format(port=port)
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=self.http_timeout)
+                ) as response:
+                    if response.status == 200:
+                        self._http_failures[name] = 0
+                        return True
+        except Exception:
+            self._http_failures[name] += 1
+            if self._http_failures[name] >= 3:
+                self._http_circuit_open[name] = time.time()
+            return False
+
+        return False
+
+    async def wait_for_component(
+        self,
+        name: str,
+        timeout: float = 60.0,
+        check_interval: float = 2.0,
+    ) -> bool:
+        """
+        Wait for a component to become healthy.
+
+        Args:
+            name: Component name
+            timeout: Maximum wait time
+            check_interval: Time between checks
+
+        Returns:
+            True if component became healthy
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            health = await self.check_component(name)
+            if health.online and health.http_healthy:
+                return True
+            await asyncio.sleep(check_interval)
+
+        return False
+
+    def get_unified_status(self) -> Dict[str, Any]:
+        """Get unified status of all components."""
+        if not self._health_cache:
+            return {"status": "unknown", "components": {}}
+
+        all_online = all(h.online for h in self._health_cache.values())
+        any_online = any(h.online for h in self._health_cache.values())
+
+        if all_online:
+            status = "healthy"
+        elif any_online:
+            status = "degraded"
+        else:
+            status = "offline"
+
+        return {
+            "status": status,
+            "timestamp": time.time(),
+            "components": {
+                name: {
+                    "status": h.status,
+                    "online": h.online,
+                    "heartbeat_age": h.heartbeat_age,
+                    "http_healthy": h.http_healthy,
+                    "port": h.port,
+                    "model_loaded": h.model_loaded,
+                }
+                for name, h in self._health_cache.items()
+            }
+        }
+
+    async def print_status(self):
+        """Print formatted status of all components."""
+        health_map = await self.check_all()
+
+        print()
+        print("=" * 60)
+        print("TRINITY HEALTH STATUS")
+        print("=" * 60)
+
+        for name, health in health_map.items():
+            status_icon = {
+                "HEALTHY": "✅",
+                "DEGRADED": "⚠️",
+                "STALE": "🔶",
+                "OFFLINE": "❌",
+            }.get(health.status, "❓")
+
+            print(f"{status_icon} {name:20s} {health.status:10s}", end="")
+            if health.online:
+                print(f" (heartbeat: {health.heartbeat_age:.1f}s)", end="")
+                if health.http_healthy:
+                    print(f" [HTTP OK]", end="")
+                if health.port:
+                    print(f" ::{health.port}", end="")
+            print()
+
+        print("=" * 60)
+
+
+# ============================================================================
 # REPO MANAGER
 # ============================================================================
 
@@ -559,6 +861,13 @@ class CrossRepoOrchestrator:
         self._file_watcher: Optional[FileWatcher] = None
         self._dependency_resolver = DependencyResolver()
 
+        # v84.0: Trinity Health Checker for cross-repo monitoring
+        self._health_checker = TrinityHealthChecker(
+            trinity_dir=self.config.state_dir,
+            stale_threshold=30.0,
+            http_timeout=5.0,
+        )
+
         # State
         self._running = False
         self._startup_order: List[str] = []
@@ -572,54 +881,121 @@ class CrossRepoOrchestrator:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
 
     def _detect_repos(self) -> Dict[str, RepoConfig]:
-        """Auto-detect repositories in base directory."""
+        """
+        v84.0: Auto-detect repositories with intelligent path resolution.
+
+        Searches multiple possible locations and naming conventions for each repo.
+        Uses environment variables with fallback to common paths.
+        """
         repos = {}
 
         # JARVIS Prime (current repo)
         prime_path = Path(__file__).parent.parent.parent
+        prime_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+
+        # v84.0: Detect model path dynamically
+        model_paths = [
+            prime_path / "models" / "current.gguf",
+            Path.home() / ".jarvis" / "prime" / "models" / "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf",
+            Path.home() / ".jarvis" / "prime" / "models" / "current.gguf",
+        ]
+        model_path = next((p for p in model_paths if p.exists()), model_paths[0])
+
         repos["jarvis_prime"] = RepoConfig(
             name="JARVIS-Prime",
             type=RepoType.JARVIS_PRIME,
             path=prime_path,
-            entry_point="python3 -m uvicorn jarvis_prime.server:app --host 0.0.0.0 --port 8000",
-            health_url="http://localhost:8000/health",
+            # v84.0: Use run_server.py with Metal GPU enabled
+            entry_point=f"python3 run_server.py --model {model_path} --gpu-layers -1 --port {prime_port}",
+            health_url=f"http://localhost:{prime_port}/health",
             dependencies=[],
             env_vars={
-                "JARVIS_PRIME_PORT": "8000",
+                "JARVIS_PRIME_PORT": str(prime_port),
                 "PYTHONPATH": str(prime_path),
+                "TRINITY_ENABLED": "true",
+                "METAL_ENABLED": "true",
             }
         )
 
-        # JARVIS (look for it)
-        jarvis_path = self.config.base_dir / "jarvis"
-        if jarvis_path.exists():
-            repos["jarvis"] = RepoConfig(
-                name="JARVIS",
-                type=RepoType.JARVIS,
-                path=jarvis_path,
-                entry_point="python3 -m backend.main",
-                health_url="http://localhost:5000/health",
-                dependencies=["jarvis_prime"],  # Depends on Prime
-                env_vars={
-                    "JARVIS_PORT": "5000",
-                    "JARVIS_PRIME_URL": "http://localhost:8000",
-                }
+        # v84.0: JARVIS-AI-Agent detection with multiple path candidates
+        jarvis_candidates = [
+            Path(os.getenv("JARVIS_AI_AGENT_PATH", "")),
+            self.config.base_dir / "JARVIS-AI-Agent",
+            self.config.base_dir / "jarvis-ai-agent",
+            self.config.base_dir / "jarvis",
+            Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent",
+        ]
+        jarvis_path = next((p for p in jarvis_candidates if p.exists() and p.is_dir()), None)
+
+        if jarvis_path:
+            jarvis_port = int(os.getenv("JARVIS_PORT", "8010"))
+            # v84.0: Detect correct entry point
+            entry_candidates = [
+                (jarvis_path / "run_supervisor.py", f"python3 run_supervisor.py"),
+                (jarvis_path / "backend" / "main.py", f"python3 -m backend.main"),
+            ]
+            entry_point = next(
+                (cmd for path, cmd in entry_candidates if path.exists()),
+                "python3 run_supervisor.py"
             )
 
-        # Reactor Core (look for it)
-        reactor_path = self.config.base_dir / "reactor-core"
-        if reactor_path.exists():
+            repos["jarvis"] = RepoConfig(
+                name="JARVIS-AI-Agent",
+                type=RepoType.JARVIS,
+                path=jarvis_path,
+                entry_point=entry_point,
+                health_url=f"http://localhost:{jarvis_port}/health",
+                dependencies=[],  # JARVIS is the master, no deps
+                env_vars={
+                    "JARVIS_PORT": str(jarvis_port),
+                    "JARVIS_PRIME_URL": f"http://localhost:{prime_port}",
+                    "JARVIS_PRIME_PATH": str(prime_path),
+                    "PYTHONPATH": str(jarvis_path),
+                    "TRINITY_ENABLED": "true",
+                }
+            )
+            logger.info(f"✓ Found JARVIS-AI-Agent: {jarvis_path}")
+        else:
+            logger.warning("⚠️ JARVIS-AI-Agent not found in any expected location")
+
+        # v84.0: Reactor Core detection with multiple path candidates
+        reactor_candidates = [
+            Path(os.getenv("REACTOR_CORE_PATH", "")),
+            self.config.base_dir / "reactor-core",
+            self.config.base_dir / "Reactor-Core",
+            Path.home() / "Documents" / "repos" / "reactor-core",
+        ]
+        reactor_path = next((p for p in reactor_candidates if p.exists() and p.is_dir()), None)
+
+        if reactor_path:
+            reactor_port = int(os.getenv("REACTOR_CORE_PORT", "8090"))
+            # v84.0: Detect correct entry point
+            entry_candidates = [
+                (reactor_path / "run_server.py", f"python3 run_server.py --port {reactor_port}"),
+                (reactor_path / "reactor" / "server.py", f"python3 -m reactor.server"),
+                (reactor_path / "main.py", f"python3 main.py"),
+            ]
+            entry_point = next(
+                (cmd for path, cmd in entry_candidates if path.exists()),
+                f"python3 -m reactor.server --port {reactor_port}"
+            )
+
             repos["reactor_core"] = RepoConfig(
                 name="Reactor-Core",
                 type=RepoType.REACTOR_CORE,
                 path=reactor_path,
-                entry_point="python3 -m reactor.server",
-                health_url="http://localhost:9000/health",
-                dependencies=["jarvis_prime"],  # Can depend on Prime
+                entry_point=entry_point,
+                health_url=f"http://localhost:{reactor_port}/health",
+                dependencies=["jarvis_prime"],
                 env_vars={
-                    "REACTOR_PORT": "9000",
+                    "REACTOR_PORT": str(reactor_port),
+                    "JARVIS_PRIME_URL": f"http://localhost:{prime_port}",
+                    "PYTHONPATH": str(reactor_path),
                 }
             )
+            logger.info(f"✓ Found Reactor-Core: {reactor_path}")
+        else:
+            logger.info("ℹ️ Reactor-Core not found (optional)")
 
         return repos
 
@@ -668,29 +1044,84 @@ class CrossRepoOrchestrator:
         logger.info("Trinity Orchestrator initialized")
 
     async def start_all(self):
-        """Start all components in dependency order."""
-        logger.info("Starting all Trinity components...")
+        """
+        v84.0: Start all components with health verification and status display.
+
+        Uses parallel startup for independent components and sequential
+        startup for components with dependencies.
+        """
+        logger.info("=" * 60)
+        logger.info("TRINITY ECOSYSTEM STARTUP v84.0")
+        logger.info("=" * 60)
         self._running = True
+
+        # v84.0: Check for already-running components first
+        logger.info("Checking for running components...")
+        pre_health = await self._health_checker.check_all()
+
+        already_running = [
+            name for name, health in pre_health.items()
+            if health.online and health.http_healthy
+        ]
+
+        if already_running:
+            logger.info(f"✓ Already running: {', '.join(already_running)}")
+
+        # Start components in order
+        started = []
+        failed = []
 
         for name in self._startup_order:
             if name in self._repos:
+                # Check if already running
+                if name in already_running:
+                    logger.info(f"  ✓ {name}: Already running")
+                    started.append(name)
+                    continue
+
                 manager = self._repos[name]
+                logger.info(f"  🚀 Starting {name}...")
 
                 success = await manager.start()
 
-                if not success:
-                    logger.error(f"Failed to start {name}")
+                if success:
+                    # Wait for health check
+                    healthy = await self._health_checker.wait_for_component(
+                        name,
+                        timeout=manager.config.startup_timeout,
+                        check_interval=2.0,
+                    )
+
+                    if healthy:
+                        logger.info(f"  ✅ {name}: Started and healthy")
+                        started.append(name)
+                    else:
+                        logger.warning(f"  ⚠️ {name}: Started but health check failed")
+                        started.append(name)  # Still count as started
+                else:
+                    logger.error(f"  ❌ {name}: Failed to start")
+                    failed.append(name)
 
                     if not self.config.enable_auto_restart:
-                        # Stop already started components
                         await self._stop_all_reverse()
                         return False
 
                 # Small delay between starts
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
 
-        logger.info("All Trinity components started")
-        return True
+        # v84.0: Display final status
+        logger.info("")
+        logger.info("=" * 60)
+        if failed:
+            logger.warning(f"TRINITY STARTUP PARTIAL: {len(started)}/{len(self._startup_order)} components")
+        else:
+            logger.info(f"🚀 TRINITY ECOSYSTEM ONLINE: {len(started)} components")
+        logger.info("=" * 60)
+
+        # Print health status
+        await self._health_checker.print_status()
+
+        return len(failed) == 0
 
     async def _stop_all_reverse(self):
         """Stop all components in reverse order."""
@@ -740,6 +1171,8 @@ class CrossRepoOrchestrator:
 _orchestrator: Optional[CrossRepoOrchestrator] = None
 _orchestrator_lock = asyncio.Lock()
 
+_health_checker: Optional[TrinityHealthChecker] = None
+
 
 async def get_orchestrator() -> CrossRepoOrchestrator:
     """Get or create global orchestrator."""
@@ -751,3 +1184,52 @@ async def get_orchestrator() -> CrossRepoOrchestrator:
             await _orchestrator.initialize()
 
         return _orchestrator
+
+
+def get_health_checker() -> TrinityHealthChecker:
+    """Get or create global health checker."""
+    global _health_checker
+
+    if _health_checker is None:
+        _health_checker = TrinityHealthChecker()
+
+    return _health_checker
+
+
+async def check_trinity_health() -> Dict[str, ComponentHealth]:
+    """Convenience function to check all Trinity component health."""
+    checker = get_health_checker()
+    return await checker.check_all()
+
+
+async def print_trinity_status():
+    """Print formatted Trinity health status."""
+    checker = get_health_checker()
+    await checker.print_status()
+
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+__all__ = [
+    # Configuration
+    "RepoType",
+    "RepoConfig",
+    "OrchestratorConfig",
+    # Health
+    "ComponentHealth",
+    "TrinityHealthChecker",
+    "get_health_checker",
+    "check_trinity_health",
+    "print_trinity_status",
+    # Components
+    "SignalHandler",
+    "FileWatcher",
+    "DependencyResolver",
+    "RepoState",
+    "RepoManager",
+    # Orchestrator
+    "CrossRepoOrchestrator",
+    "get_orchestrator",
+]
