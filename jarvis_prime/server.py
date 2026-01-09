@@ -613,6 +613,126 @@ async def main():
         else:
             logger.info("[Trinity] Running in standalone mode (no Trinity connection)")
 
+        # v84.0: Advanced Heartbeat Writer for Service Discovery
+        heartbeat_task = None
+        heartbeat_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_prime.json"
+
+        async def advanced_heartbeat_writer():
+            """
+            v84.0: Write detailed heartbeat for intelligent service discovery.
+
+            Includes:
+            - Port number for discovery
+            - Model status
+            - Process metrics
+            - API format info
+            - Inference statistics
+            """
+            import tempfile
+
+            trinity_dir = Path.home() / ".jarvis" / "trinity" / "components"
+            trinity_dir.mkdir(parents=True, exist_ok=True)
+
+            heartbeat_interval = float(os.getenv("JARVIS_PRIME_HEARTBEAT_INTERVAL", "5.0"))
+
+            while True:
+                try:
+                    # Build comprehensive heartbeat data
+                    heartbeat_data = {
+                        # Identity
+                        "component": "jarvis_prime",
+                        "component_type": "j_prime",
+                        "instance_id": f"jprime-{os.getpid()}-{int(time.time())}",
+                        "pid": os.getpid(),
+
+                        # Network
+                        "port": args.port,
+                        "host": args.host,
+                        "endpoint": f"http://localhost:{args.port}",
+                        "api_format": "openai",  # J-Prime uses OpenAI-compatible format
+
+                        # Model status
+                        "model_loaded": manager.current_model is not None if hasattr(manager, 'current_model') else False,
+                        "model_name": str(manager.current_model.name) if hasattr(manager, 'current_model') and manager.current_model else None,
+                        "model_path": str(model_path) if model_path else None,
+
+                        # Health
+                        "status": "running",
+                        "healthy": True,
+                        "timestamp": time.time(),
+
+                        # Process metrics
+                        "uptime_seconds": time.time() - _trinity_integration.start_time if _trinity_integration else 0,
+                    }
+
+                    # Add system metrics if available
+                    try:
+                        import psutil
+                        proc = psutil.Process()
+                        heartbeat_data["cpu_percent"] = proc.cpu_percent()
+                        heartbeat_data["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
+                        heartbeat_data["system_memory_percent"] = psutil.virtual_memory().percent
+                    except ImportError:
+                        pass
+
+                    # Add Trinity state if available
+                    if _trinity_integration:
+                        trinity_status = _trinity_integration.get_status()
+                        heartbeat_data["trinity_connected"] = trinity_status.get("connected", False)
+                        heartbeat_data["trinity_state"] = trinity_status.get("state", "UNKNOWN")
+
+                    # Atomic write (write to temp file, then rename)
+                    tmp_fd = None
+                    tmp_name = None
+                    try:
+                        tmp_fd, tmp_name = tempfile.mkstemp(
+                            dir=trinity_dir,
+                            prefix=".jarvis_prime.",
+                            suffix=".tmp"
+                        )
+                        with os.fdopen(tmp_fd, 'w') as f:
+                            tmp_fd = None  # fdopen takes ownership
+                            json.dump(heartbeat_data, f, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
+
+                        # Atomic rename
+                        os.replace(tmp_name, heartbeat_file)
+                        tmp_name = None  # Rename succeeded
+
+                    except Exception as e:
+                        logger.debug(f"[Heartbeat] Write failed: {e}")
+                        if tmp_name and os.path.exists(tmp_name):
+                            try:
+                                os.unlink(tmp_name)
+                            except OSError:
+                                pass
+                    finally:
+                        if tmp_fd is not None:
+                            try:
+                                os.close(tmp_fd)
+                            except OSError:
+                                pass
+
+                    await asyncio.sleep(heartbeat_interval)
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"[Heartbeat] Error: {e}")
+                    await asyncio.sleep(heartbeat_interval)
+
+            # Cleanup heartbeat file on shutdown
+            try:
+                if heartbeat_file.exists():
+                    heartbeat_file.unlink()
+            except Exception:
+                pass
+
+        # Start heartbeat task
+        heartbeat_task = asyncio.create_task(advanced_heartbeat_writer())
+        logger.info(f"[Heartbeat] ✓ Writer started (file={heartbeat_file})")
+
         # Create FastAPI app
         app = create_api_app(manager)
 
@@ -643,7 +763,7 @@ async def main():
 
         def signal_handler():
             logger.info("Shutdown signal received")
-            loop.create_task(shutdown(manager, server))
+            loop.create_task(shutdown(manager, server, heartbeat_task, heartbeat_file))
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, signal_handler)
@@ -663,11 +783,34 @@ async def main():
         raise
 
 
-async def shutdown(manager, server):
-    """Graceful shutdown with Trinity coordination."""
+async def shutdown(
+    manager,
+    server,
+    heartbeat_task: Optional[asyncio.Task] = None,
+    heartbeat_file: Optional[Path] = None,
+):
+    """Graceful shutdown with Trinity coordination and heartbeat cleanup."""
     logger.info("Shutting down...")
 
-    # v84.0: Shutdown Trinity integration first (notify network)
+    # v84.0: Cancel heartbeat task first
+    if heartbeat_task and not heartbeat_task.done():
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("[Heartbeat] ✓ Writer stopped")
+
+    # Cleanup heartbeat file
+    if heartbeat_file:
+        try:
+            if heartbeat_file.exists():
+                heartbeat_file.unlink()
+                logger.info("[Heartbeat] ✓ File cleaned up")
+        except Exception as e:
+            logger.debug(f"[Heartbeat] Cleanup error: {e}")
+
+    # v84.0: Shutdown Trinity integration (notify network)
     if _trinity_integration:
         try:
             await _trinity_integration.shutdown()
