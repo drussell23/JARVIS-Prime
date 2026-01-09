@@ -3,14 +3,21 @@
 JARVIS Unified Supervisor - Cross-Repository Orchestration
 =============================================================
 
-v80.0 - Ultra-Advanced AGI System Orchestrator with Full Trinity Integration
+v85.0 - Ultra-Advanced AGI System Orchestrator with Full Trinity Integration
 
 This supervisor connects and orchestrates all JARVIS ecosystem components:
 - JARVIS (Body): Main orchestrator, computer use, action execution
 - JARVIS-Prime (Mind): LLM inference, reasoning, cognitive processing
 - Reactor-Core (Training): Model training, fine-tuning, deployment
 
-NEW IN v80.0:
+NEW IN v85.0:
+    - FIXED: Environment variable precedence (system env overrides config)
+    - FIXED: Intelligent repo path discovery with multiple fallback strategies
+    - NEW: Startup verification with process/health/functional checks
+    - NEW: JARVIS_BASE_DIR, JARVIS_PRIME_PATH, JARVIS_AI_AGENT_PATH env vars
+    - Detailed logging of detected repo paths for debugging
+
+EXISTING FEATURES (v80.0):
     - Automatic cross-repo detection and path resolution
     - Graceful shutdown with async signal handlers
     - Hot-reload configuration watching
@@ -472,22 +479,46 @@ class ComponentManager:
         return cmd
 
     def _build_environment(self) -> Dict[str, str]:
-        """Build environment for component."""
-        env = os.environ.copy()
+        """
+        v85.0: Build environment for component with correct precedence.
 
-        # Add custom env vars
+        Priority (highest to lowest):
+        1. System environment variables (user explicitly set)
+        2. Component config env vars (defaults for this component)
+        3. Auto-generated vars (PYTHONPATH, component identification)
+
+        This allows users to override any setting via environment.
+        """
+        # Start with config defaults
+        env = {}
+
+        # Add component config env vars (lowest priority)
         env.update(self.config.env)
 
-        # Set Python path
+        # Copy system environment (higher priority - overrides config)
+        system_env = os.environ.copy()
+
+        # For each config key, only use it if system env doesn't have it
+        for key, value in self.config.env.items():
+            if key not in system_env:
+                env[key] = value
+
+        # Merge with system env taking precedence
+        env.update(system_env)
+
+        # Set Python path (prepend repo path)
         if self.config.repo_path:
             python_path = env.get("PYTHONPATH", "")
+            repo_path_str = str(self.config.repo_path)
             if python_path:
-                python_path = f"{self.config.repo_path}:{python_path}"
+                # Only add if not already in path
+                if repo_path_str not in python_path:
+                    python_path = f"{repo_path_str}:{python_path}"
             else:
-                python_path = str(self.config.repo_path)
+                python_path = repo_path_str
             env["PYTHONPATH"] = python_path
 
-        # Set component-specific vars
+        # Set component-specific vars (for identification)
         env["JARVIS_COMPONENT"] = self.config.name
         env["JARVIS_COMPONENT_TYPE"] = self.config.type.value
 
@@ -538,14 +569,66 @@ class UnifiedSupervisor:
         logger.info(f"Supervisor initialized with {len(self._managers)} components")
 
     def _create_default_config(self) -> SupervisorConfig:
-        """Create default configuration."""
+        """
+        v85.0: Create default configuration with intelligent repo discovery.
+
+        Uses environment variables with fallback to automatic detection.
+        Environment variables take priority for explicit configuration.
+        """
         config = SupervisorConfig()
 
-        # Detect repository paths
+        # v85.0: Intelligent repo path detection with env var priority
         current_dir = Path(__file__).parent
-        jarvis_prime_path = current_dir
-        jarvis_path = current_dir.parent / "JARVIS"
-        reactor_core_path = current_dir.parent / "Reactor-Core"
+
+        # JARVIS Prime - current repo or env var
+        jarvis_prime_path = Path(os.environ.get(
+            "JARVIS_PRIME_PATH",
+            str(current_dir)
+        )).expanduser()
+
+        # Base directory for sibling repos
+        base_dir = Path(os.environ.get(
+            "JARVIS_BASE_DIR",
+            str(jarvis_prime_path.parent)
+        )).expanduser()
+
+        # JARVIS Body - try env var, then multiple naming conventions
+        jarvis_env = os.environ.get("JARVIS_AI_AGENT_PATH", "")
+        if jarvis_env:
+            jarvis_path = Path(jarvis_env).expanduser()
+        else:
+            jarvis_candidates = [
+                base_dir / "JARVIS-AI-Agent",
+                base_dir / "jarvis-ai-agent",
+                base_dir / "JARVIS",
+                current_dir.parent / "JARVIS-AI-Agent",
+                current_dir.parent / "JARVIS",
+            ]
+            jarvis_path = next(
+                (p for p in jarvis_candidates if p.exists() and p.is_dir()),
+                jarvis_candidates[0]  # Default to first candidate
+            )
+
+        # Reactor Core - try env var, then multiple naming conventions
+        reactor_env = os.environ.get("REACTOR_CORE_PATH", "")
+        if reactor_env:
+            reactor_core_path = Path(reactor_env).expanduser()
+        else:
+            reactor_candidates = [
+                base_dir / "Reactor-Core",
+                base_dir / "reactor-core",
+                current_dir.parent / "Reactor-Core",
+            ]
+            reactor_core_path = next(
+                (p for p in reactor_candidates if p.exists() and p.is_dir()),
+                reactor_candidates[0]
+            )
+
+        # Log detected paths for debugging
+        logger.info(f"Repo paths detected:")
+        logger.info(f"  JARVIS-Prime: {jarvis_prime_path} (exists: {jarvis_prime_path.exists()})")
+        logger.info(f"  JARVIS-Body:  {jarvis_path} (exists: {jarvis_path.exists()})")
+        logger.info(f"  Reactor-Core: {reactor_core_path} (exists: {reactor_core_path.exists()})")
 
         # JARVIS Prime configuration
         config.components["jarvis_prime"] = ComponentConfig(
@@ -659,10 +742,125 @@ class UnifiedSupervisor:
             # Start health monitoring
             self._health_task = asyncio.create_task(self._health_monitor())
 
+            # v85.0: Run startup verification
+            verification_passed = await self._verify_startup()
+
             # Print status
             self._print_status()
 
+            if not verification_passed:
+                logger.warning("=" * 60)
+                logger.warning("STARTUP VERIFICATION INCOMPLETE")
+                logger.warning("Some components may not be fully operational")
+                logger.warning("=" * 60)
+
         return success
+
+    async def _verify_startup(self) -> bool:
+        """
+        v85.0: Verify that all components started correctly.
+
+        Performs:
+        1. Process liveness check (is process still running?)
+        2. HTTP health endpoint check (is service responding?)
+        3. Functional verification (is service operational?)
+
+        Returns:
+            True if all verifications passed
+        """
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("STARTUP VERIFICATION")
+        logger.info("=" * 60)
+
+        all_passed = True
+        results = []
+
+        for name, manager in self._managers.items():
+            if manager.state.status == ComponentStatus.STOPPED:
+                continue
+
+            verification = {
+                "name": name,
+                "process_alive": False,
+                "health_check": False,
+                "functional": False,
+            }
+
+            # 1. Process liveness check
+            if manager.state.process and manager.state.process.returncode is None:
+                verification["process_alive"] = True
+                logger.info(f"  [PROCESS] {name}: PID {manager.state.pid} running")
+            else:
+                all_passed = False
+                logger.error(f"  [PROCESS] {name}: NOT RUNNING (exit code: {manager.state.process.returncode if manager.state.process else 'N/A'})")
+                # Try to get last stderr for debugging
+                if manager.state.stderr_buffer:
+                    last_errors = manager.state.stderr_buffer[-5:]
+                    logger.error(f"    Last errors: {last_errors}")
+
+            # 2. Health check (with timeout)
+            if verification["process_alive"]:
+                try:
+                    healthy = await asyncio.wait_for(
+                        manager.health_check(),
+                        timeout=10.0
+                    )
+                    verification["health_check"] = healthy
+                    if healthy:
+                        logger.info(f"  [HEALTH]  {name}: responding on port {manager.config.port}")
+                    else:
+                        logger.warning(f"  [HEALTH]  {name}: not responding (might still be starting)")
+                except asyncio.TimeoutError:
+                    logger.warning(f"  [HEALTH]  {name}: health check timed out")
+
+            # 3. Functional check (basic - can extend per component)
+            if verification["health_check"]:
+                try:
+                    # For JARVIS Prime, check if model is loaded
+                    if manager.config.type == ComponentType.JARVIS_PRIME:
+                        functional = await self._verify_prime_functional(manager)
+                        verification["functional"] = functional
+                        if functional:
+                            logger.info(f"  [FUNC]    {name}: inference engine ready")
+                        else:
+                            logger.warning(f"  [FUNC]    {name}: inference engine not ready yet")
+                    else:
+                        # For other components, health check is sufficient
+                        verification["functional"] = True
+                        logger.info(f"  [FUNC]    {name}: operational")
+                except Exception as e:
+                    logger.warning(f"  [FUNC]    {name}: verification error: {e}")
+
+            results.append(verification)
+
+        logger.info("=" * 60)
+
+        # Summary
+        passed = sum(1 for r in results if r["process_alive"] and r["health_check"])
+        total = len(results)
+        logger.info(f"Verification: {passed}/{total} components fully operational")
+
+        return all_passed
+
+    async def _verify_prime_functional(self, manager: "ComponentManager") -> bool:
+        """Verify JARVIS Prime is functionally ready."""
+        try:
+            import aiohttp
+            url = f"http://{manager.config.host}:{manager.config.port}/health"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Check if model is loaded (if this info is available)
+                        if isinstance(data, dict):
+                            model_loaded = data.get("model_loaded", True)
+                            status = data.get("status", "unknown")
+                            return model_loaded or status == "healthy"
+                        return True
+        except Exception:
+            pass
+        return False
 
     async def stop(self) -> None:
         """

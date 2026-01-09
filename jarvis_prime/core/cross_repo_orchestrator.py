@@ -142,10 +142,39 @@ class RepoConfig:
     enabled: bool = True
 
 
+def _get_base_dir() -> Path:
+    """
+    v85.0: Get base directory for repos with intelligent fallback.
+
+    Priority:
+    1. JARVIS_BASE_DIR environment variable
+    2. Parent of JARVIS_PRIME_PATH if set
+    3. Parent of current file's repo location
+    4. ~/Documents/repos as last resort
+    """
+    # Check explicit base dir env var
+    env_base = os.getenv("JARVIS_BASE_DIR")
+    if env_base:
+        return Path(env_base).expanduser()
+
+    # Check if running from a known repo and derive base from it
+    prime_path = os.getenv("JARVIS_PRIME_PATH")
+    if prime_path:
+        return Path(prime_path).expanduser().parent
+
+    # Detect from current file location
+    current_repo = Path(__file__).parent.parent.parent
+    if current_repo.name in ("jarvis-prime", "JARVIS-Prime"):
+        return current_repo.parent
+
+    # Default fallback
+    return Path.home() / "Documents" / "repos"
+
+
 @dataclass
 class OrchestratorConfig:
     """Configuration for the orchestrator."""
-    base_dir: Path = field(default_factory=lambda: Path.home() / "Documents" / "repos")
+    base_dir: Path = field(default_factory=_get_base_dir)
     state_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity")
     enable_hot_reload: bool = field(
         default_factory=lambda: os.getenv("ENABLE_HOT_RELOAD", "true").lower() == "true"
