@@ -431,12 +431,42 @@ class PrimeModelManager:
         await self._telemetry.start()
 
         # Load initial model if provided
+        model_load_start = time.time()
+        models_loaded = 0
+
         if initial_model_path:
-            await self._hot_swap.load_initial(
-                model_path=initial_model_path,
-                version_id="v1.0-initial",
-            )
-            self._current_version = "v1.0-initial"
+            try:
+                await self._hot_swap.load_initial(
+                    model_path=initial_model_path,
+                    version_id="v1.0-initial",
+                )
+                self._current_version = "v1.0-initial"
+                models_loaded = 1
+
+                # Voice announcement: Model loaded successfully
+                try:
+                    from jarvis_prime.core.voice_integration import announce_model_loaded
+                    await announce_model_loaded(
+                        model_name="v1.0-initial",
+                        load_time_seconds=time.time() - model_load_start,
+                        success=True,
+                    )
+                except Exception as ve:
+                    logger.debug(f"Voice announcement skipped: {ve}")
+
+            except Exception as e:
+                logger.error(f"Failed to load initial model: {e}")
+                # Voice announcement: Model load failed
+                try:
+                    from jarvis_prime.core.voice_integration import announce_model_loaded
+                    await announce_model_loaded(
+                        model_name="v1.0-initial",
+                        load_time_seconds=time.time() - model_load_start,
+                        success=False,
+                        error_message=str(e),
+                    )
+                except Exception as ve:
+                    logger.debug(f"Voice announcement skipped: {ve}")
 
         # Register callbacks
         self._registry.on_new_version(self._on_new_version)
@@ -444,6 +474,18 @@ class PrimeModelManager:
         self._hot_swap.on_swap_complete(self._on_swap_complete)
 
         self._running = True
+
+        # Voice announcement: Manager started
+        manager_startup_time = time.time() - model_load_start
+        try:
+            from jarvis_prime.core.voice_integration import announce_manager_started
+            await announce_manager_started(
+                models_loaded=models_loaded,
+                startup_time_seconds=manager_startup_time,
+            )
+        except Exception as ve:
+            logger.debug(f"Voice announcement skipped: {ve}")
+
         logger.info("PrimeModelManager started successfully")
 
     async def stop(self) -> None:
@@ -495,16 +537,47 @@ class PrimeModelManager:
 
             # Execute based on tier
             if decision.tier in (TierClassification.TIER_0, TierClassification.TIER_0_PREFERRED):
+                # Voice announcement: Tier 0 routing (optional, low priority)
+                try:
+                    from jarvis_prime.core.voice_integration import announce_tier_routing
+                    asyncio.create_task(announce_tier_routing(
+                        tier="tier_0",
+                        reason=decision.reason or "Low complexity",
+                        complexity_score=decision.complexity_score,
+                    ))
+                except Exception:
+                    pass
+
                 completion = await self._execute_tier_0(prompt, request)
                 tier_used = "tier_0"
                 self._tier_0_count += 1
             else:
                 if self.cloud_executor:
+                    # Voice announcement: Tier 1 routing (optional, low priority)
+                    try:
+                        from jarvis_prime.core.voice_integration import announce_tier_routing
+                        asyncio.create_task(announce_tier_routing(
+                            tier="tier_1",
+                            reason=decision.reason or "High complexity",
+                            complexity_score=decision.complexity_score,
+                        ))
+                    except Exception:
+                        pass
+
                     completion = await self._execute_tier_1(request)
                     tier_used = "tier_1"
                     self._tier_1_count += 1
                 else:
                     # Fallback to Tier 0 if no cloud executor
+                    # Voice announcement: Cloud fallback
+                    try:
+                        from jarvis_prime.core.voice_integration import announce_cloud_fallback
+                        asyncio.create_task(announce_cloud_fallback(
+                            reason="No cloud executor available",
+                        ))
+                    except Exception:
+                        pass
+
                     completion = await self._execute_tier_0(prompt, request)
                     tier_used = "tier_0_fallback"
                     self._tier_0_count += 1
