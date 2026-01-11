@@ -3,14 +3,23 @@
 JARVIS Unified Supervisor - Cross-Repository Orchestration
 =============================================================
 
-v91.0 - OBSERVABILITY & CHAOS ENGINEERING
+v92.0 - LLM/BRAIN INTELLIGENCE
 
 This supervisor connects and orchestrates all JARVIS ecosystem components:
 - JARVIS (Body): Main orchestrator, computer use, action execution
 - JARVIS-Prime (Mind): LLM inference, reasoning, cognitive processing
 - Reactor-Core (Training): Model training, fine-tuning, deployment
 
-NEW IN v91.0 - OBSERVABILITY BRIDGE:
+NEW IN v92.0 - LLM/BRAIN INTELLIGENCE:
+    - AUTO MODEL SELECTOR: Complexity-based intelligent model selection
+    - UNIFIED INFERENCE: Seamless fallback chain (Local -> GCP -> Claude API)
+    - RLHF PIPELINE: Reinforcement Learning from Human Feedback with PPO
+    - REACTOR CORE BRIDGE: Training pipeline integration for fine-tuning
+    - CONTINUOUS LEARNING: Lifelong learning with EWC forgetting prevention
+    - DYNAMIC BATCHING: Request batching for throughput optimization
+    - CIRCUIT BREAKERS: Per-backend fault tolerance with auto-recovery
+
+v91.0 - OBSERVABILITY BRIDGE:
     - LANGFUSE INTEGRATION: Distributed tracing with Langfuse
     - PROMETHEUS EXPORT: Metrics export in OpenMetrics format
     - CHAOS TESTING: Fault injection framework (latency, errors, timeouts)
@@ -1355,7 +1364,7 @@ async def main_v87_unified(args):
         COMPAT_AVAILABLE = False
 
     logger.info("=" * 70)
-    logger.info("JARVIS TRINITY v91.0 - PRODUCTION OBSERVABILITY")
+    logger.info("JARVIS TRINITY v92.0 - LLM/BRAIN INTELLIGENCE")
     logger.info("=" * 70)
     logger.info("")
 
@@ -1534,6 +1543,103 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  Observability Bridge failed: {e}")
 
+        # 5.8. Initialize Auto Model Selector (v92.0 - Brain Intelligence)
+        logger.info("")
+        logger.info("Initializing Auto Model Selector (Brain Intelligence)...")
+        auto_model_selector = None
+        try:
+            from jarvis_prime.core.auto_model_selector import get_auto_model_selector
+            auto_model_selector = await get_auto_model_selector()
+            initialized.append(("auto_model_selector", auto_model_selector))
+            status = auto_model_selector.get_status()
+            logger.info("  Auto Model Selector initialized")
+            logger.info(f"    - Model Profiles: {len(status.get('models', {}))}")
+            logger.info(f"    - Selection Strategy: {status.get('strategy', 'complexity_based')}")
+            logger.info(f"    - Default Timeout: {status.get('default_timeout', 30)}s")
+        except ImportError:
+            logger.warning("  Auto Model Selector not available")
+        except Exception as e:
+            logger.warning(f"  Auto Model Selector failed: {e}")
+
+        # 5.9. Initialize Unified Inference Client (v92.0 - Seamless Fallback)
+        logger.info("")
+        logger.info("Initializing Unified Inference Client (Seamless Fallback)...")
+        unified_inference = None
+        try:
+            from jarvis_prime.core.unified_inference import get_unified_inference_client
+            unified_inference = await get_unified_inference_client()
+            initialized.append(("unified_inference", unified_inference))
+            status = unified_inference.get_status()
+            logger.info("  Unified Inference Client initialized")
+            logger.info(f"    - Backends: {len(status.get('backends', []))}")
+            for backend in status.get('backends', []):
+                backend_name = backend.get('name', 'unknown')
+                is_healthy = backend.get('healthy', False)
+                logger.info(f"      - {backend_name}: {'READY' if is_healthy else 'OFFLINE'}")
+            logger.info(f"    - Circuit Breakers: {status.get('circuit_breakers', 0)}")
+            logger.info(f"    - Fallback Chain: {' -> '.join(status.get('fallback_order', []))}")
+        except ImportError:
+            logger.warning("  Unified Inference Client not available")
+        except Exception as e:
+            logger.warning(f"  Unified Inference Client failed: {e}")
+
+        # 5.10. Initialize RLHF Pipeline (v92.0 - Learning from Feedback)
+        logger.info("")
+        logger.info("Initializing RLHF Pipeline (Learning from Feedback)...")
+        rlhf_pipeline = None
+        try:
+            from jarvis_prime.learning.rlhf_integration import get_rlhf_pipeline
+            rlhf_pipeline = await get_rlhf_pipeline()
+            initialized.append(("rlhf_pipeline", rlhf_pipeline))
+            status = rlhf_pipeline.get_status()
+            logger.info("  RLHF Pipeline initialized")
+            logger.info(f"    - Preference Buffer: {status.get('buffer_size', 0)}/{status.get('buffer_capacity', 1000)}")
+            logger.info(f"    - Reward Model: {'TRAINED' if status.get('reward_model_trained') else 'PENDING'}")
+            logger.info(f"    - Auto-Train Threshold: {status.get('auto_train_threshold', 100)} preferences")
+            logger.info(f"    - Policy Optimizer: {status.get('optimizer', 'PPO')}")
+        except ImportError:
+            logger.warning("  RLHF Pipeline not available")
+        except Exception as e:
+            logger.warning(f"  RLHF Pipeline failed: {e}")
+
+        # 5.11. Initialize Reactor Core Bridge (v92.0 - Training Integration)
+        logger.info("")
+        logger.info("Initializing Reactor Core Bridge (Training Integration)...")
+        reactor_bridge = None
+        try:
+            from jarvis_prime.core.reactor_core_bridge import get_reactor_core_bridge
+            reactor_bridge = await get_reactor_core_bridge()
+            initialized.append(("reactor_bridge", reactor_bridge))
+            status = reactor_bridge.get_status()
+            logger.info("  Reactor Core Bridge initialized")
+            logger.info(f"    - Reactor Core URL: {status.get('reactor_url', 'not configured')}")
+            logger.info(f"    - Connection: {'CONNECTED' if status.get('connected') else 'OFFLINE'}")
+            logger.info(f"    - Active Jobs: {len(status.get('active_jobs', []))}")
+            logger.info(f"    - Training Data Dir: {status.get('data_dir', 'not set')}")
+        except ImportError:
+            logger.warning("  Reactor Core Bridge not available")
+        except Exception as e:
+            logger.warning(f"  Reactor Core Bridge failed: {e}")
+
+        # 5.12. Initialize Continuous Learning Engine (v92.0 - Lifelong Learning)
+        logger.info("")
+        logger.info("Initializing Continuous Learning Engine (Lifelong Learning)...")
+        continuous_learning = None
+        try:
+            from jarvis_prime.core.continuous_learning import get_continuous_learning_engine
+            continuous_learning = await get_continuous_learning_engine()
+            initialized.append(("continuous_learning", continuous_learning))
+            status = continuous_learning.get_status()
+            logger.info("  Continuous Learning Engine initialized")
+            logger.info(f"    - Learning Mode: {status.get('mode', 'online')}")
+            logger.info(f"    - Experience Buffer: {status.get('experience_count', 0)}/{status.get('buffer_capacity', 10000)}")
+            logger.info(f"    - Forgetting Prevention: {status.get('forgetting_prevention', 'EWC')}")
+            logger.info(f"    - A/B Test Manager: {'ACTIVE' if status.get('ab_testing_enabled') else 'DISABLED'}")
+        except ImportError:
+            logger.warning("  Continuous Learning Engine not available")
+        except Exception as e:
+            logger.warning(f"  Continuous Learning Engine failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1624,6 +1730,32 @@ async def main_v87_unified(args):
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                  LLM/BRAIN INTELLIGENCE (v92.0)                   │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info(f"│  Auto Model Selector:     {'✓ ACTIVE' if auto_model_selector else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Unified Inference:       {'✓ ACTIVE' if unified_inference else '✗ INACTIVE':>18} │")
+        logger.info(f"│  RLHF Pipeline:           {'✓ ACTIVE' if rlhf_pipeline else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Reactor Core Bridge:     {'✓ ACTIVE' if reactor_bridge else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Continuous Learning:     {'✓ ACTIVE' if continuous_learning else '✗ INACTIVE':>18} │")
+        if auto_model_selector:
+            ams_status = auto_model_selector.get_status()
+            logger.info(f"│    Model Profiles:        {len(ams_status.get('models', {})):>18} │")
+        if unified_inference:
+            ui_status = unified_inference.get_status()
+            backends = ui_status.get('backends', [])
+            healthy_backends = sum(1 for b in backends if b.get('healthy', False))
+            logger.info(f"│    Active Backends:       {healthy_backends}/{len(backends)}{' '*14} │")
+        if rlhf_pipeline:
+            rlhf_status = rlhf_pipeline.get_status()
+            reward_trained = rlhf_status.get('reward_model_trained', False)
+            logger.info(f"│    Reward Model:          {'TRAINED' if reward_trained else 'PENDING':>18} │")
+        if continuous_learning:
+            cl_status = continuous_learning.get_status()
+            exp_count = cl_status.get('experience_count', 0)
+            logger.info(f"│    Experiences Learned:   {exp_count:>18} │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
+        logger.info("")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
         logger.info("│                  PRODUCTION FEATURES                              │")
         logger.info("├──────────────────────────────────────────────────────────────────┤")
         logger.info("│  ✓ Event Delivery Guarantees (retry + DLQ)                       │")
@@ -1636,6 +1768,10 @@ async def main_v87_unified(args):
         logger.info("│  ✓ Saga Pattern for Transactional Deployments                    │")
         logger.info("│  ✓ Chaos Testing Framework                                       │")
         logger.info("│  ✓ Adaptive Event Bus Polling                                    │")
+        logger.info("│  ✓ Automatic Model Selection (Complexity-Based)                  │")
+        logger.info("│  ✓ RLHF with PPO Policy Optimization                             │")
+        logger.info("│  ✓ Continuous Learning with EWC Forgetting Prevention            │")
+        logger.info("│  ✓ Reactor Core Training Pipeline Integration                    │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("┌──────────────────────────────────────────────────────────────────┐")
@@ -1652,7 +1788,7 @@ async def main_v87_unified(args):
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("=" * 70)
-        logger.info("  TRINITY v2.0 PRODUCTION-GRADE - Press Ctrl+C to shutdown")
+        logger.info("  TRINITY v92.0 BRAIN INTELLIGENCE - Press Ctrl+C to shutdown")
         logger.info("=" * 70)
         logger.info("")
 
@@ -1751,6 +1887,54 @@ async def main_v87_unified(args):
                         logger.info(f"    Chaos: {chaos_stats.get('total_injections', 0)} faults injected")
                     await shutdown_observability_bridge()
                     logger.info(f"  {name}: stopped (traces flushed, metrics exported)")
+                elif name == "auto_model_selector":
+                    # v92.0: Stop Auto Model Selector
+                    from jarvis_prime.core.auto_model_selector import shutdown_auto_model_selector
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        selections = status.get('total_selections', 0)
+                        logger.info(f"    Total selections made: {selections}")
+                    await shutdown_auto_model_selector()
+                    logger.info(f"  {name}: stopped")
+                elif name == "unified_inference":
+                    # v92.0: Stop Unified Inference Client
+                    from jarvis_prime.core.unified_inference import shutdown_unified_inference_client
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        total_requests = status.get('total_requests', 0)
+                        fallback_count = status.get('fallback_count', 0)
+                        logger.info(f"    Total requests: {total_requests}, Fallbacks: {fallback_count}")
+                    await shutdown_unified_inference_client()
+                    logger.info(f"  {name}: stopped (circuit breakers closed)")
+                elif name == "rlhf_pipeline":
+                    # v92.0: Stop RLHF Pipeline
+                    from jarvis_prime.learning.rlhf_integration import shutdown_rlhf_pipeline
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        preferences = status.get('buffer_size', 0)
+                        training_runs = status.get('training_runs', 0)
+                        logger.info(f"    Preferences collected: {preferences}, Training runs: {training_runs}")
+                    await shutdown_rlhf_pipeline()
+                    logger.info(f"  {name}: stopped (preferences persisted)")
+                elif name == "reactor_bridge":
+                    # v92.0: Stop Reactor Core Bridge
+                    from jarvis_prime.core.reactor_core_bridge import shutdown_reactor_core_bridge
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        active_jobs = len(status.get('active_jobs', []))
+                        logger.info(f"    Active training jobs: {active_jobs}")
+                    await shutdown_reactor_core_bridge()
+                    logger.info(f"  {name}: stopped (training jobs preserved)")
+                elif name == "continuous_learning":
+                    # v92.0: Stop Continuous Learning Engine
+                    from jarvis_prime.core.continuous_learning import shutdown_continuous_learning_engine
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        experiences = status.get('experience_count', 0)
+                        updates = status.get('model_updates', 0)
+                        logger.info(f"    Experiences: {experiences}, Model updates: {updates}")
+                    await shutdown_continuous_learning_engine()
+                    logger.info(f"  {name}: stopped (experiences persisted)")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
 

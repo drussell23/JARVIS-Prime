@@ -1415,6 +1415,39 @@ def create_continuous_learning_engine(
     return ContinuousLearningEngine(config=config, model=model)
 
 
+# Global singleton for continuous learning engine
+_learning_engine: Optional[ContinuousLearningEngine] = None
+_engine_lock = asyncio.Lock()
+
+
+async def get_continuous_learning_engine(
+    model: Optional[Any] = None,
+    config: Optional[LearningConfig] = None,
+) -> ContinuousLearningEngine:
+    """Get or create the global continuous learning engine."""
+    global _learning_engine
+
+    async with _engine_lock:
+        if _learning_engine is None:
+            _learning_engine = ContinuousLearningEngine(config=config, model=model)
+
+        return _learning_engine
+
+
+async def shutdown_continuous_learning_engine() -> None:
+    """Shutdown the global continuous learning engine."""
+    global _learning_engine
+
+    async with _engine_lock:
+        if _learning_engine is not None:
+            # Persist any pending experiences before shutdown
+            try:
+                await _learning_engine.persist_state()
+            except Exception:
+                pass  # Best effort
+            _learning_engine = None
+
+
 # =============================================================================
 # EXPORTS
 # =============================================================================
@@ -1443,4 +1476,6 @@ __all__ = [
     # Engine
     "ContinuousLearningEngine",
     "create_continuous_learning_engine",
+    "get_continuous_learning_engine",
+    "shutdown_continuous_learning_engine",
 ]
