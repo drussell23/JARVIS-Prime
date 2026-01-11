@@ -1695,6 +1695,47 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  Resource Manager failed: {e}")
 
+        # 5.16. Initialize Training Executor (v92.0 - Training Loop)
+        logger.info("")
+        logger.info("Initializing Training Executor (Training Loop)...")
+        training_executor = None
+        try:
+            from jarvis_prime.core.training_executor import get_training_executor
+            training_executor = await get_training_executor()
+            initialized.append(("training_executor", training_executor))
+            status = training_executor.get_status()
+            logger.info("  Training Executor initialized")
+            logger.info(f"    - Running Jobs: {status.get('running_jobs', 0)}")
+            logger.info(f"    - Completed Jobs: {status.get('completed_jobs', 0)}")
+            logger.info(f"    - Remote Training: {'ENABLED' if status.get('config', {}).get('remote_enabled') else 'DISABLED'}")
+            # Schedule incremental training
+            from jarvis_prime.core.training_executor import TrainingStrategy
+            await training_executor.schedule_training(TrainingStrategy.INCREMENTAL, interval_hours=1.0)
+            logger.info(f"    - Auto-Training: SCHEDULED (hourly)")
+        except ImportError:
+            logger.warning("  Training Executor not available")
+        except Exception as e:
+            logger.warning(f"  Training Executor failed: {e}")
+
+        # 5.17. Initialize JARVIS-Prime Bridge (v92.0 - Unified Inference)
+        logger.info("")
+        logger.info("Initializing JARVIS-Prime Bridge (Unified Inference)...")
+        jarvis_bridge = None
+        try:
+            from jarvis_prime.core.jarvis_prime_bridge import get_jarvis_prime_bridge
+            jarvis_bridge = await get_jarvis_prime_bridge()
+            initialized.append(("jarvis_bridge", jarvis_bridge))
+            status = jarvis_bridge.get_status()
+            logger.info("  JARVIS-Prime Bridge initialized")
+            logger.info(f"    - Prefer Local: {'YES' if status.get('config', {}).get('prefer_local') else 'NO'}")
+            logger.info(f"    - Default Model: {status.get('config', {}).get('default_model', 'unknown')}")
+            logger.info(f"    - API Fallback: {'ENABLED' if status.get('config', {}).get('api_fallback_enabled') else 'DISABLED'}")
+            logger.info(f"    - Capture: {'ENABLED' if status.get('config', {}).get('capture_enabled') else 'DISABLED'}")
+        except ImportError:
+            logger.warning("  JARVIS-Prime Bridge not available")
+        except Exception as e:
+            logger.warning(f"  JARVIS-Prime Bridge failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1795,6 +1836,8 @@ async def main_v87_unified(args):
         logger.info(f"│  Model Evaluation:        {'✓ ACTIVE' if evaluation_system else '✗ INACTIVE':>18} │")
         logger.info(f"│  Training Pipeline:       {'✓ ACTIVE' if training_pipeline else '✗ INACTIVE':>18} │")
         logger.info(f"│  Resource Manager:        {'✓ ACTIVE' if resource_manager else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Training Executor:       {'✓ ACTIVE' if training_executor else '✗ INACTIVE':>18} │")
+        logger.info(f"│  JARVIS-Prime Bridge:     {'✓ ACTIVE' if jarvis_bridge else '✗ INACTIVE':>18} │")
         if auto_model_selector:
             ams_status = auto_model_selector.get_status()
             logger.info(f"│    Model Profiles:        {len(ams_status.get('models', {})):>18} │")
@@ -2020,6 +2063,24 @@ async def main_v87_unified(args):
                         queued = status.get('stats', {}).get('queued_requests', 0)
                         logger.info(f"    Evictions: {evictions}, Queued requests: {queued}")
                     await shutdown_resource_manager()
+                    logger.info(f"  {name}: stopped")
+                elif name == "training_executor":
+                    # v92.0: Stop Training Executor
+                    from jarvis_prime.core.training_executor import shutdown_training_executor
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        completed = status.get('completed_jobs', 0)
+                        failed = status.get('failed_jobs', 0)
+                        logger.info(f"    Completed: {completed}, Failed: {failed}")
+                    await shutdown_training_executor()
+                    logger.info(f"  {name}: stopped (scheduled training cancelled)")
+                elif name == "jarvis_bridge":
+                    # v92.0: Stop JARVIS-Prime Bridge
+                    from jarvis_prime.core.jarvis_prime_bridge import shutdown_jarvis_prime_bridge
+                    if hasattr(component, 'get_stats'):
+                        stats = component.get_stats()
+                        logger.info(f"    Requests: {stats.total_requests}, Fallbacks: {stats.fallback_count}")
+                    await shutdown_jarvis_prime_bridge()
                     logger.info(f"  {name}: stopped")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
