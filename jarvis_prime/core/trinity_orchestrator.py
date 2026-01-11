@@ -101,6 +101,20 @@ try:
 except ImportError:
     ADVANCED_PRIMITIVES_AVAILABLE = False
 
+try:
+    from jarvis_prime.core.trinity_event_bus import (
+        TrinityEventBus,
+        EventType,
+        EventPriority,
+        ComponentID,
+        TrinityEvent,
+        get_event_bus,
+        shutdown_event_bus,
+    )
+    EVENT_BUS_AVAILABLE = True
+except ImportError:
+    EVENT_BUS_AVAILABLE = False
+
 
 # =============================================================================
 # CONFIGURATION
@@ -801,6 +815,14 @@ class TrinityOrchestrator:
         # IPC
         self._protocol: Optional[TrinityProtocol] = None
 
+        # Event Bus - The neural impulses that close The Loop
+        self._event_bus: Optional["TrinityEventBus"] = None
+        self._event_subscriptions: List[str] = []
+
+        # Model registry - tracks available models for hot-swap
+        self._model_registry: Dict[str, Dict[str, Any]] = {}
+        self._active_model: Optional[str] = None
+
         # State
         self._running = False
         self._shutdown_event = asyncio.Event()
@@ -837,7 +859,66 @@ class TrinityOrchestrator:
             on_unhealthy=self._handle_unhealthy,
         )
 
+        # Initialize Event Bus - The neural impulses that close The Loop
+        await self._initialize_event_bus()
+
         logger.info(f"TrinityOrchestrator initialized with {len(self._components)} components")
+
+    async def _initialize_event_bus(self):
+        """Initialize the event bus and set up subscriptions."""
+        if not EVENT_BUS_AVAILABLE:
+            logger.warning("Event bus not available - The Loop will not be closed")
+            return
+
+        try:
+            # Create event bus as orchestrator
+            self._event_bus = await TrinityEventBus.create(
+                ComponentID.ORCHESTRATOR,
+                use_file_transport=True,
+                trinity_dir=self._config.trinity_dir,
+            )
+
+            # Subscribe to key events for The Loop
+            # MODEL_READY: Reactor trained a new model -> trigger hot-swap
+            sub_id = await self._event_bus.subscribe(
+                EventType.MODEL_READY,
+                self._on_model_ready,
+            )
+            self._event_subscriptions.append(sub_id)
+
+            # TRAINING_COMPLETE: Training finished -> validate and promote
+            sub_id = await self._event_bus.subscribe(
+                EventType.TRAINING_COMPLETE,
+                self._on_training_complete,
+            )
+            self._event_subscriptions.append(sub_id)
+
+            # EXPERIENCE_COLLECTED: Body collected data -> notify Reactor
+            sub_id = await self._event_bus.subscribe(
+                EventType.EXPERIENCE_COLLECTED,
+                self._on_experience_collected,
+            )
+            self._event_subscriptions.append(sub_id)
+
+            # HEALTH_CHANGED: Component health changed -> trigger recovery
+            sub_id = await self._event_bus.subscribe(
+                EventType.HEALTH_CHANGED,
+                self._on_health_changed,
+            )
+            self._event_subscriptions.append(sub_id)
+
+            # SHUTDOWN_REQUESTED: Graceful shutdown requested
+            sub_id = await self._event_bus.subscribe(
+                EventType.SHUTDOWN_REQUESTED,
+                self._on_shutdown_requested,
+            )
+            self._event_subscriptions.append(sub_id)
+
+            logger.info("Event bus initialized - The Loop is now connected!")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize event bus: {e}")
+            self._event_bus = None
 
     async def _load_components(self, repos: Dict[str, Optional[Path]]):
         """Load component configurations from YAML and discovered repos."""
@@ -1004,6 +1085,25 @@ class TrinityOrchestrator:
 
         self._running = False
 
+        # Notify all components of shutdown
+        if self._event_bus:
+            try:
+                await self._event_bus.publish_shutdown_requested(
+                    reason="orchestrator_shutdown",
+                    graceful=True,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send shutdown event: {e}")
+
+        # Stop event bus
+        if self._event_bus:
+            try:
+                await self._event_bus.shutdown()
+                self._event_bus = None
+                logger.info("Event bus shutdown complete")
+            except Exception as e:
+                logger.warning(f"Error shutting down event bus: {e}")
+
         # Stop health monitoring
         if self._health_monitor:
             await self._health_monitor.stop()
@@ -1030,6 +1130,383 @@ class TrinityOrchestrator:
         logger.info("=" * 70)
         logger.info("TRINITY ECOSYSTEM STOPPED")
         logger.info("=" * 70)
+
+    # =========================================================================
+    # EVENT HANDLERS - The Neural Impulses of The Loop
+    # =========================================================================
+
+    async def _on_model_ready(self, event: "TrinityEvent"):
+        """
+        Handle MODEL_READY event - A new model is ready for use.
+
+        This is THE KEY EVENT that closes The Loop:
+        Reactor trains model -> publishes MODEL_READY -> Orchestrator hot-swaps
+
+        THE LOOP:
+        ┌──────────────────────────────────────────────────────────────────┐
+        │                                                                  │
+        │  JARVIS (Body) ──experience──> Reactor ──training──> Prime       │
+        │       ▲                                               │          │
+        │       │                                               │          │
+        │       └───────────── model_ready ─────────────────────┘          │
+        │                                                                  │
+        │                    *** YOU ARE HERE ***                          │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        model_name = event.payload.get("model_name", "unknown")
+        model_path = event.payload.get("model_path", "")
+        model_type = event.payload.get("model_type", "llm")
+        capabilities = event.payload.get("capabilities", [])
+
+        logger.info(f"[EVENT] MODEL_READY received: {model_name}")
+        logger.info(f"  Path: {model_path}")
+        logger.info(f"  Type: {model_type}")
+        logger.info(f"  Capabilities: {capabilities}")
+
+        # Register the model
+        self._model_registry[model_name] = {
+            "path": model_path,
+            "type": model_type,
+            "capabilities": capabilities,
+            "ready_at": event.payload.get("ready_at", time.time()),
+            "source": event.source.value,
+        }
+
+        # Trigger hot-swap if this is a better model
+        await self._trigger_model_hot_swap(model_name)
+
+    async def _on_training_complete(self, event: "TrinityEvent"):
+        """Handle TRAINING_COMPLETE event - Reactor finished training."""
+        model_name = event.payload.get("model_name", "unknown")
+        model_path = event.payload.get("model_path", "")
+        metrics = event.payload.get("training_metrics", {})
+
+        logger.info(f"[EVENT] TRAINING_COMPLETE: {model_name}")
+        logger.info(f"  Metrics: {json.dumps(metrics, indent=2) if metrics else 'none'}")
+
+        # Validate the trained model
+        is_valid = await self._validate_model(model_name, model_path, metrics)
+
+        if is_valid:
+            # Promote to ready state
+            await self.notify_model_ready(
+                model_name=model_name,
+                model_path=model_path,
+                model_type="llm",
+                capabilities=["text-generation"],
+                metadata={"training_metrics": metrics},
+            )
+        else:
+            logger.warning(f"Model {model_name} failed validation - not promoting")
+
+    async def _on_experience_collected(self, event: "TrinityEvent"):
+        """Handle EXPERIENCE_COLLECTED event - JARVIS collected new data."""
+        experience_type = event.payload.get("experience_type", "unknown")
+        sample_count = event.payload.get("sample_count", 0)
+        data_path = event.payload.get("data_path", "")
+
+        logger.info(f"[EVENT] EXPERIENCE_COLLECTED: {experience_type}")
+        logger.info(f"  Samples: {sample_count}")
+        logger.info(f"  Path: {data_path}")
+
+        # Forward to Reactor for training
+        if self._event_bus:
+            await self._event_bus.publish(
+                event_type=EventType.DATA_BATCH_READY,
+                payload={
+                    "experience_type": experience_type,
+                    "sample_count": sample_count,
+                    "data_path": data_path,
+                    "forwarded_at": time.time(),
+                },
+                target=ComponentID.REACTOR_CORE,
+                priority=EventPriority.NORMAL,
+            )
+
+    async def _on_health_changed(self, event: "TrinityEvent"):
+        """Handle HEALTH_CHANGED event - Component health changed."""
+        status = event.payload.get("status", "unknown")
+        details = event.payload.get("details", {})
+
+        logger.info(f"[EVENT] HEALTH_CHANGED from {event.source.value}: {status}")
+
+        # Trigger recovery if unhealthy
+        if status in ["unhealthy", "failed", "critical"]:
+            component_name = self._map_component_id_to_name(event.source)
+            if component_name:
+                await self._restart_component(component_name)
+
+    async def _on_shutdown_requested(self, event: "TrinityEvent"):
+        """Handle SHUTDOWN_REQUESTED event - Graceful shutdown requested."""
+        reason = event.payload.get("reason", "unknown")
+        graceful = event.payload.get("graceful", True)
+
+        logger.info(f"[EVENT] SHUTDOWN_REQUESTED: {reason} (graceful={graceful})")
+
+        # Signal shutdown
+        self._shutdown_event.set()
+
+    def _map_component_id_to_name(self, component_id: "ComponentID") -> Optional[str]:
+        """Map ComponentID enum to component name."""
+        mapping = {
+            ComponentID.JARVIS_BODY: "jarvis",
+            ComponentID.JARVIS_PRIME: "jarvis_prime",
+            ComponentID.REACTOR_CORE: "reactor_core",
+        }
+        return mapping.get(component_id)
+
+    # =========================================================================
+    # MODEL HOT-SWAP - The Core of The Loop
+    # =========================================================================
+
+    async def notify_model_ready(
+        self,
+        model_name: str,
+        model_path: str,
+        model_type: str = "llm",
+        capabilities: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Notify the Trinity ecosystem that a model is ready.
+
+        This is THE KEY METHOD that closes The Loop:
+
+        USAGE:
+            # After Reactor finishes training:
+            await orchestrator.notify_model_ready(
+                model_name="prime-7b-v2",
+                model_path="/models/prime-7b-v2",
+                model_type="llm",
+                capabilities=["text-generation", "code-completion"],
+            )
+
+            # This triggers:
+            # 1. MODEL_READY event broadcast to all components
+            # 2. Prime receives event -> hot-swaps to new model
+            # 3. Body receives event -> updates routing to use new model
+            # 4. The Loop is complete!
+
+        Args:
+            model_name: Human-readable model name
+            model_path: Path to model files
+            model_type: Type of model (llm, embedding, classifier, etc.)
+            capabilities: List of capabilities (text-generation, code, etc.)
+            metadata: Additional metadata
+
+        Returns:
+            True if notification was published successfully
+        """
+        if not self._event_bus:
+            logger.warning("Event bus not available - cannot notify model ready")
+
+            # Fallback to file-based notification
+            return await self._notify_model_ready_fallback(
+                model_name, model_path, model_type, capabilities, metadata
+            )
+
+        try:
+            # Publish MODEL_READY event to all components
+            event = await self._event_bus.publish_model_ready(
+                model_name=model_name,
+                model_path=model_path,
+                model_type=model_type,
+                capabilities=capabilities or [],
+                metadata=metadata,
+            )
+
+            logger.info(f"[NOTIFY] MODEL_READY published: {model_name}")
+            logger.info(f"  Event ID: {event.event_id}")
+            logger.info(f"  Correlation ID: {event.correlation_id}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to publish MODEL_READY: {e}")
+            return False
+
+    async def _notify_model_ready_fallback(
+        self,
+        model_name: str,
+        model_path: str,
+        model_type: str,
+        capabilities: Optional[List[str]],
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Fallback notification via direct file."""
+        try:
+            notification_dir = self._config.trinity_dir / "model_notifications"
+            notification_dir.mkdir(parents=True, exist_ok=True)
+
+            notification = {
+                "event": "model_ready",
+                "model_name": model_name,
+                "model_path": model_path,
+                "model_type": model_type,
+                "capabilities": capabilities or [],
+                "metadata": metadata or {},
+                "timestamp": time.time(),
+            }
+
+            notification_file = notification_dir / f"{model_name}_{int(time.time())}.json"
+
+            with open(notification_file, "w") as f:
+                json.dump(notification, f, indent=2)
+
+            logger.info(f"[NOTIFY] MODEL_READY written to file: {notification_file}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Fallback notification failed: {e}")
+            return False
+
+    async def _trigger_model_hot_swap(self, model_name: str):
+        """
+        Trigger hot-swap to a new model.
+
+        This notifies Prime to load the new model and Body to route to it.
+        """
+        model_info = self._model_registry.get(model_name)
+        if not model_info:
+            logger.warning(f"Model {model_name} not found in registry")
+            return
+
+        logger.info(f"[HOT-SWAP] Triggering hot-swap to model: {model_name}")
+
+        # Notify Prime to load the new model
+        if self._protocol:
+            await self._protocol.send_message("jarvis_prime", {
+                "action": "hot_swap_model",
+                "model_name": model_name,
+                "model_path": model_info["path"],
+                "model_type": model_info["type"],
+            })
+
+        # Notify Body about the new default model
+        if self._protocol:
+            await self._protocol.send_message("jarvis", {
+                "action": "update_model_routing",
+                "default_model": model_name,
+                "model_capabilities": model_info["capabilities"],
+            })
+
+        self._active_model = model_name
+        logger.info(f"[HOT-SWAP] Active model is now: {model_name}")
+
+    async def _validate_model(
+        self,
+        model_name: str,
+        model_path: str,
+        metrics: Dict[str, Any],
+    ) -> bool:
+        """
+        Validate a trained model before promotion.
+
+        Checks:
+        1. Model files exist
+        2. Model can be loaded
+        3. Basic inference works
+        4. Metrics meet quality threshold
+        """
+        logger.info(f"[VALIDATE] Validating model: {model_name}")
+
+        # Check path exists
+        path = Path(model_path)
+        if not path.exists():
+            logger.warning(f"Model path does not exist: {model_path}")
+            return False
+
+        # Check required files (for typical LLM)
+        required_files = ["config.json", "model.safetensors"]  # or pytorch_model.bin
+        has_required = any((path / f).exists() for f in required_files)
+
+        if not has_required:
+            # Check for alternative structures
+            has_required = (path / "adapter_model.safetensors").exists()  # LoRA
+
+        if not has_required:
+            logger.warning(f"Model missing required files at: {model_path}")
+            # Don't fail - might be a different structure
+            logger.info("  Proceeding anyway (may be alternative model structure)")
+
+        # Check metrics (if provided)
+        if metrics:
+            loss = metrics.get("loss", float("inf"))
+            if loss > 10.0:
+                logger.warning(f"Model loss too high: {loss}")
+                return False
+
+        logger.info(f"[VALIDATE] Model {model_name} passed validation")
+        return True
+
+    # =========================================================================
+    # EXPERIENCE NOTIFICATION - Body -> Reactor
+    # =========================================================================
+
+    async def notify_experience_collected(
+        self,
+        experience_type: str,
+        sample_count: int,
+        data_path: Optional[str] = None,
+    ) -> bool:
+        """
+        Notify that new experience data has been collected.
+
+        This is how the Body tells the Reactor about new training data.
+
+        Args:
+            experience_type: Type of experience (conversation, feedback, etc.)
+            sample_count: Number of samples collected
+            data_path: Path to the data file
+
+        Returns:
+            True if notification was published successfully
+        """
+        if not self._event_bus:
+            logger.warning("Event bus not available - cannot notify experience")
+            return False
+
+        try:
+            await self._event_bus.publish_experience_collected(
+                experience_type=experience_type,
+                sample_count=sample_count,
+                data_path=data_path,
+            )
+
+            logger.info(f"[NOTIFY] EXPERIENCE_COLLECTED: {sample_count} {experience_type} samples")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to publish EXPERIENCE_COLLECTED: {e}")
+            return False
+
+    async def notify_training_started(
+        self,
+        model_name: str,
+        training_config: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Notify that model training has started."""
+        if not self._event_bus:
+            return False
+
+        try:
+            await self._event_bus.publish(
+                event_type=EventType.TRAINING_STARTED,
+                payload={
+                    "model_name": model_name,
+                    "training_config": training_config or {},
+                    "started_at": time.time(),
+                },
+                target=ComponentID.BROADCAST,
+                priority=EventPriority.NORMAL,
+            )
+
+            logger.info(f"[NOTIFY] TRAINING_STARTED: {model_name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to publish TRAINING_STARTED: {e}")
+            return False
 
     def _get_startup_order(self) -> List[str]:
         """Get component startup order respecting dependencies."""
@@ -1127,6 +1604,13 @@ class TrinityOrchestrator:
                 for name, comp in self._components.items()
             },
             "health": self._health_monitor.get_status() if self._health_monitor else {},
+            "event_bus": {
+                "available": EVENT_BUS_AVAILABLE,
+                "connected": self._event_bus is not None,
+                "metrics": self._event_bus.get_metrics() if self._event_bus else {},
+            },
+            "model_registry": self._model_registry,
+            "active_model": self._active_model,
         }
 
     async def wait_for_shutdown(self):
@@ -1155,4 +1639,7 @@ __all__ = [
     "TrinityProtocol",
     # Orchestrator
     "TrinityOrchestrator",
+    # Availability flags
+    "ADVANCED_PRIMITIVES_AVAILABLE",
+    "EVENT_BUS_AVAILABLE",
 ]

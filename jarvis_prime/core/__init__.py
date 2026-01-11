@@ -395,6 +395,47 @@ try:
 except ImportError:
     VERIFICATION_SUITE_AVAILABLE = False
 
+# Trinity Event Bus v89.0 - The Neural Impulses (Closes The Loop)
+try:
+    from jarvis_prime.core.trinity_event_bus import (
+        TrinityEventBus,
+        TrinityEvent,
+        EventType,
+        EventPriority,
+        ComponentID,
+        Subscription,
+        EventTransport,
+        FileEventTransport,
+        MemoryEventTransport,
+        get_event_bus,
+        shutdown_event_bus,
+    )
+    TRINITY_EVENT_BUS_AVAILABLE = True
+except ImportError:
+    TRINITY_EVENT_BUS_AVAILABLE = False
+
+# Intelligent Request Router v89.0 - Routes Requests to Best Endpoint
+try:
+    from jarvis_prime.core.intelligent_request_router import (
+        IntelligentRequestRouter,
+        EndpointManager,
+        EndpointCircuitBreaker,
+        Capability,
+        EndpointType,
+        RoutingPriority,
+        EndpointHealth,
+        EndpointConfig,
+        RoutingContext,
+        RoutingResult,
+        RequestResult,
+        get_request_router,
+        shutdown_request_router,
+        route_request,
+    )
+    INTELLIGENT_REQUEST_ROUTER_AVAILABLE = True
+except ImportError:
+    INTELLIGENT_REQUEST_ROUTER_AVAILABLE = False
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -694,4 +735,33 @@ __all__ = [
     "ServiceMeshVerification",
     "CrossRepoVerification",
     "VERIFICATION_SUITE_AVAILABLE",
+    # Trinity Event Bus v89.0 - The Loop
+    "TrinityEventBus",
+    "TrinityEvent",
+    "EventType",
+    "EventPriority",
+    "ComponentID",
+    "Subscription",
+    "EventTransport",
+    "FileEventTransport",
+    "MemoryEventTransport",
+    "get_event_bus",
+    "shutdown_event_bus",
+    "TRINITY_EVENT_BUS_AVAILABLE",
+    # Intelligent Request Router v89.0
+    "IntelligentRequestRouter",
+    "EndpointManager",
+    "EndpointCircuitBreaker",
+    "Capability",
+    "EndpointType",
+    "RoutingPriority",
+    "EndpointHealth",
+    "EndpointConfig",
+    "RoutingContext",
+    "RoutingResult",
+    "RequestResult",
+    "get_request_router",
+    "shutdown_request_router",
+    "route_request",
+    "INTELLIGENT_REQUEST_ROUTER_AVAILABLE",
 ]
