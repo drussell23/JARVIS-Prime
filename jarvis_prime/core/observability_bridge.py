@@ -974,9 +974,14 @@ class ObservabilityBridge:
         if self._langfuse._initialized:
             logger.info("[OBS] Langfuse tracer initialized")
 
-        # Initialize Prometheus server (optional)
+        # Initialize Prometheus HTTP server (optional)
+        self._prometheus_server = None
+        self._prometheus_server_task = None
         if self._config.prometheus_enabled:
-            logger.info(f"[OBS] Prometheus metrics available on port {self._config.prometheus_port}")
+            try:
+                await self._start_prometheus_server()
+            except Exception as e:
+                logger.warning(f"[OBS] Failed to start Prometheus server: {e}")
 
         # Check for JARVIS Body observability hub
         jarvis_url = os.getenv("JARVIS_OBSERVABILITY_URL")
@@ -987,9 +992,73 @@ class ObservabilityBridge:
         self._initialized = True
         logger.info("[OBS] Observability Bridge ready")
 
+    async def _start_prometheus_server(self):
+        """Start the Prometheus metrics HTTP server."""
+        try:
+            from aiohttp import web
+
+            app = web.Application()
+            app.router.add_get("/metrics", self._handle_metrics)
+            app.router.add_get("/health", self._handle_health)
+
+            runner = web.AppRunner(app)
+            await runner.setup()
+
+            site = web.TCPSite(
+                runner,
+                "0.0.0.0",
+                self._config.prometheus_port,
+                reuse_address=True,
+            )
+            await site.start()
+
+            self._prometheus_server = runner
+            logger.info(f"[OBS] Prometheus metrics server started on port {self._config.prometheus_port}")
+            logger.info(f"[OBS]   - GET http://localhost:{self._config.prometheus_port}/metrics")
+            logger.info(f"[OBS]   - GET http://localhost:{self._config.prometheus_port}/health")
+
+        except ImportError:
+            logger.info("[OBS] aiohttp not available, Prometheus server disabled")
+        except OSError as e:
+            if "Address already in use" in str(e):
+                logger.info(f"[OBS] Port {self._config.prometheus_port} in use, Prometheus server disabled")
+            else:
+                raise
+
+    async def _handle_metrics(self, request):
+        """Handle /metrics endpoint for Prometheus scraping."""
+        from aiohttp import web
+
+        metrics = self._prometheus.export()
+        return web.Response(
+            text=metrics,
+            content_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    async def _handle_health(self, request):
+        """Handle /health endpoint."""
+        from aiohttp import web
+
+        status = self.get_status()
+        return web.json_response({
+            "status": "healthy" if self._initialized else "initializing",
+            "langfuse": status.get("langfuse", {}),
+            "chaos": {"enabled": status.get("chaos", {}).get("enabled", False)},
+            "poller": status.get("poller", {}),
+        })
+
     async def shutdown(self):
         """Shutdown the observability bridge."""
         logger.info("[OBS] Shutting down...")
+
+        # Stop Prometheus server
+        if self._prometheus_server:
+            try:
+                await self._prometheus_server.cleanup()
+                logger.info("[OBS] Prometheus server stopped")
+            except Exception as e:
+                logger.debug(f"[OBS] Error stopping Prometheus server: {e}")
+
         await self._langfuse.shutdown()
         self._initialized = False
         ObservabilityBridge._instance = None

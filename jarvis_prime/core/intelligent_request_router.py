@@ -130,6 +130,15 @@ try:
 except ImportError:
     ADVANCED_PRIMITIVES_AVAILABLE = False
 
+try:
+    from jarvis_prime.core.observability_bridge import (
+        get_observability_bridge,
+        trace_request,
+    )
+    OBSERVABILITY_AVAILABLE = True
+except ImportError:
+    OBSERVABILITY_AVAILABLE = False
+
 
 # =============================================================================
 # ENUMS
@@ -2217,11 +2226,33 @@ class IntelligentRequestRouter:
             request_id=hashlib.md5(f"{prompt}{time.time()}".encode()).hexdigest()[:8],
         )
 
+        # v91.0: Observability tracing and metrics
+        obs_bridge = None
+        if OBSERVABILITY_AVAILABLE:
+            try:
+                obs_bridge = await get_observability_bridge()
+                await obs_bridge.set_gauge(
+                    "trinity_active_requests",
+                    self._total_requests - self._successful_requests - self._failed_requests,
+                    labels={"component": "request_router"},
+                )
+            except Exception:
+                pass  # Observability is optional
+
         # Find best endpoint
         routing_result = await self._find_best_endpoint(context)
 
         if not routing_result.success or not routing_result.endpoint:
             self._failed_requests += 1
+            # v91.0: Track failed routing
+            if obs_bridge:
+                try:
+                    await obs_bridge.inc_counter(
+                        "trinity_requests_total",
+                        labels={"component": "request_router", "endpoint": "none", "status": "no_endpoint"},
+                    )
+                except Exception:
+                    pass
             return RequestResult(
                 success=False,
                 error=f"No suitable endpoint found: {routing_result.reason}",
@@ -2235,15 +2266,55 @@ class IntelligentRequestRouter:
                 self._fallback_count += 1
                 logger.info(f"Trying fallback endpoint: {endpoint.name}")
 
+            # v91.0: Maybe inject chaos (fault testing)
+            if obs_bridge:
+                try:
+                    await obs_bridge.maybe_inject_latency(endpoint.name)
+                    await obs_bridge.maybe_inject_error(endpoint.name)
+                except RuntimeError as e:
+                    # Chaos-injected error
+                    logger.warning(f"[CHAOS] Injected error for {endpoint.name}: {e}")
+                    continue
+                except Exception:
+                    pass
+
             result = await self._call_endpoint(endpoint, prompt)
 
             if result.success:
                 self._successful_requests += 1
                 result.fallbacks_attempted = i
+
+                # v91.0: Track successful request metrics
+                if obs_bridge:
+                    try:
+                        latency_seconds = result.latency_ms / 1000.0 if result.latency_ms else (time.time() - start_time)
+                        await obs_bridge.inc_counter(
+                            "trinity_requests_total",
+                            labels={"component": "request_router", "endpoint": endpoint.name, "status": "success"},
+                        )
+                        await obs_bridge.observe_histogram(
+                            "trinity_request_duration_seconds",
+                            latency_seconds,
+                            labels={"component": "request_router", "endpoint": endpoint.name},
+                        )
+                    except Exception:
+                        pass
+
                 return result
 
         # All endpoints failed
         self._failed_requests += 1
+
+        # v91.0: Track failed request
+        if obs_bridge:
+            try:
+                await obs_bridge.inc_counter(
+                    "trinity_requests_total",
+                    labels={"component": "request_router", "endpoint": "all", "status": "failed"},
+                )
+            except Exception:
+                pass
+
         return RequestResult(
             success=False,
             error="All endpoints failed",

@@ -107,6 +107,14 @@ try:
 except ImportError:
     ADVANCED_PRIMITIVES_AVAILABLE = False
 
+try:
+    from jarvis_prime.core.observability_bridge import (
+        get_observability_bridge,
+    )
+    OBSERVABILITY_AVAILABLE = True
+except ImportError:
+    OBSERVABILITY_AVAILABLE = False
+
 
 # =============================================================================
 # UNIFIED EVENT TYPE MAPPING
@@ -1321,6 +1329,16 @@ class TrinityBridgeAdapter:
 
         self._processed_hashes.append(event._hash)
         self._last_event_time = time.time()
+        start_time = time.time()
+
+        # v91.0: Track event with observability bridge
+        obs_bridge = None
+        if OBSERVABILITY_AVAILABLE:
+            try:
+                obs_bridge = await get_observability_bridge()
+                obs_bridge.record_event()  # For adaptive polling
+            except Exception:
+                pass
 
         logger.info(
             f"[BRIDGE] {source_system} -> {event.event_type.value}: "
@@ -1360,11 +1378,34 @@ class TrinityBridgeAdapter:
             return success
 
         # Execute with retry
-        return await self._retry_engine.execute_with_retry(
+        result = await self._retry_engine.execute_with_retry(
             event,
             deliver,
             self._circuit_breakers.get(source_system),
         )
+
+        # v91.0: Track event metrics with observability bridge
+        if obs_bridge:
+            try:
+                elapsed_ms = (time.time() - start_time) * 1000
+                status = "success" if result else "failed"
+                await obs_bridge.inc_counter(
+                    "trinity_events_delivered_total",
+                    labels={"event_type": event.event_type.value, "destination": source_system},
+                )
+                await obs_bridge.inc_counter(
+                    "trinity_events_published_total",
+                    labels={"event_type": event.event_type.value, "source": source_system},
+                )
+                await obs_bridge.observe_histogram(
+                    "trinity_request_duration_seconds",
+                    elapsed_ms / 1000.0,
+                    labels={"component": "bridge_adapter", "endpoint": source_system},
+                )
+            except Exception:
+                pass
+
+        return result
 
     async def _forward_to_prime(self, event: UnifiedEvent):
         """Forward event to Prime's TrinityEventBus."""

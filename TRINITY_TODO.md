@@ -275,6 +275,7 @@ jarvis-prime/
 │       ├── trinity_orchestrator.py        # Cross-repo orchestration
 │       ├── trinity_bridge_adapter.py      # Unified event bridge (v89.0)
 │       ├── intelligent_request_router.py  # Request routing (v89.0)
+│       ├── observability_bridge.py        # Langfuse/Prometheus/Chaos (v91.0)
 │       ├── verification_suite.py          # System tests
 │       ├── intelligent_model_router.py    # Model tier routing
 │       ├── gcp_vm_manager.py             # GCP infrastructure
@@ -297,7 +298,14 @@ reactor-core/
 
 ## Version History
 
-- **v90.0** - PRODUCTION HARDENING (Current)
+- **v91.0** - OBSERVABILITY & CHAOS ENGINEERING (Current)
+  - Observability Bridge (`observability_bridge.py`)
+  - Langfuse Integration for distributed tracing
+  - Prometheus Metrics Export (OpenMetrics format)
+  - Chaos Testing Framework (latency, errors, timeouts)
+  - Adaptive Event Bus Polling
+  - Integrated with run_supervisor.py
+- **v90.0** - PRODUCTION HARDENING
   - Event Delivery Guarantees (RetryEngine + DLQ)
   - Model Validation Before Hot-Swap (5 check types)
   - Request Queuing During Deployments
