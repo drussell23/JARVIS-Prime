@@ -333,6 +333,68 @@ from jarvis_prime.core.service_mesh import (
     shutdown_service_mesh,
 )
 
+# Advanced Primitives v88.0 - Production-Grade Building Blocks
+try:
+    from jarvis_prime.core.advanced_primitives import (
+        AtomicFileWriter,
+        WriteAheadLog,
+        AdvancedCircuitBreaker,
+        CircuitBreakerConfig,
+        CircuitOpenError,
+        BackoffConfig,
+        ExponentialBackoff,
+        with_retry,
+        OperationTimeoutError,
+        operation_timeout,
+        with_timeout,
+        GPUInfo,
+        NetworkInfo,
+        SystemResources,
+        ResourceMonitor,
+        ManagedConnectionPool,
+        TraceContext,
+        trace_operation,
+        TokenBucketRateLimiter,
+        MeteredSemaphore,
+    )
+    ADVANCED_PRIMITIVES_AVAILABLE = True
+except ImportError:
+    ADVANCED_PRIMITIVES_AVAILABLE = False
+
+# Trinity Orchestrator v88.0 - Unified Cross-Repo Orchestration
+try:
+    from jarvis_prime.core.trinity_orchestrator import (
+        TrinityOrchestrator,
+        ComponentState,
+        ComponentType as TrinityComponentType,
+        ComponentConfig as TrinityComponentConfig,
+        OrchestratorConfig as TrinityOrchestratorConfig,
+        RepoDiscovery,
+        ProcessManager,
+        HealthMonitor,
+        TrinityProtocol,
+    )
+    TRINITY_ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    TRINITY_ORCHESTRATOR_AVAILABLE = False
+
+# Verification Suite v88.0 - System Verification Tests
+try:
+    from jarvis_prime.core.verification_suite import (
+        VerificationRunner,
+        TestStatus,
+        TestResult,
+        TestSuiteResult,
+        BrainRouterVerification,
+        PreemptionDrillVerification,
+        OOMProtectionVerification,
+        ServiceMeshVerification,
+        CrossRepoVerification,
+    )
+    VERIFICATION_SUITE_AVAILABLE = True
+except ImportError:
+    VERIFICATION_SUITE_AVAILABLE = False
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -588,4 +650,48 @@ __all__ = [
     "ServiceMeshClient",
     "get_service_mesh",
     "shutdown_service_mesh",
+    # Advanced Primitives v88.0
+    "AtomicFileWriter",
+    "WriteAheadLog",
+    "AdvancedCircuitBreaker",
+    "CircuitBreakerConfig",
+    "CircuitOpenError",
+    "BackoffConfig",
+    "ExponentialBackoff",
+    "with_retry",
+    "OperationTimeoutError",
+    "operation_timeout",
+    "with_timeout",
+    "GPUInfo",
+    "NetworkInfo",
+    "SystemResources",
+    "ResourceMonitor",
+    "ManagedConnectionPool",
+    "TraceContext",
+    "trace_operation",
+    "TokenBucketRateLimiter",
+    "MeteredSemaphore",
+    "ADVANCED_PRIMITIVES_AVAILABLE",
+    # Trinity Orchestrator v88.0
+    "TrinityOrchestrator",
+    "ComponentState",
+    "TrinityComponentType",
+    "TrinityComponentConfig",
+    "TrinityOrchestratorConfig",
+    "RepoDiscovery",
+    "ProcessManager",
+    "HealthMonitor",
+    "TrinityProtocol",
+    "TRINITY_ORCHESTRATOR_AVAILABLE",
+    # Verification Suite v88.0
+    "VerificationRunner",
+    "TestStatus",
+    "TestResult",
+    "TestSuiteResult",
+    "BrainRouterVerification",
+    "PreemptionDrillVerification",
+    "OOMProtectionVerification",
+    "ServiceMeshVerification",
+    "CrossRepoVerification",
+    "VERIFICATION_SUITE_AVAILABLE",
 ]

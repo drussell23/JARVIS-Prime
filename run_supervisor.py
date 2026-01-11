@@ -1212,6 +1212,18 @@ Examples:
         help="v87.0: Enable intelligent model routing (default: true)",
     )
 
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="v88.0: Run verification suite before startup",
+    )
+
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="v88.0: Run verification suite and exit (no startup)",
+    )
+
     return parser.parse_args()
 
 
@@ -1287,9 +1299,33 @@ async def main_v87_unified(args):
     - Cross-repo orchestration with dependency resolution
     """
     logger.info("=" * 70)
-    logger.info("JARVIS TRINITY v87.0 - THE CONNECTIVE TISSUE")
+    logger.info("JARVIS TRINITY v88.0 - THE CONNECTIVE TISSUE (Enhanced)")
     logger.info("=" * 70)
     logger.info("")
+
+    # Run verification if requested
+    if args.verify or args.verify_only:
+        logger.info("Running Verification Suite...")
+        logger.info("")
+        try:
+            from jarvis_prime.core.verification_suite import VerificationRunner
+            runner = VerificationRunner()
+            results = await runner.run_all()
+
+            if args.verify_only:
+                # Save results and exit
+                runner.save_results()
+                sys.exit(0 if results["failed"] == 0 else 1)
+
+            if results["failed"] > 0:
+                logger.warning("")
+                logger.warning("Verification found issues - continuing with startup")
+                logger.warning("Run with --verify-only for detailed analysis")
+                logger.warning("")
+        except ImportError as e:
+            logger.warning(f"Verification suite not available: {e}")
+        except Exception as e:
+            logger.warning(f"Verification failed: {e}")
 
     # Track initialized components for cleanup
     initialized = []
@@ -1366,16 +1402,27 @@ async def main_v87_unified(args):
             logger.info("")
             logger.info("GCP VM Manager: DISABLED (use --enable-gcp to enable)")
 
-        # 5. Initialize Cross-Repo Orchestrator
+        # 5. Initialize Trinity Orchestrator (v88.0 - Enhanced)
         logger.info("")
-        logger.info("Initializing Cross-Repo Orchestrator...")
+        logger.info("Initializing Trinity Orchestrator...")
         try:
-            from jarvis_prime.core.cross_repo_orchestrator import get_orchestrator
-            orchestrator = await get_orchestrator()
+            # Try new enhanced orchestrator first
+            from jarvis_prime.core.trinity_orchestrator import TrinityOrchestrator
+            orchestrator = await TrinityOrchestrator.create()
             initialized.append(("orchestrator", orchestrator))
-            logger.info("  Cross-Repo Orchestrator initialized")
+            logger.info("  Trinity Orchestrator initialized (v88.0 Enhanced)")
+        except ImportError:
+            # Fallback to legacy orchestrator
+            try:
+                from jarvis_prime.core.cross_repo_orchestrator import get_orchestrator
+                orchestrator = await get_orchestrator()
+                initialized.append(("orchestrator", orchestrator))
+                logger.info("  Cross-Repo Orchestrator initialized (legacy)")
+            except Exception as e:
+                logger.warning(f"  Orchestrator initialization failed: {e}")
+                orchestrator = None
         except Exception as e:
-            logger.warning(f"  Orchestrator initialization failed: {e}")
+            logger.warning(f"  Trinity Orchestrator initialization failed: {e}")
             orchestrator = None
 
         # 6. Register services with mesh
@@ -1400,13 +1447,20 @@ async def main_v87_unified(args):
         logger.info("Starting Trinity components...")
 
         if orchestrator:
+            # Check if new TrinityOrchestrator or legacy
+            is_new_orchestrator = hasattr(orchestrator, 'start_all') and hasattr(orchestrator, 'shutdown_all')
+
             success = await orchestrator.start_all()
             if not success:
                 logger.error("Failed to start all components")
         else:
             # Fallback to direct startup
             logger.info("  Starting JARVIS-Prime directly...")
-            # This will be handled by the legacy supervisor
+            success = True
+            # Start legacy supervisor
+            legacy_supervisor = UnifiedSupervisor()
+            await legacy_supervisor.start(["jarvis_prime"])
+            initialized.append(("legacy_supervisor", legacy_supervisor))
 
         # 8. Print status summary
         logger.info("")
@@ -1436,7 +1490,25 @@ async def main_v87_unified(args):
 
         # 9. Run until shutdown
         if orchestrator:
-            await orchestrator.run_until_shutdown()
+            # Check if new TrinityOrchestrator (has wait_for_shutdown) or legacy (has run_until_shutdown)
+            if hasattr(orchestrator, 'wait_for_shutdown'):
+                # New TrinityOrchestrator
+                await orchestrator.wait_for_shutdown()
+            elif hasattr(orchestrator, 'run_until_shutdown'):
+                # Legacy orchestrator
+                await orchestrator.run_until_shutdown()
+            else:
+                # Unknown orchestrator - wait for signal
+                shutdown_event = asyncio.Event()
+
+                def signal_handler():
+                    shutdown_event.set()
+
+                loop = asyncio.get_event_loop()
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, signal_handler)
+
+                await shutdown_event.wait()
         else:
             # Fallback: wait for signal
             shutdown_event = asyncio.Event()
@@ -1477,8 +1549,13 @@ async def main_v87_unified(args):
                     await shutdown_gcp_manager()
                     logger.info(f"  {name}: stopped")
                 elif name == "orchestrator":
-                    # Orchestrator handles its own shutdown
-                    pass
+                    # Handle both new TrinityOrchestrator and legacy
+                    if hasattr(component, 'shutdown_all'):
+                        await component.shutdown_all()
+                        logger.info(f"  {name}: stopped")
+                elif name == "legacy_supervisor":
+                    await component.stop()
+                    logger.info(f"  {name}: stopped")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
 

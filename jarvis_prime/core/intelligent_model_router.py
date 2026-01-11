@@ -120,6 +120,47 @@ except ImportError:
     RELIABILITY_AVAILABLE = False
     logger.warning("Reliability engines not available")
 
+try:
+    from jarvis_prime.core.advanced_primitives import (
+        ResourceMonitor,
+        AtomicFileWriter,
+        AdvancedCircuitBreaker,
+        CircuitBreakerConfig,
+        BackoffConfig,
+        ExponentialBackoff,
+        with_retry,
+        with_timeout,
+        operation_timeout,
+        OperationTimeoutError,
+        ManagedConnectionPool,
+        TraceContext,
+        trace_operation,
+        TokenBucketRateLimiter,
+        GPUInfo,
+        NetworkInfo,
+        SystemResources,
+        IS_MACOS,
+        HAS_METAL,
+        HAS_NVIDIA,
+    )
+    ADVANCED_PRIMITIVES_AVAILABLE = True
+except ImportError:
+    ADVANCED_PRIMITIVES_AVAILABLE = False
+    logger.warning("Advanced primitives not available - using basic implementations")
+
+# Global resource monitor instance
+_resource_monitor: Optional["ResourceMonitor"] = None
+
+
+async def get_resource_monitor() -> Optional["ResourceMonitor"]:
+    """Get or create the global ResourceMonitor."""
+    global _resource_monitor
+    if not ADVANCED_PRIMITIVES_AVAILABLE:
+        return None
+    if _resource_monitor is None:
+        _resource_monitor = await ResourceMonitor.get_instance()
+    return _resource_monitor
+
 
 # =============================================================================
 # CONFIGURATION
@@ -239,7 +280,7 @@ class ResourceSnapshot:
 
     @classmethod
     def capture(cls) -> "ResourceSnapshot":
-        """Capture current resource state."""
+        """Capture current resource state with REAL GPU and network detection."""
         if not PSUTIL_AVAILABLE:
             return cls(
                 timestamp=time.time(),
@@ -255,25 +296,107 @@ class ResourceSnapshot:
 
         mem = psutil.virtual_memory()
 
+        # Real GPU detection
+        gpu_available = False
+        gpu_memory_used = 0.0
+        gpu_memory_total = 0.0
+
+        if ADVANCED_PRIMITIVES_AVAILABLE:
+            # Use advanced primitives for GPU detection
+            if HAS_NVIDIA:
+                gpu_available = True
+                # Query NVIDIA GPU
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        parts = result.stdout.strip().split(',')
+                        if len(parts) >= 2:
+                            gpu_memory_used = float(parts[0].strip())
+                            gpu_memory_total = float(parts[1].strip())
+                except Exception:
+                    pass
+            elif HAS_METAL and IS_MACOS:
+                # Apple Silicon with Metal - uses unified memory
+                gpu_available = True
+                # Estimate GPU memory from system memory (unified memory architecture)
+                gpu_memory_total = mem.total / (1024 ** 2) * 0.75  # 75% available for GPU
+                gpu_memory_used = mem.used / (1024 ** 2) * 0.3  # Estimate 30% GPU usage
+        else:
+            # Fallback GPU detection without advanced primitives
+            try:
+                import subprocess
+                import platform
+
+                if platform.system() == "Darwin":
+                    # macOS - check for Metal
+                    result = subprocess.run(
+                        ["system_profiler", "SPDisplaysDataType"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    gpu_available = "Metal" in result.stdout
+                else:
+                    # Try nvidia-smi
+                    result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    gpu_available = result.returncode == 0 and bool(result.stdout.strip())
+            except Exception:
+                gpu_available = False
+
+        # Real network detection
+        network_available = False
+        try:
+            import socket
+            socket.setdefaulttimeout(2)
+            socket.gethostbyname("dns.google")
+            network_available = True
+        except Exception:
+            # Fallback - check if any non-loopback interface is up
+            try:
+                net_if = psutil.net_if_stats()
+                network_available = any(
+                    stats.isup and iface != 'lo' and not iface.startswith('lo')
+                    for iface, stats in net_if.items()
+                )
+            except Exception:
+                network_available = False
+
         return cls(
             timestamp=time.time(),
             ram_used_percent=mem.percent,
             ram_used_mb=mem.used / (1024 ** 2),
             ram_available_mb=mem.available / (1024 ** 2),
             cpu_percent=psutil.cpu_percent(),
-            gpu_available=True,  # TODO: Check GPU availability
-            gpu_memory_used_mb=0.0,
-            gpu_memory_total_mb=0.0,
-            network_available=True,  # TODO: Check network
+            gpu_available=gpu_available,
+            gpu_memory_used_mb=gpu_memory_used,
+            gpu_memory_total_mb=gpu_memory_total,
+            network_available=network_available,
         )
 
     def can_use_local(self, config: RoutingConfig) -> Tuple[bool, str]:
-        """Check if local inference is viable."""
+        """Check if local inference is viable based on RAM, GPU, and network."""
+        # RAM checks
         if self.ram_used_percent > config.local_max_ram_percent:
             return False, f"RAM usage {self.ram_used_percent:.1f}% > {config.local_max_ram_percent}%"
         if self.ram_used_mb > config.local_max_ram_mb:
             return False, f"RAM used {self.ram_used_mb:.0f}MB > {config.local_max_ram_mb}MB"
+
+        # GPU check - local inference typically needs GPU
+        if not self.gpu_available:
+            return False, "No GPU available for local inference"
+
         return True, "Resources available"
+
+    def can_use_cloud(self) -> Tuple[bool, str]:
+        """Check if cloud inference is viable based on network availability."""
+        if not self.network_available:
+            return False, "Network unavailable for cloud inference"
+        return True, "Network available"
 
 
 @dataclass
@@ -1084,7 +1207,7 @@ class IntelligentModelRouter:
         prompt: str,
         context: Optional[Dict[str, Any]],
     ) -> Tuple[ModelTier, float, str]:
-        """Select the optimal tier based on complexity and resources."""
+        """Select the optimal tier based on complexity, resources, and network."""
         reasons = []
 
         # Get adaptive thresholds
@@ -1093,14 +1216,30 @@ class IntelligentModelRouter:
 
         # Check resource constraints
         can_use_local, local_reason = resources.can_use_local(self._config)
+        can_use_cloud, cloud_reason = resources.can_use_cloud()
 
         # Token count check
         token_count = len(prompt.split())
 
         # Multimodal check
         if context and context.get("has_images"):
-            reasons.append("multimodal content requires Claude API")
-            return ModelTier.CLAUDE_API, 0.95, "; ".join(reasons)
+            if can_use_cloud:
+                reasons.append("multimodal content requires Claude API")
+                return ModelTier.CLAUDE_API, 0.95, "; ".join(reasons)
+            else:
+                reasons.append(f"multimodal content requires cloud but {cloud_reason}")
+                # Can't do multimodal locally - best effort with local
+                return ModelTier.LOCAL_7B, 0.3, "; ".join(reasons)
+
+        # Network unavailable → local only
+        if not can_use_cloud:
+            reasons.append(f"cloud unavailable: {cloud_reason}")
+            if can_use_local:
+                return ModelTier.LOCAL_7B, 0.8, "; ".join(reasons)
+            else:
+                # Both local and cloud unavailable - try local anyway
+                reasons.append(f"local also limited: {local_reason}")
+                return ModelTier.LOCAL_7B, 0.3, "; ".join(reasons)
 
         # Resource constraint → skip local
         if not can_use_local:
@@ -1225,9 +1364,17 @@ class IntelligentModelRouter:
             except Exception as e:
                 logger.warning(f"Inference failed on {tier.value}: {e}")
 
-                # Record failure in circuit breaker
+                # Record failure in circuit breaker (use public interface)
                 if tier in self._circuit_breakers:
-                    await self._circuit_breakers[tier]._record_failure(tier.value)
+                    try:
+                        # Use proper public method if available
+                        cb = self._circuit_breakers[tier]
+                        if hasattr(cb, 'record_failure'):
+                            await cb.record_failure(tier.value)
+                        elif hasattr(cb, '_record_failure'):
+                            await cb._record_failure(tier.value)
+                    except Exception as cb_error:
+                        logger.debug(f"Circuit breaker update failed: {cb_error}")
 
                 if not fallback_used:
                     fallback_used = True
