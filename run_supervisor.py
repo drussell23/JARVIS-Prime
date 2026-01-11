@@ -1736,6 +1736,28 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  JARVIS-Prime Bridge failed: {e}")
 
+        # 5.18. Initialize GCP Cross-Repo Bridge (v92.1 - Unified Cloud Coordination)
+        logger.info("")
+        logger.info("Initializing GCP Cross-Repo Bridge (Unified Cloud)...")
+        gcp_cross_repo_bridge = None
+        try:
+            from jarvis_prime.core.gcp_cross_repo_bridge import get_gcp_cross_repo_bridge
+            gcp_cross_repo_bridge = await get_gcp_cross_repo_bridge()
+            initialized.append(("gcp_cross_repo_bridge", gcp_cross_repo_bridge))
+            status = gcp_cross_repo_bridge.get_status()
+            repos = status.get('repos', {})
+            stats = status.get('stats', {})
+            logger.info("  GCP Cross-Repo Bridge initialized")
+            logger.info(f"    - JARVIS (Body): {'CONNECTED' if repos.get('jarvis') else 'NOT FOUND'}")
+            logger.info(f"    - JARVIS-Prime (Mind): {'CONNECTED' if repos.get('jarvis_prime') else 'NOT FOUND'}")
+            logger.info(f"    - Reactor-Core (Nervous): {'CONNECTED' if repos.get('reactor_core') else 'NOT FOUND'}")
+            logger.info(f"    - Endpoints Discovered: {stats.get('endpoints_discovered', 0)}")
+            logger.info(f"    - Project ID: {status.get('config', {}).get('project_id', 'NOT SET')}")
+        except ImportError:
+            logger.warning("  GCP Cross-Repo Bridge not available")
+        except Exception as e:
+            logger.warning(f"  GCP Cross-Repo Bridge failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1785,6 +1807,7 @@ async def main_v87_unified(args):
         logger.info(f"│  Service Mesh:            {'✓ ACTIVE' if service_mesh else '✗ INACTIVE':>18} │")
         logger.info(f"│  Model Router:            {'✓ ACTIVE' if model_router else '✗ INACTIVE':>18} │")
         logger.info(f"│  GCP VM Manager:          {'✓ ACTIVE' if gcp_manager else '✗ INACTIVE':>18} │")
+        logger.info(f"│  GCP Cross-Repo Bridge:   {'✓ ACTIVE' if gcp_cross_repo_bridge else '✗ INACTIVE':>18} │")
         logger.info(f"│  Trinity Orchestrator:    {'✓ ACTIVE' if orchestrator else '✗ INACTIVE':>18} │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
@@ -2081,6 +2104,16 @@ async def main_v87_unified(args):
                         stats = component.get_stats()
                         logger.info(f"    Requests: {stats.total_requests}, Fallbacks: {stats.fallback_count}")
                     await shutdown_jarvis_prime_bridge()
+                    logger.info(f"  {name}: stopped")
+                elif name == "gcp_cross_repo_bridge":
+                    # v92.1: Stop GCP Cross-Repo Bridge
+                    from jarvis_prime.core.gcp_cross_repo_bridge import shutdown_gcp_cross_repo_bridge
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        stats = status.get('stats', {})
+                        logger.info(f"    Requests Routed: {stats.get('requests_routed', 0)}")
+                        logger.info(f"    Preemptions Handled: {stats.get('preemptions_handled', 0)}")
+                    await shutdown_gcp_cross_repo_bridge()
                     logger.info(f"  {name}: stopped")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
