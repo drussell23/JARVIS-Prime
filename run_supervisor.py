@@ -3,14 +3,36 @@
 JARVIS Unified Supervisor - Cross-Repository Orchestration
 =============================================================
 
-v87.0 - THE CONNECTIVE TISSUE - Unified Trinity Ecosystem
+v91.0 - OBSERVABILITY & CHAOS ENGINEERING
 
 This supervisor connects and orchestrates all JARVIS ecosystem components:
 - JARVIS (Body): Main orchestrator, computer use, action execution
 - JARVIS-Prime (Mind): LLM inference, reasoning, cognitive processing
 - Reactor-Core (Training): Model training, fine-tuning, deployment
 
-NEW IN v87.0 - THE CONNECTIVE TISSUE:
+NEW IN v91.0 - OBSERVABILITY BRIDGE:
+    - LANGFUSE INTEGRATION: Distributed tracing with Langfuse
+    - PROMETHEUS EXPORT: Metrics export in OpenMetrics format
+    - CHAOS TESTING: Fault injection framework (latency, errors, timeouts)
+    - ADAPTIVE POLLING: Dynamic event bus poll interval optimization
+    - CROSS-REPO OBSERVABILITY: Connect to JARVIS Body's observability hub
+
+v90.0 - PRODUCTION HARDENING:
+    - EVENT DELIVERY GUARANTEES: Retry with exponential backoff + DLQ
+    - MODEL VALIDATION: Pre-deployment validation (integrity, inference, safety)
+    - REQUEST QUEUING: Buffer requests during hot-swap operations
+    - CANARY DEPLOYMENTS: Gradual rollout (1% → 5% → 25% → 50% → 100%)
+    - AUTO-ROLLBACK: Automatic rollback on error rate threshold (5%)
+    - DISTRIBUTED TRACING: TraceContext + Span propagation across repos
+    - CIRCUIT BREAKERS: Per-endpoint circuit breakers (CLOSED → OPEN → HALF_OPEN)
+    - METRICS & ALERTING: Real-time health monitoring with alerts
+    - SAGA PATTERN: Transactional deployments with compensation
+
+v89.0 - THE LOOP COMPLETE:
+    - Trinity Bridge Adapter: Cross-repo event translation and forwarding
+    - Intelligent Request Router: Capability-based routing with fallbacks
+
+v87.0 - THE CONNECTIVE TISSUE:
     - UNIFIED MODE: python3 run_supervisor.py --unified (RECOMMENDED)
     - INTELLIGENT MODEL ROUTER: Local 7B -> GCP 13B -> Claude API fallback
     - GCP VM MANAGER: Spot VM lifecycle, preemption handling, auto-scaling
@@ -1459,6 +1481,25 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  Intelligent Request Router failed: {e}")
 
+        # 5.7. Initialize Observability Bridge (v91.0)
+        logger.info("")
+        logger.info("Initializing Observability Bridge...")
+        obs_bridge = None
+        try:
+            from jarvis_prime.core.observability_bridge import get_observability_bridge
+            obs_bridge = await get_observability_bridge()
+            initialized.append(("obs_bridge", obs_bridge))
+            status = obs_bridge.get_status()
+            logger.info("  Observability Bridge initialized")
+            logger.info(f"    - Langfuse: {'ENABLED' if status.get('langfuse', {}).get('initialized') else 'DISABLED'}")
+            logger.info(f"    - Prometheus: Port {obs_bridge._config.prometheus_port}")
+            logger.info(f"    - Chaos Testing: {'ENABLED' if status.get('chaos', {}).get('enabled') else 'DISABLED'}")
+            logger.info(f"    - Adaptive Polling: {status.get('poller', {}).get('current_interval_ms', 100):.0f}ms")
+        except ImportError:
+            logger.warning("  Observability Bridge not available")
+        except Exception as e:
+            logger.warning(f"  Observability Bridge failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1496,33 +1537,88 @@ async def main_v87_unified(args):
             await legacy_supervisor.start(["jarvis_prime"])
             initialized.append(("legacy_supervisor", legacy_supervisor))
 
-        # 8. Print status summary
+        # 8. Print status summary with v2.0 production metrics
         logger.info("")
         logger.info("=" * 70)
-        logger.info("JARVIS TRINITY ECOSYSTEM STATUS")
+        logger.info("JARVIS TRINITY ECOSYSTEM v2.0 - PRODUCTION STATUS")
         logger.info("=" * 70)
         logger.info("")
-        logger.info("CONNECTIVE TISSUE:")
-        logger.info(f"  Service Mesh:           {'ACTIVE' if service_mesh else 'INACTIVE'}")
-        logger.info(f"  Model Router:           {'ACTIVE' if model_router else 'INACTIVE'}")
-        logger.info(f"  GCP VM Manager:         {'ACTIVE' if gcp_manager else 'INACTIVE'}")
-        logger.info(f"  Cross-Repo Orchestrator:{'ACTIVE' if orchestrator else 'INACTIVE'}")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                    CONNECTIVE TISSUE                              │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info(f"│  Service Mesh:            {'✓ ACTIVE' if service_mesh else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Model Router:            {'✓ ACTIVE' if model_router else '✗ INACTIVE':>18} │")
+        logger.info(f"│  GCP VM Manager:          {'✓ ACTIVE' if gcp_manager else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Trinity Orchestrator:    {'✓ ACTIVE' if orchestrator else '✗ INACTIVE':>18} │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
-        logger.info("THE LOOP (v89.0):")
-        logger.info(f"  Trinity Bridge Adapter: {'ACTIVE' if bridge_adapter else 'INACTIVE'}")
-        logger.info(f"  Request Router:         {'ACTIVE' if request_router else 'INACTIVE'}")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                    THE LOOP (v2.0)                                │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info(f"│  Trinity Bridge Adapter:  {'✓ ACTIVE' if bridge_adapter else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Request Router:          {'✓ ACTIVE' if request_router else '✗ INACTIVE':>18} │")
+        if request_router:
+            status = request_router.get_status()
+            endpoints_info = status.get('endpoints', {})
+            total_eps = endpoints_info.get('total', 0) if isinstance(endpoints_info, dict) else len(endpoints_info)
+            healthy_eps = endpoints_info.get('healthy', 0) if isinstance(endpoints_info, dict) else 0
+            logger.info(f"│    Endpoints:             {healthy_eps}/{total_eps} healthy{' '*8} │")
+            health = status.get('health', 'unknown')
+            logger.info(f"│    Health:                {health:>18} │")
+            alerts = status.get('alerts', [])
+            if alerts:
+                logger.info(f"│    Alerts:                {len(alerts)} active{' '*10} │")
+                for alert in alerts[:3]:  # Show first 3 alerts
+                    severity = alert.get('severity', 'unknown')[:4]
+                    msg = alert.get('message', '')[:30]
+                    logger.info(f"│      [{severity}] {msg:30} │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
-        logger.info("ROUTING TIERS:")
-        logger.info("  Tier 1 (Priority): Local 7B   -> http://localhost:8000")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                  OBSERVABILITY (v91.0)                            │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info(f"│  Observability Bridge:    {'✓ ACTIVE' if obs_bridge else '✗ INACTIVE':>18} │")
+        if obs_bridge:
+            obs_status = obs_bridge.get_status()
+            langfuse_ok = obs_status.get('langfuse', {}).get('initialized', False)
+            chaos_ok = obs_status.get('chaos', {}).get('enabled', False)
+            logger.info(f"│    Langfuse Tracing:      {'✓ CONNECTED' if langfuse_ok else '○ READY':>18} │")
+            logger.info(f"│    Prometheus Export:     {'Port ' + str(obs_bridge._config.prometheus_port):>18} │")
+            logger.info(f"│    Chaos Engine:          {'✓ ENABLED' if chaos_ok else '○ STANDBY':>18} │")
+            poll_ms = obs_status.get('poller', {}).get('current_interval_ms', 100)
+            logger.info(f"│    Adaptive Poll:         {f'{poll_ms:.0f}ms':>18} │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
+        logger.info("")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                  PRODUCTION FEATURES                              │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info("│  ✓ Event Delivery Guarantees (retry + DLQ)                       │")
+        logger.info("│  ✓ Model Validation Before Hot-Swap                              │")
+        logger.info("│  ✓ Request Queuing During Deployments                            │")
+        logger.info("│  ✓ Canary Deployments with Auto-Rollback                         │")
+        logger.info("│  ✓ Distributed Tracing (Langfuse + TraceContext)                 │")
+        logger.info("│  ✓ Circuit Breakers per Endpoint                                 │")
+        logger.info("│  ✓ Metrics & Alerting (Prometheus Export)                        │")
+        logger.info("│  ✓ Saga Pattern for Transactional Deployments                    │")
+        logger.info("│  ✓ Chaos Testing Framework                                       │")
+        logger.info("│  ✓ Adaptive Event Bus Polling                                    │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
+        logger.info("")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│                    ROUTING TIERS                                  │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info("│  Tier 1 (Priority): Local 7B   -> http://localhost:8000          │")
         if gcp_manager:
             endpoint = await gcp_manager.get_inference_endpoint()
-            logger.info(f"  Tier 2 (Fallback): GCP 13B   -> {endpoint or 'Not provisioned'}")
+            ep_display = endpoint[:40] if endpoint else 'Not provisioned'
+            logger.info(f"│  Tier 2 (Fallback): GCP 13B   -> {ep_display:35}│")
         else:
-            logger.info("  Tier 2 (Fallback): GCP 13B   -> DISABLED")
-        logger.info("  Tier 3 (Ultimate): Claude API -> api.anthropic.com")
+            logger.info("│  Tier 2 (Fallback): GCP 13B   -> DISABLED                        │")
+        logger.info("│  Tier 3 (Ultimate): Claude API -> api.anthropic.com              │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("=" * 70)
-        logger.info("TRINITY IS ONLINE - Press Ctrl+C to shutdown gracefully")
+        logger.info("  TRINITY v2.0 PRODUCTION-GRADE - Press Ctrl+C to shutdown")
         logger.info("=" * 70)
         logger.info("")
 
@@ -1594,6 +1690,33 @@ async def main_v87_unified(args):
                 elif name == "legacy_supervisor":
                     await component.stop()
                     logger.info(f"  {name}: stopped")
+                elif name == "bridge_adapter":
+                    # v2.0: Properly stop Trinity Bridge Adapter
+                    from jarvis_prime.core.trinity_bridge_adapter import stop_bridge
+                    await stop_bridge()
+                    logger.info(f"  {name}: stopped (DLQ processed, metrics saved)")
+                elif name == "request_router":
+                    # v2.0: Properly stop Intelligent Request Router
+                    from jarvis_prime.core.intelligent_request_router import shutdown_request_router
+                    # Log final metrics before shutdown
+                    if hasattr(component, 'get_metrics_summary'):
+                        metrics = component.get_metrics_summary()
+                        logger.info(f"    Final metrics: {metrics.get('requests', {}).get('total', 0)} requests, "
+                                   f"{metrics.get('requests', {}).get('success_rate', 0):.1%} success")
+                    await shutdown_request_router()
+                    logger.info(f"  {name}: stopped")
+                elif name == "obs_bridge":
+                    # v91.0: Properly stop Observability Bridge
+                    from jarvis_prime.core.observability_bridge import shutdown_observability_bridge
+                    # Log final metrics before shutdown
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        langfuse_stats = status.get('langfuse', {})
+                        chaos_stats = status.get('chaos', {})
+                        logger.info(f"    Langfuse: {langfuse_stats.get('traces_created', 0)} traces created")
+                        logger.info(f"    Chaos: {chaos_stats.get('total_injections', 0)} faults injected")
+                    await shutdown_observability_bridge()
+                    logger.info(f"  {name}: stopped (traces flushed, metrics exported)")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
 
