@@ -289,6 +289,50 @@ from jarvis_prime.core.graph_routing import (
     get_graph_router,
 )
 
+# Intelligent Model Router v1.0 - The Brain Router
+from jarvis_prime.core.intelligent_model_router import (
+    IntelligentModelRouter,
+    ModelTier,
+    RoutingStrategy,
+    ModelEndpointConfig,
+    RoutingConfig,
+    RoutingResult,
+    ResourceSnapshot,
+    ComplexityAnalyzer,
+    AdaptiveThresholdManager,
+    get_intelligent_router,
+    shutdown_intelligent_router,
+)
+
+# GCP VM Manager v1.0 - Cloud Infrastructure
+from jarvis_prime.core.gcp_vm_manager import (
+    GCPVMManager,
+    VMConfig,
+    VMInstance,
+    VMState,
+    AutoScaleConfig,
+    CostConfig,
+    PreemptionConfig,
+    GCPManagerConfig,
+    PreemptionHandler,
+    CostTracker,
+    get_gcp_manager,
+    shutdown_gcp_manager,
+)
+
+# Service Mesh v1.0 - Dynamic Service Discovery
+from jarvis_prime.core.service_mesh import (
+    ServiceMesh,
+    ServiceEndpoint,
+    ServiceStatus,
+    ServiceMeshConfig,
+    LoadBalancingStrategy,
+    CircuitState,
+    ServiceMeshClient,
+    get_service_mesh,
+    shutdown_service_mesh,
+)
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -509,4 +553,39 @@ __all__ = [
     "EdgeType",
     "RoutingObjective",
     "get_graph_router",
+    # Intelligent Model Router v1.0
+    "IntelligentModelRouter",
+    "ModelTier",
+    "RoutingStrategy",
+    "ModelEndpointConfig",
+    "RoutingConfig",
+    "RoutingResult",
+    "ResourceSnapshot",
+    "ComplexityAnalyzer",
+    "AdaptiveThresholdManager",
+    "get_intelligent_router",
+    "shutdown_intelligent_router",
+    # GCP VM Manager v1.0
+    "GCPVMManager",
+    "VMConfig",
+    "VMInstance",
+    "VMState",
+    "AutoScaleConfig",
+    "CostConfig",
+    "PreemptionConfig",
+    "GCPManagerConfig",
+    "PreemptionHandler",
+    "CostTracker",
+    "get_gcp_manager",
+    "shutdown_gcp_manager",
+    # Service Mesh v1.0
+    "ServiceMesh",
+    "ServiceEndpoint",
+    "ServiceStatus",
+    "ServiceMeshConfig",
+    "LoadBalancingStrategy",
+    "CircuitState",
+    "ServiceMeshClient",
+    "get_service_mesh",
+    "shutdown_service_mesh",
 ]

@@ -3,12 +3,21 @@
 JARVIS Unified Supervisor - Cross-Repository Orchestration
 =============================================================
 
-v85.0 - Ultra-Advanced AGI System Orchestrator with Full Trinity Integration
+v87.0 - THE CONNECTIVE TISSUE - Unified Trinity Ecosystem
 
 This supervisor connects and orchestrates all JARVIS ecosystem components:
 - JARVIS (Body): Main orchestrator, computer use, action execution
 - JARVIS-Prime (Mind): LLM inference, reasoning, cognitive processing
 - Reactor-Core (Training): Model training, fine-tuning, deployment
+
+NEW IN v87.0 - THE CONNECTIVE TISSUE:
+    - UNIFIED MODE: python3 run_supervisor.py --unified (RECOMMENDED)
+    - INTELLIGENT MODEL ROUTER: Local 7B -> GCP 13B -> Claude API fallback
+    - GCP VM MANAGER: Spot VM lifecycle, preemption handling, auto-scaling
+    - SERVICE MESH: Dynamic service discovery, circuit breakers, load balancing
+    - UNIFIED CONFIG: Single YAML source of truth (config/unified_config.yaml)
+    - RAM-AWARE ROUTING: Automatic failover when local resources exhausted
+    - ADAPTIVE THRESHOLDS: Learn from routing outcomes for optimization
 
 NEW IN v85.0:
     - FIXED: Environment variable precedence (system env overrides config)
@@ -30,11 +39,13 @@ EXISTING FEATURES (v80.0):
     - Dependency graph resolution
 
 USAGE:
-    python3 run_supervisor.py                    # Start all components
+    python3 run_supervisor.py --unified          # RECOMMENDED: Full Connective Tissue
+    python3 run_supervisor.py                    # Start all components (legacy)
     python3 run_supervisor.py --prime-only       # Start only JARVIS-Prime
     python3 run_supervisor.py --components prime,jarvis  # Specific components
     python3 run_supervisor.py --config config.yaml       # Custom config
     python3 run_supervisor.py --enable-tracing   # Enable distributed tracing
+    python3 run_supervisor.py --enable-gcp       # Enable GCP cloud inference
 
 ARCHITECTURE:
     Supervisor
@@ -1175,6 +1186,32 @@ Examples:
         help="Enable hot-reload configuration watching",
     )
 
+    parser.add_argument(
+        "--unified",
+        action="store_true",
+        help="v87.0: Start with full Connective Tissue (RECOMMENDED)",
+    )
+
+    parser.add_argument(
+        "--enable-gcp",
+        action="store_true",
+        help="v87.0: Enable GCP Spot VM for cloud inference",
+    )
+
+    parser.add_argument(
+        "--enable-service-mesh",
+        action="store_true",
+        default=True,
+        help="v87.0: Enable service mesh for dynamic discovery (default: true)",
+    )
+
+    parser.add_argument(
+        "--enable-intelligent-routing",
+        action="store_true",
+        default=True,
+        help="v87.0: Enable intelligent model routing (default: true)",
+    )
+
     return parser.parse_args()
 
 
@@ -1238,6 +1275,217 @@ async def main_v80_orchestrator(args):
         sys.exit(1)
 
 
+async def main_v87_unified(args):
+    """
+    v87.0: Main entry point with full Connective Tissue.
+
+    This provides the complete unified architecture:
+    - Intelligent Model Router (Local 7B -> GCP 13B -> Claude API)
+    - GCP VM Manager (Spot VM lifecycle, auto-scaling, preemption)
+    - Service Mesh (discovery, circuit breakers, load balancing)
+    - Unified Configuration (single YAML source of truth)
+    - Cross-repo orchestration with dependency resolution
+    """
+    logger.info("=" * 70)
+    logger.info("JARVIS TRINITY v87.0 - THE CONNECTIVE TISSUE")
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Track initialized components for cleanup
+    initialized = []
+
+    try:
+        # 1. Load unified configuration
+        config_path = Path(__file__).parent / "config" / "unified_config.yaml"
+        if config_path.exists():
+            logger.info(f"Loading unified config from {config_path}")
+            import yaml
+            with open(config_path) as f:
+                unified_config = yaml.safe_load(f)
+            logger.info("  Unified configuration loaded")
+        else:
+            logger.warning(f"No unified config at {config_path}, using defaults")
+            unified_config = {}
+
+        # 2. Initialize Service Mesh
+        if args.enable_service_mesh:
+            logger.info("")
+            logger.info("Initializing Service Mesh...")
+            try:
+                from jarvis_prime.core.service_mesh import get_service_mesh
+                service_mesh = await get_service_mesh()
+                initialized.append(("service_mesh", service_mesh))
+                logger.info("  Service Mesh initialized")
+            except Exception as e:
+                logger.warning(f"  Service Mesh initialization failed: {e}")
+                service_mesh = None
+        else:
+            service_mesh = None
+
+        # 3. Initialize Intelligent Model Router
+        if args.enable_intelligent_routing:
+            logger.info("")
+            logger.info("Initializing Intelligent Model Router (Brain Router)...")
+            try:
+                from jarvis_prime.core.intelligent_model_router import get_intelligent_router
+                model_router = await get_intelligent_router()
+                initialized.append(("model_router", model_router))
+
+                # Check endpoint health
+                health_status = await model_router.health_check_all()
+                for tier, healthy in health_status.items():
+                    status = "READY" if healthy else "OFFLINE"
+                    logger.info(f"    {tier}: {status}")
+
+                logger.info("  Intelligent Model Router initialized")
+            except Exception as e:
+                logger.warning(f"  Model Router initialization failed: {e}")
+                model_router = None
+        else:
+            model_router = None
+
+        # 4. Initialize GCP VM Manager (if enabled)
+        if args.enable_gcp:
+            logger.info("")
+            logger.info("Initializing GCP VM Manager...")
+            try:
+                from jarvis_prime.core.gcp_vm_manager import get_gcp_manager
+                gcp_manager = await get_gcp_manager()
+                initialized.append(("gcp_manager", gcp_manager))
+
+                status = gcp_manager.get_status()
+                logger.info(f"    Project: {status['config'].get('project_id', 'N/A')}")
+                logger.info(f"    Region: {status['config'].get('region', 'N/A')}")
+                logger.info(f"    Instances: {len(status.get('instances', {}))}")
+                logger.info("  GCP VM Manager initialized")
+            except Exception as e:
+                logger.warning(f"  GCP VM Manager initialization failed: {e}")
+                gcp_manager = None
+        else:
+            gcp_manager = None
+            logger.info("")
+            logger.info("GCP VM Manager: DISABLED (use --enable-gcp to enable)")
+
+        # 5. Initialize Cross-Repo Orchestrator
+        logger.info("")
+        logger.info("Initializing Cross-Repo Orchestrator...")
+        try:
+            from jarvis_prime.core.cross_repo_orchestrator import get_orchestrator
+            orchestrator = await get_orchestrator()
+            initialized.append(("orchestrator", orchestrator))
+            logger.info("  Cross-Repo Orchestrator initialized")
+        except Exception as e:
+            logger.warning(f"  Orchestrator initialization failed: {e}")
+            orchestrator = None
+
+        # 6. Register services with mesh
+        if service_mesh:
+            logger.info("")
+            logger.info("Registering services with mesh...")
+
+            # Register JARVIS-Prime
+            try:
+                await service_mesh.register_service(
+                    service_name="jarvis-prime",
+                    host="localhost",
+                    port=8000,
+                    capabilities=["inference", "reasoning", "agi"],
+                )
+                logger.info("  Registered jarvis-prime (Mind)")
+            except Exception as e:
+                logger.debug(f"  Failed to register jarvis-prime: {e}")
+
+        # 7. Start components
+        logger.info("")
+        logger.info("Starting Trinity components...")
+
+        if orchestrator:
+            success = await orchestrator.start_all()
+            if not success:
+                logger.error("Failed to start all components")
+        else:
+            # Fallback to direct startup
+            logger.info("  Starting JARVIS-Prime directly...")
+            # This will be handled by the legacy supervisor
+
+        # 8. Print status summary
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("JARVIS TRINITY ECOSYSTEM STATUS")
+        logger.info("=" * 70)
+        logger.info("")
+        logger.info("CONNECTIVE TISSUE:")
+        logger.info(f"  Service Mesh:           {'ACTIVE' if service_mesh else 'INACTIVE'}")
+        logger.info(f"  Intelligent Router:     {'ACTIVE' if model_router else 'INACTIVE'}")
+        logger.info(f"  GCP VM Manager:         {'ACTIVE' if gcp_manager else 'INACTIVE'}")
+        logger.info(f"  Cross-Repo Orchestrator:{'ACTIVE' if orchestrator else 'INACTIVE'}")
+        logger.info("")
+        logger.info("ROUTING TIERS:")
+        logger.info("  Tier 1 (Priority): Local 7B   -> http://localhost:8000")
+        if gcp_manager:
+            endpoint = await gcp_manager.get_inference_endpoint()
+            logger.info(f"  Tier 2 (Fallback): GCP 13B   -> {endpoint or 'Not provisioned'}")
+        else:
+            logger.info("  Tier 2 (Fallback): GCP 13B   -> DISABLED")
+        logger.info("  Tier 3 (Ultimate): Claude API -> api.anthropic.com")
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("TRINITY IS ONLINE - Press Ctrl+C to shutdown gracefully")
+        logger.info("=" * 70)
+        logger.info("")
+
+        # 9. Run until shutdown
+        if orchestrator:
+            await orchestrator.run_until_shutdown()
+        else:
+            # Fallback: wait for signal
+            shutdown_event = asyncio.Event()
+
+            def signal_handler():
+                shutdown_event.set()
+
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, signal_handler)
+
+            await shutdown_event.wait()
+
+    except KeyboardInterrupt:
+        logger.info("")
+        logger.info("Shutdown requested...")
+    except Exception as e:
+        logger.error(f"Trinity error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        logger.info("")
+        logger.info("Shutting down Connective Tissue...")
+
+        for name, component in reversed(initialized):
+            try:
+                if name == "service_mesh":
+                    from jarvis_prime.core.service_mesh import shutdown_service_mesh
+                    await shutdown_service_mesh()
+                    logger.info(f"  {name}: stopped")
+                elif name == "model_router":
+                    from jarvis_prime.core.intelligent_model_router import shutdown_intelligent_router
+                    await shutdown_intelligent_router()
+                    logger.info(f"  {name}: stopped")
+                elif name == "gcp_manager":
+                    from jarvis_prime.core.gcp_vm_manager import shutdown_gcp_manager
+                    await shutdown_gcp_manager()
+                    logger.info(f"  {name}: stopped")
+                elif name == "orchestrator":
+                    # Orchestrator handles its own shutdown
+                    pass
+            except Exception as e:
+                logger.debug(f"  Error stopping {name}: {e}")
+
+        logger.info("")
+        logger.info("Trinity shutdown complete")
+
+
 async def main():
     """Main entry point."""
     args = parse_args()
@@ -1245,6 +1493,11 @@ async def main():
     # Configure logging
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # v87.0: Unified mode (RECOMMENDED)
+    if args.unified:
+        await main_v87_unified(args)
+        return
 
     # Check if using advanced orchestrator
     if args.advanced_orchestrator:

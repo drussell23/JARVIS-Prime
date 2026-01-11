@@ -1,0 +1,545 @@
+# =============================================================================
+# UNIFIED TRINITY CONFIGURATION v1.0
+# =============================================================================
+# Single Source of Truth for JARVIS, JARVIS-Prime, and Reactor-Core
+#
+# This configuration is dynamically loaded and supports hot-reload.
+# All values can be overridden via environment variables using the pattern:
+#   TRINITY_<SECTION>_<KEY> (e.g., TRINITY_JARVIS_PRIME_PORT=8001)
+#
+# The system reads configuration in this priority order:
+#   1. Environment variables (highest priority)
+#   2. This YAML file
+#   3. Hardcoded defaults (lowest priority)
+# =============================================================================
+
+version: "1.0"
+last_updated: "2026-01-11"
+
+# =============================================================================
+# TRINITY ECOSYSTEM COMPONENTS
+# =============================================================================
+
+components:
+  jarvis:
+    name: "JARVIS-AI-Agent"
+    type: "body"
+    description: "Main orchestrator - Computer use, action execution, window management"
+    enabled: true
+    port: 8080
+    health_endpoint: "/health"
+    metrics_endpoint: "/metrics"
+    startup_timeout_seconds: 60
+    shutdown_timeout_seconds: 30
+    auto_restart: true
+    max_restarts: 5
+    restart_delay_seconds: 5.0
+    entry_point: "run_jarvis.py"
+    # Path resolution (tried in order)
+    path_candidates:
+      - "${JARVIS_AI_AGENT_PATH}"
+      - "${JARVIS_BASE_DIR}/JARVIS-AI-Agent"
+      - "${JARVIS_BASE_DIR}/jarvis-ai-agent"
+      - "../JARVIS-AI-Agent"
+      - "../JARVIS"
+    dependencies: []
+
+  jarvis_prime:
+    name: "JARVIS-Prime"
+    type: "mind"
+    description: "Cognitive engine - LLM inference, reasoning, AGI models"
+    enabled: true
+    port: 8000
+    health_endpoint: "/health"
+    metrics_endpoint: "/metrics"
+    startup_timeout_seconds: 120  # Model loading takes time
+    shutdown_timeout_seconds: 30
+    auto_restart: true
+    max_restarts: 3
+    restart_delay_seconds: 10.0
+    entry_point: "run_server.py"
+    path_candidates:
+      - "${JARVIS_PRIME_PATH}"
+      - "."  # Current directory
+    dependencies: []
+
+  reactor_core:
+    name: "Reactor-Core"
+    type: "soul"
+    description: "Training pipeline - Model training, fine-tuning, deployment"
+    enabled: false  # Disabled by default - training on demand
+    port: 8090
+    health_endpoint: "/health"
+    metrics_endpoint: "/metrics"
+    startup_timeout_seconds: 60
+    shutdown_timeout_seconds: 60  # Training cleanup takes time
+    auto_restart: false  # Don't auto-restart training
+    max_restarts: 1
+    restart_delay_seconds: 30.0
+    entry_point: "run_reactor.py"
+    path_candidates:
+      - "${REACTOR_CORE_PATH}"
+      - "${JARVIS_BASE_DIR}/Reactor-Core"
+      - "${JARVIS_BASE_DIR}/reactor-core"
+      - "../Reactor-Core"
+    dependencies:
+      - "jarvis_prime"
+
+# =============================================================================
+# MODEL ROUTING CONFIGURATION
+# =============================================================================
+
+model_routing:
+  # Tier definitions
+  tiers:
+    local_7b:
+      name: "Local 7B Quantized"
+      description: "Fast local inference on M1/M2/M3 Mac"
+      priority: 1  # Highest priority (try first)
+      endpoint: "http://localhost:8000"
+      model_type: "llama_cpp"
+      model_path: "${MODEL_PATH:-~/.jarvis/prime/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf}"
+      capabilities:
+        - chat
+        - summarize
+        - format
+        - code_simple
+        - creative
+      max_context_tokens: 4096
+      max_output_tokens: 2048
+      tokens_per_second: 15  # Approximate for M1
+      cost_per_1k_tokens: 0.0  # Local = free
+      memory_required_mb: 6144  # ~6GB for 7B Q4
+      gpu_layers: -1  # All layers on GPU (Metal)
+
+    gcp_13b:
+      name: "GCP 13B Reasoning"
+      description: "Cloud inference for complex reasoning"
+      priority: 2
+      endpoint: "${GCP_PRIME_URL:-http://localhost:8001}"
+      model_type: "llama_cpp"
+      model_path: "meta-llama/Llama-2-13b-chat-hf"
+      capabilities:
+        - chat
+        - summarize
+        - format
+        - code_simple
+        - code_complex
+        - creative
+        - analyze
+        - reason
+      max_context_tokens: 4096
+      max_output_tokens: 2048
+      tokens_per_second: 25  # Approximate for A100
+      cost_per_1k_tokens: 0.002  # GCP Spot pricing estimate
+      memory_required_mb: 26624  # ~26GB for 13B
+      gpu_layers: -1
+
+    claude_api:
+      name: "Claude API"
+      description: "Anthropic Claude for specialized tasks"
+      priority: 3  # Fallback
+      endpoint: "https://api.anthropic.com/v1"
+      model_type: "anthropic"
+      model_id: "${CLAUDE_MODEL:-claude-3-5-sonnet-20241022}"
+      capabilities:
+        - chat
+        - summarize
+        - format
+        - code_simple
+        - code_complex
+        - creative
+        - analyze
+        - reason
+        - multimodal
+        - search
+      max_context_tokens: 200000
+      max_output_tokens: 8192
+      tokens_per_second: 50
+      cost_per_1k_tokens: 0.003  # Input tokens
+      cost_per_1k_output_tokens: 0.015  # Output tokens
+
+  # Routing rules
+  routing_rules:
+    # Complexity thresholds (0.0 - 1.0)
+    complexity_thresholds:
+      tier_0_max: 0.40  # Below this → definitely local
+      tier_1_min: 0.65  # Above this → cloud/API
+      tier_2_min: 0.85  # Above this → Claude API required
+
+    # Task type → preferred tier mapping
+    task_type_routing:
+      chat: "local_7b"
+      summarize: "local_7b"
+      format: "local_7b"
+      code_simple: "local_7b"
+      code_complex: "gcp_13b"
+      creative: "local_7b"
+      analyze: "gcp_13b"
+      reason: "gcp_13b"
+      multimodal: "claude_api"
+      search: "claude_api"
+
+    # Fallback chain (in order)
+    fallback_chain:
+      - "local_7b"
+      - "gcp_13b"
+      - "claude_api"
+
+    # Resource-based routing
+    resource_thresholds:
+      # If RAM usage exceeds these thresholds, skip the tier
+      local_max_ram_percent: 85  # Skip local if RAM > 85%
+      local_max_ram_mb: 14336    # Skip local if RAM > 14GB used
+
+      # Latency thresholds for tier selection
+      max_local_latency_ms: 30000  # 30 seconds
+      max_gcp_latency_ms: 60000    # 60 seconds
+      max_api_latency_ms: 120000   # 2 minutes
+
+    # Token count routing
+    token_routing:
+      local_max_tokens: 2000      # Route long prompts to cloud
+      gcp_max_tokens: 8000        # Route very long prompts to Claude
+
+    # Adaptive learning
+    adaptive:
+      enabled: true
+      learning_rate: 0.05
+      min_samples_for_adjustment: 10
+      success_rate_threshold: 0.7
+
+# =============================================================================
+# GCP INFRASTRUCTURE
+# =============================================================================
+
+gcp:
+  enabled: "${GCP_ENABLED:-false}"
+
+  project_id: "${GCP_PROJECT_ID}"
+  region: "${GCP_REGION:-us-central1}"
+  zone: "${GCP_ZONE:-us-central1-a}"
+
+  spot_vm:
+    enabled: true
+    machine_type: "n1-standard-8"  # 8 vCPU, 30GB RAM
+    gpu_type: "nvidia-tesla-t4"    # or nvidia-tesla-a100
+    gpu_count: 1
+    disk_size_gb: 100
+    disk_type: "pd-ssd"
+
+    # Preemption handling
+    preemption:
+      check_interval_seconds: 60
+      signal_file: "/tmp/preemption_signal"
+      checkpoint_on_preemption: true
+      auto_migrate: true
+
+    # Auto-scaling
+    auto_scaling:
+      enabled: true
+      min_instances: 0
+      max_instances: 2
+      scale_up_threshold_percent: 80
+      scale_down_threshold_percent: 20
+      cooldown_seconds: 300
+
+    # Cost limits
+    cost_limits:
+      max_hourly_spend: 5.0
+      max_daily_spend: 50.0
+      alert_threshold_percent: 80
+
+  # Service account
+  service_account: "${GCP_SERVICE_ACCOUNT}"
+  credentials_path: "${GOOGLE_APPLICATION_CREDENTIALS:-~/.gcp/credentials.json}"
+
+# =============================================================================
+# CLAUDE API CONFIGURATION
+# =============================================================================
+
+claude_api:
+  enabled: "${CLAUDE_API_ENABLED:-true}"
+  api_key: "${ANTHROPIC_API_KEY}"
+  base_url: "https://api.anthropic.com/v1"
+
+  # Model selection
+  default_model: "claude-3-5-sonnet-20241022"
+  fallback_model: "claude-3-haiku-20240307"
+
+  # Rate limiting
+  rate_limits:
+    requests_per_minute: 50
+    tokens_per_minute: 100000
+    concurrent_requests: 10
+
+  # Retry configuration
+  retry:
+    max_retries: 3
+    initial_backoff_seconds: 1.0
+    max_backoff_seconds: 30.0
+    exponential_base: 2.0
+    jitter_factor: 0.1
+
+  # Cost tracking
+  cost_tracking:
+    enabled: true
+    alert_daily_threshold: 10.0
+    alert_monthly_threshold: 200.0
+
+# =============================================================================
+# SERVICE MESH & DISCOVERY
+# =============================================================================
+
+service_mesh:
+  enabled: true
+
+  # Service registry
+  registry:
+    type: "file"  # file, consul, etcd, kubernetes
+    file_path: "${HOME}/.jarvis/trinity/service_registry.json"
+    refresh_interval_seconds: 5
+    stale_threshold_seconds: 30
+
+  # Health checking
+  health:
+    check_interval_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 3
+    success_threshold: 2
+
+  # Circuit breaker
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    success_threshold: 2
+    timeout_seconds: 30
+    half_open_max_calls: 3
+
+  # Load balancing
+  load_balancing:
+    strategy: "round_robin"  # round_robin, least_connections, random, weighted
+    sticky_sessions: false
+    health_check_filter: true
+
+  # Connection pooling
+  connection_pool:
+    enabled: true
+    max_connections_per_host: 10
+    max_keepalive_connections: 5
+    keepalive_expiry_seconds: 300
+    connection_timeout_seconds: 5
+    read_timeout_seconds: 60
+
+# =============================================================================
+# TRINITY PROTOCOL (CROSS-REPO IPC)
+# =============================================================================
+
+trinity_protocol:
+  enabled: true
+
+  # IPC directory
+  ipc_dir: "${HOME}/.jarvis/trinity"
+
+  # Transport layer
+  transport:
+    primary: "file"  # file, websocket, grpc
+    fallback: "http"
+
+    file:
+      heartbeat_interval_seconds: 5
+      stale_threshold_seconds: 30
+      atomic_writes: true
+
+    websocket:
+      port: 9000
+      ping_interval_seconds: 30
+      reconnect_interval_seconds: 5
+      max_reconnect_attempts: 10
+
+    http:
+      timeout_seconds: 30
+      keepalive: true
+
+  # Message handling
+  messaging:
+    max_message_size_bytes: 1048576  # 1MB
+    compression: "gzip"
+    encryption: false  # Enable for production
+
+  # Guaranteed delivery
+  delivery:
+    enabled: true
+    ack_timeout_seconds: 5
+    max_retries: 10
+    retry_delay_seconds: 1.0
+    persistence: true
+    dead_letter_threshold: 10
+
+# =============================================================================
+# RELIABILITY & RESILIENCE
+# =============================================================================
+
+reliability:
+  # SQLite retry engine
+  sqlite:
+    max_retries: 5
+    initial_backoff_seconds: 0.05
+    max_backoff_seconds: 5.0
+    exponential_base: 2.0
+    jitter_factor: 0.1
+    enable_wal: true
+    pool_size: 5
+    query_timeout_seconds: 30
+
+  # OOM protection
+  oom_protection:
+    enabled: true
+    memory_threshold_percent: 95  # Emergency
+    warning_threshold_percent: 85
+    gc_threshold_percent: 80
+    check_interval_seconds: 5
+    enable_aggressive_gc: true
+    load_shed_cooldown_seconds: 30
+
+  # Rate limiting
+  rate_limiting:
+    enabled: true
+    default_requests_per_second: 100
+    burst_size: 20
+    adaptive: true
+
+# =============================================================================
+# OBSERVABILITY
+# =============================================================================
+
+observability:
+  # Logging
+  logging:
+    level: "${LOG_LEVEL:-INFO}"
+    format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    date_format: "%H:%M:%S"
+    structured: true
+    log_dir: "${HOME}/.jarvis/logs"
+    max_file_size_mb: 100
+    backup_count: 5
+
+  # Metrics
+  metrics:
+    enabled: true
+    export_interval_seconds: 15
+    export_path: "${HOME}/.jarvis/metrics"
+    prometheus_port: 9090
+
+  # Distributed tracing
+  tracing:
+    enabled: "${TRACING_ENABLED:-false}"
+    exporter: "otlp"  # otlp, jaeger, zipkin
+    endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+    sample_rate: 0.1
+
+  # Health dashboard
+  dashboard:
+    enabled: true
+    port: 8888
+    refresh_interval_seconds: 5
+
+# =============================================================================
+# SECURITY
+# =============================================================================
+
+security:
+  # Kill switch
+  kill_switch:
+    enabled: true
+    state_file: "${HOME}/.jarvis/cross_repo/kill_switch_state.json"
+
+  # Action safety
+  action_safety:
+    enabled: true
+    confirmation_required_for:
+      - "delete"
+      - "remove"
+      - "execute"
+      - "install"
+      - "uninstall"
+    risk_levels:
+      low: 0.3
+      medium: 0.6
+      high: 0.8
+      critical: 0.95
+
+  # API keys
+  api_keys:
+    rotation_interval_days: 90
+    encryption: true
+
+# =============================================================================
+# STARTUP CONFIGURATION
+# =============================================================================
+
+startup:
+  # Startup order (respects dependencies)
+  order:
+    - "jarvis_prime"
+    - "jarvis"
+    - "reactor_core"
+
+  # Parallel startup for independent components
+  parallel_startup: false
+
+  # Verification after startup
+  verification:
+    enabled: true
+    process_check: true
+    health_check: true
+    functional_check: true
+    timeout_seconds: 120
+
+  # Pre-flight checks
+  preflight:
+    check_disk_space: true
+    min_disk_space_gb: 10
+    check_memory: true
+    min_memory_mb: 4096
+    check_gpu: true
+    check_network: true
+    check_dependencies: true
+
+# =============================================================================
+# SHUTDOWN CONFIGURATION
+# =============================================================================
+
+shutdown:
+  # Graceful shutdown
+  graceful: true
+  timeout_seconds: 30
+
+  # Shutdown order (reverse of startup)
+  order:
+    - "reactor_core"
+    - "jarvis"
+    - "jarvis_prime"
+
+  # Cleanup
+  cleanup:
+    clear_temp_files: true
+    persist_state: true
+    notify_components: true
+
+# =============================================================================
+# DEVELOPMENT & DEBUGGING
+# =============================================================================
+
+development:
+  debug_mode: "${DEBUG:-false}"
+  hot_reload: "${ENABLE_HOT_RELOAD:-true}"
+  mock_gcp: "${MOCK_GCP:-true}"
+  mock_claude: "${MOCK_CLAUDE:-false}"
+  profile_enabled: "${PROFILE:-false}"
+
+  # Test endpoints
+  test_endpoints:
+    echo: "/test/echo"
+    health: "/test/health"
+    metrics: "/test/metrics"
