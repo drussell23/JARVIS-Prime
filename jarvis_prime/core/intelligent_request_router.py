@@ -527,7 +527,7 @@ class EndpointManager:
         if ADVANCED_PRIMITIVES_AVAILABLE:
             self._rate_limiters[config.endpoint_id] = TokenBucketRateLimiter(
                 rate=config.rate_limit_rpm / 60.0,  # Convert RPM to RPS
-                capacity=config.rate_limit_rpm,
+                burst=config.rate_limit_rpm,  # Burst capacity = RPM
             )
 
         logger.debug(f"Registered endpoint: {config.name}")

@@ -1425,6 +1425,40 @@ async def main_v87_unified(args):
             logger.warning(f"  Trinity Orchestrator initialization failed: {e}")
             orchestrator = None
 
+        # 5.5. Initialize Trinity Bridge Adapter (v89.0 - The Loop Connector)
+        logger.info("")
+        logger.info("Initializing Trinity Bridge Adapter (The Loop)...")
+        bridge_adapter = None
+        try:
+            from jarvis_prime.core.trinity_bridge_adapter import start_bridge
+            bridge_adapter = await start_bridge()
+            initialized.append(("bridge_adapter", bridge_adapter))
+            logger.info("  Trinity Bridge Adapter initialized")
+            logger.info("    - Watching: ~/.jarvis/reactor/events")
+            logger.info("    - Watching: ~/.jarvis/cross_repo")
+            logger.info("    - The Loop is now connected!")
+        except ImportError:
+            logger.warning("  Trinity Bridge Adapter not available")
+        except Exception as e:
+            logger.warning(f"  Trinity Bridge Adapter failed: {e}")
+
+        # 5.6. Initialize Intelligent Request Router (v89.0)
+        logger.info("")
+        logger.info("Initializing Intelligent Request Router...")
+        request_router = None
+        try:
+            from jarvis_prime.core.intelligent_request_router import get_request_router
+            request_router = await get_request_router()
+            initialized.append(("request_router", request_router))
+            status = request_router.get_status()
+            logger.info("  Intelligent Request Router initialized")
+            logger.info(f"    - Endpoints registered: {len(status.get('endpoints', []))}")
+            logger.info(f"    - Healthy endpoints: {status.get('healthy_endpoints', 0)}")
+        except ImportError:
+            logger.warning("  Intelligent Request Router not available")
+        except Exception as e:
+            logger.warning(f"  Intelligent Request Router failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1470,9 +1504,13 @@ async def main_v87_unified(args):
         logger.info("")
         logger.info("CONNECTIVE TISSUE:")
         logger.info(f"  Service Mesh:           {'ACTIVE' if service_mesh else 'INACTIVE'}")
-        logger.info(f"  Intelligent Router:     {'ACTIVE' if model_router else 'INACTIVE'}")
+        logger.info(f"  Model Router:           {'ACTIVE' if model_router else 'INACTIVE'}")
         logger.info(f"  GCP VM Manager:         {'ACTIVE' if gcp_manager else 'INACTIVE'}")
         logger.info(f"  Cross-Repo Orchestrator:{'ACTIVE' if orchestrator else 'INACTIVE'}")
+        logger.info("")
+        logger.info("THE LOOP (v89.0):")
+        logger.info(f"  Trinity Bridge Adapter: {'ACTIVE' if bridge_adapter else 'INACTIVE'}")
+        logger.info(f"  Request Router:         {'ACTIVE' if request_router else 'INACTIVE'}")
         logger.info("")
         logger.info("ROUTING TIERS:")
         logger.info("  Tier 1 (Priority): Local 7B   -> http://localhost:8000")

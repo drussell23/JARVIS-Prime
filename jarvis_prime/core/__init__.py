@@ -436,6 +436,20 @@ try:
 except ImportError:
     INTELLIGENT_REQUEST_ROUTER_AVAILABLE = False
 
+# Trinity Bridge Adapter v89.0 - Unified Cross-Repo Event Bridge
+try:
+    from jarvis_prime.core.trinity_bridge_adapter import (
+        TrinityBridgeAdapter,
+        UnifiedEventType,
+        UnifiedEvent,
+        get_bridge_adapter,
+        start_bridge,
+        stop_bridge,
+    )
+    TRINITY_BRIDGE_ADAPTER_AVAILABLE = True
+except ImportError:
+    TRINITY_BRIDGE_ADAPTER_AVAILABLE = False
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -764,4 +778,12 @@ __all__ = [
     "shutdown_request_router",
     "route_request",
     "INTELLIGENT_REQUEST_ROUTER_AVAILABLE",
+    # Trinity Bridge Adapter v89.0
+    "TrinityBridgeAdapter",
+    "UnifiedEventType",
+    "UnifiedEvent",
+    "get_bridge_adapter",
+    "start_bridge",
+    "stop_bridge",
+    "TRINITY_BRIDGE_ADAPTER_AVAILABLE",
 ]
