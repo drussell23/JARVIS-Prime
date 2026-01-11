@@ -193,25 +193,63 @@ def read_json_safe(
 # This ensures consistency across all Trinity repos (JARVIS, Prime, Reactor Core).
 # =============================================================================
 
-# Try to import unified config, fall back to local env vars if not available
+# Try to import compatibility layer first
 try:
-    import sys
-    # Add JARVIS path to allow cross-repo imports
-    _jarvis_path = Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent"
-    if str(_jarvis_path) not in sys.path:
-        sys.path.insert(0, str(_jarvis_path))
-
-    from backend.core.trinity_config import (
-        get_config,
-        sleep_with_jitter,
-        get_retry_delay,
-        TrinityConfig,
+    from jarvis_prime.core.compat import (
+        resilient_import,
+        suppress_all_warnings,
     )
-    _UNIFIED_CONFIG = True
-    logger.debug("[Trinity] Using unified TrinityConfig")
+    COMPAT_AVAILABLE = True
 except ImportError:
-    _UNIFIED_CONFIG = False
-    logger.debug("[Trinity] Unified config not available, using local defaults")
+    COMPAT_AVAILABLE = False
+    from contextlib import contextmanager
+    @contextmanager
+    def resilient_import(name, critical=False):
+        try:
+            yield
+        except Exception:
+            pass
+    @contextmanager
+    def suppress_all_warnings():
+        yield
+
+# Try to import unified config, fall back to local env vars if not available
+# Use resilience for cross-repo imports that may trigger Python version issues
+_UNIFIED_CONFIG = False
+get_config = None
+sleep_with_jitter = None
+get_retry_delay = None
+TrinityConfig = None
+
+with resilient_import('backend.core.trinity_config'):
+    with suppress_all_warnings():
+        try:
+            import sys
+            import warnings
+            warnings.filterwarnings('ignore', category=DeprecationWarning)
+            warnings.filterwarnings('ignore', category=FutureWarning)
+
+            # Add JARVIS path to allow cross-repo imports
+            _jarvis_path = Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent"
+            if str(_jarvis_path) not in sys.path:
+                sys.path.insert(0, str(_jarvis_path))
+
+            from backend.core.trinity_config import (
+                get_config,
+                sleep_with_jitter,
+                get_retry_delay,
+                TrinityConfig,
+            )
+            _UNIFIED_CONFIG = True
+            logger.debug("[Trinity] Using unified TrinityConfig")
+        except (ImportError, AttributeError) as e:
+            logger.debug(f"[Trinity] Unified config not available: {e}")
+        except Exception as e:
+            # Catch Python version compatibility errors
+            logger.debug(f"[Trinity] Cross-repo import error (non-critical): {e}")
+
+if not _UNIFIED_CONFIG:
+    logger.debug("[Trinity] Using local defaults (cross-repo config unavailable)")
 
 
 def _get_trinity_config():

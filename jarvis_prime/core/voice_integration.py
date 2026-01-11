@@ -83,21 +83,52 @@ if JARVIS_BODY_PATH and Path(JARVIS_BODY_PATH).exists():
 # Trinity Voice Coordinator Import (with graceful fallback)
 # =============================================================================
 
+# Import compatibility layer for resilient cross-repo imports
+try:
+    from jarvis_prime.core.compat import (
+        resilient_import,
+        suppress_all_warnings,
+    )
+    _COMPAT_AVAILABLE = True
+except ImportError:
+    _COMPAT_AVAILABLE = False
+    from contextlib import contextmanager
+    @contextmanager
+    def resilient_import(name, critical=False):
+        try:
+            yield
+        except Exception:
+            pass
+    @contextmanager
+    def suppress_all_warnings():
+        yield
+
 _VOICE_AVAILABLE = False
 _VOICE_COORDINATOR = None
 
-try:
-    from backend.core.trinity_voice_coordinator import (
-        announce as trinity_announce,
-        get_voice_coordinator,
-        VoiceContext,
-        VoicePriority,
-    )
-    _VOICE_AVAILABLE = True
-    logger.info("✅ Trinity Voice Coordinator available for J-Prime announcements")
-except ImportError as e:
-    logger.debug(f"Trinity Voice Coordinator not available: {e}")
-    # Create dummy implementations for graceful degradation
+# Try cross-repo import with resilience (handles Python version issues)
+with resilient_import('backend.core.trinity_voice_coordinator'):
+    with suppress_all_warnings():
+        try:
+            import warnings
+            warnings.filterwarnings('ignore', category=DeprecationWarning)
+            warnings.filterwarnings('ignore', category=FutureWarning)
+
+            from backend.core.trinity_voice_coordinator import (
+                announce as trinity_announce,
+                get_voice_coordinator,
+                VoiceContext,
+                VoicePriority,
+            )
+            _VOICE_AVAILABLE = True
+            logger.info("Trinity Voice Coordinator available for J-Prime announcements")
+        except (ImportError, AttributeError) as e:
+            logger.debug(f"Trinity Voice Coordinator not available: {e}")
+        except Exception as e:
+            logger.debug(f"Voice coordinator import error (non-critical): {e}")
+
+# Create dummy implementations for graceful degradation (if import failed)
+if not _VOICE_AVAILABLE:
     class VoiceContext:
         STARTUP = "startup"
         TRINITY = "trinity"

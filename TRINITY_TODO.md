@@ -302,8 +302,13 @@ reactor-core/
   - Observability Bridge (`observability_bridge.py`)
   - Langfuse Integration for distributed tracing
   - Prometheus Metrics Export (OpenMetrics format)
+  - Prometheus HTTP endpoint at http://localhost:9091/metrics
   - Chaos Testing Framework (latency, errors, timeouts)
   - Adaptive Event Bus Polling
+  - Python Compatibility Layer (`compat.py`)
+    - Fixes Python 3.9 importlib.metadata issues
+    - Resilient cross-repo imports
+    - Warning suppression for clean startup
   - Integrated with run_supervisor.py
 - **v90.0** - PRODUCTION HARDENING
   - Event Delivery Guarantees (RetryEngine + DLQ)

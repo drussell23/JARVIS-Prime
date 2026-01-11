@@ -52,32 +52,76 @@ from typing import Any, Callable, Dict, Optional, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
-# Try to import OpenTelemetry (optional dependency)
+# Import compatibility layer
 try:
-    from opentelemetry import trace, metrics
-    from opentelemetry.trace import Status, StatusCode, SpanKind
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import (
-        BatchSpanProcessor,
-        ConsoleSpanExporter,
+    from jarvis_prime.core.compat import (
+        resilient_import,
+        suppress_warnings,
+        features,
     )
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import (
-        PeriodicExportingMetricReader,
-        ConsoleMetricExporter,
-    )
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-    from opentelemetry.propagate import extract, inject, set_global_textmap
-    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-
-    OTEL_AVAILABLE = True
+    COMPAT_AVAILABLE = True
 except ImportError:
-    OTEL_AVAILABLE = False
-    logger.warning(
-        "OpenTelemetry not available. Install with: "
-        "pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp"
+    COMPAT_AVAILABLE = False
+    from contextlib import contextmanager
+    @contextmanager
+    def resilient_import(name, critical=False):
+        try:
+            yield
+        except Exception:
+            pass
+    @contextmanager
+    def suppress_warnings(*cats):
+        yield
+
+# Try to import OpenTelemetry (optional dependency) with resilience
+OTEL_AVAILABLE = False
+trace = None
+metrics = None
+Status = None
+StatusCode = None
+SpanKind = None
+TracerProvider = None
+BatchSpanProcessor = None
+ConsoleSpanExporter = None
+Resource = None
+MeterProvider = None
+PeriodicExportingMetricReader = None
+ConsoleMetricExporter = None
+OTLPSpanExporter = None
+OTLPMetricExporter = None
+extract = None
+inject = None
+set_global_textmap = None
+TraceContextTextMapPropagator = None
+
+with resilient_import('opentelemetry'):
+    with suppress_warnings(DeprecationWarning, FutureWarning):
+        try:
+            from opentelemetry import trace, metrics
+            from opentelemetry.trace import Status, StatusCode, SpanKind
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import (
+                BatchSpanProcessor,
+                ConsoleSpanExporter,
+            )
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import (
+                PeriodicExportingMetricReader,
+                ConsoleMetricExporter,
+            )
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+            from opentelemetry.propagate import extract, inject, set_global_textmap
+            from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+            OTEL_AVAILABLE = True
+        except (ImportError, AttributeError) as e:
+            logger.debug(f"OpenTelemetry import failed: {e}")
+
+if not OTEL_AVAILABLE:
+    logger.info(
+        "OpenTelemetry not available - tracing disabled. "
+        "Install with: pip install opentelemetry-api opentelemetry-sdk"
     )
 
 # Type variables

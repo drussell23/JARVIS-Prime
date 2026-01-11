@@ -110,11 +110,33 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# =============================================================================
+# COMPATIBILITY LAYER - Import FIRST to patch Python 3.9 issues
+# =============================================================================
+# This MUST be imported before any Google Cloud or other libraries that use
+# importlib.metadata.packages_distributions() which doesn't exist in Python 3.9
+
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+try:
+    from jarvis_prime.core.compat import (
+        patch_google_api_core,
+        suppress_all_warnings,
+        quiet_import,
+        features,
+    )
+    # Patch is auto-applied on import, but ensure it's done
+    patch_google_api_core()
+except ImportError:
+    pass  # Compat not available, continue without it
 
 # Setup logging
 logging.basicConfig(
@@ -1311,7 +1333,7 @@ async def main_v80_orchestrator(args):
 
 async def main_v87_unified(args):
     """
-    v87.0: Main entry point with full Connective Tissue.
+    v91.0: Main entry point with full Connective Tissue + Observability.
 
     This provides the complete unified architecture:
     - Intelligent Model Router (Local 7B -> GCP 13B -> Claude API)
@@ -1319,9 +1341,21 @@ async def main_v87_unified(args):
     - Service Mesh (discovery, circuit breakers, load balancing)
     - Unified Configuration (single YAML source of truth)
     - Cross-repo orchestration with dependency resolution
+    - Observability Bridge (Langfuse, Prometheus, Chaos)
     """
+    # Import compatibility layer for resilient imports
+    import warnings
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
+    warnings.filterwarnings('ignore', category=FutureWarning)
+
+    try:
+        from jarvis_prime.core.compat import suppress_all_warnings, features
+        COMPAT_AVAILABLE = True
+    except ImportError:
+        COMPAT_AVAILABLE = False
+
     logger.info("=" * 70)
-    logger.info("JARVIS TRINITY v88.0 - THE CONNECTIVE TISSUE (Enhanced)")
+    logger.info("JARVIS TRINITY v91.0 - PRODUCTION OBSERVABILITY")
     logger.info("=" * 70)
     logger.info("")
 

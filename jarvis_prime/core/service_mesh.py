@@ -84,21 +84,60 @@ from weakref import WeakValueDictionary
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# TRY IMPORTS
+# TRY IMPORTS WITH RESILIENCE
 # =============================================================================
 
+# Import compatibility layer first
 try:
-    import aiohttp
-    AIOHTTP_AVAILABLE = True
+    from jarvis_prime.core.compat import (
+        resilient_import,
+        suppress_warnings,
+        suppress_all_warnings,
+        features,
+        async_defensive,
+    )
+    COMPAT_AVAILABLE = True
 except ImportError:
-    AIOHTTP_AVAILABLE = False
-    logger.warning("aiohttp not available - HTTP features disabled")
+    COMPAT_AVAILABLE = False
+    from contextlib import contextmanager
+    @contextmanager
+    def resilient_import(name, critical=False):
+        try:
+            yield
+        except Exception:
+            pass
+    @contextmanager
+    def suppress_warnings(*cats):
+        yield
+    suppress_all_warnings = suppress_warnings
+    def async_defensive(**kw):
+        def dec(f):
+            return f
+        return dec
 
-try:
-    import aiofiles
-    AIOFILES_AVAILABLE = True
-except ImportError:
-    AIOFILES_AVAILABLE = False
+# aiohttp with resilience
+AIOHTTP_AVAILABLE = False
+aiohttp = None
+with resilient_import('aiohttp'):
+    with suppress_all_warnings():
+        try:
+            import aiohttp
+            AIOHTTP_AVAILABLE = True
+        except Exception as e:
+            logger.debug(f"aiohttp import failed: {e}")
+
+if not AIOHTTP_AVAILABLE:
+    logger.info("aiohttp not available - HTTP features disabled")
+
+# aiofiles with resilience
+AIOFILES_AVAILABLE = False
+aiofiles = None
+with resilient_import('aiofiles'):
+    try:
+        import aiofiles
+        AIOFILES_AVAILABLE = True
+    except Exception as e:
+        logger.debug(f"aiofiles import failed: {e}")
 
 
 # =============================================================================
