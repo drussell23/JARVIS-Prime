@@ -1640,6 +1640,61 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  Continuous Learning Engine failed: {e}")
 
+        # 5.13. Initialize Model Evaluation System (v92.0 - Quality Assurance)
+        logger.info("")
+        logger.info("Initializing Model Evaluation System (Quality Assurance)...")
+        evaluation_system = None
+        try:
+            from jarvis_prime.core.model_evaluation import get_evaluation_orchestrator
+            evaluation_system = await get_evaluation_orchestrator()
+            initialized.append(("evaluation_system", evaluation_system))
+            status = evaluation_system.get_status()
+            logger.info("  Model Evaluation System initialized")
+            logger.info(f"    - Benchmark Suites: {len(status.get('available_suites', []))}")
+            logger.info(f"    - Available: {', '.join(status.get('available_suites', []))}")
+        except ImportError:
+            logger.warning("  Model Evaluation System not available")
+        except Exception as e:
+            logger.warning(f"  Model Evaluation System failed: {e}")
+
+        # 5.14. Initialize Training Data Pipeline (v92.0 - Data Collection)
+        logger.info("")
+        logger.info("Initializing Training Data Pipeline (Data Collection)...")
+        training_pipeline = None
+        try:
+            from jarvis_prime.core.training_data_pipeline import get_training_data_pipeline
+            training_pipeline = await get_training_data_pipeline()
+            initialized.append(("training_pipeline", training_pipeline))
+            status = training_pipeline.get_status()
+            logger.info("  Training Data Pipeline initialized")
+            logger.info(f"    - Data Dir: {status.get('config', {}).get('data_dir', 'not set')}")
+            logger.info(f"    - Augmentation: {'ENABLED' if status.get('config', {}).get('augmentation_enabled') else 'DISABLED'}")
+            logger.info(f"    - Reactor Sync: {'ENABLED' if status.get('sync_task_running') else 'DISABLED'}")
+        except ImportError:
+            logger.warning("  Training Data Pipeline not available")
+        except Exception as e:
+            logger.warning(f"  Training Data Pipeline failed: {e}")
+
+        # 5.15. Initialize Resource Manager (v92.0 - Memory & Degradation)
+        logger.info("")
+        logger.info("Initializing Resource Manager (Memory & Degradation)...")
+        resource_manager = None
+        try:
+            from jarvis_prime.core.resource_manager import get_resource_manager
+            resource_manager = await get_resource_manager()
+            initialized.append(("resource_manager", resource_manager))
+            status = resource_manager.get_status()
+            snapshot = await resource_manager.get_snapshot()
+            logger.info("  Resource Manager initialized")
+            logger.info(f"    - RAM Usage: {snapshot.ram_percent * 100:.1f}%")
+            logger.info(f"    - Memory Pressure: {snapshot.memory_pressure.value.upper()}")
+            logger.info(f"    - Degradation Mode: {snapshot.degradation_mode.value}")
+            logger.info(f"    - GPU Available: {'YES' if snapshot.gpu_available else 'NO'}")
+        except ImportError:
+            logger.warning("  Resource Manager not available")
+        except Exception as e:
+            logger.warning(f"  Resource Manager failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1737,6 +1792,9 @@ async def main_v87_unified(args):
         logger.info(f"│  RLHF Pipeline:           {'✓ ACTIVE' if rlhf_pipeline else '✗ INACTIVE':>18} │")
         logger.info(f"│  Reactor Core Bridge:     {'✓ ACTIVE' if reactor_bridge else '✗ INACTIVE':>18} │")
         logger.info(f"│  Continuous Learning:     {'✓ ACTIVE' if continuous_learning else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Model Evaluation:        {'✓ ACTIVE' if evaluation_system else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Training Pipeline:       {'✓ ACTIVE' if training_pipeline else '✗ INACTIVE':>18} │")
+        logger.info(f"│  Resource Manager:        {'✓ ACTIVE' if resource_manager else '✗ INACTIVE':>18} │")
         if auto_model_selector:
             ams_status = auto_model_selector.get_status()
             logger.info(f"│    Model Profiles:        {len(ams_status.get('models', {})):>18} │")
@@ -1753,6 +1811,10 @@ async def main_v87_unified(args):
             cl_status = continuous_learning.get_status()
             exp_count = cl_status.get('experience_count', 0)
             logger.info(f"│    Experiences Learned:   {exp_count:>18} │")
+        if resource_manager:
+            rm_snapshot = await resource_manager.get_snapshot()
+            logger.info(f"│    Memory Pressure:       {rm_snapshot.memory_pressure.value.upper():>18} │")
+            logger.info(f"│    Degradation Mode:      {rm_snapshot.degradation_mode.value:>18} │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("┌──────────────────────────────────────────────────────────────────┐")
@@ -1772,6 +1834,10 @@ async def main_v87_unified(args):
         logger.info("│  ✓ RLHF with PPO Policy Optimization                             │")
         logger.info("│  ✓ Continuous Learning with EWC Forgetting Prevention            │")
         logger.info("│  ✓ Reactor Core Training Pipeline Integration                    │")
+        logger.info("│  ✓ Model Benchmarking & Evaluation (Safety + Performance)        │")
+        logger.info("│  ✓ Training Data Collection with PII Filtering                   │")
+        logger.info("│  ✓ Graceful Degradation (Memory Pressure Management)             │")
+        logger.info("│  ✓ Intelligent Model Eviction (LRU + Priority)                   │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("┌──────────────────────────────────────────────────────────────────┐")
@@ -1935,6 +2001,26 @@ async def main_v87_unified(args):
                         logger.info(f"    Experiences: {experiences}, Model updates: {updates}")
                     await shutdown_continuous_learning_engine()
                     logger.info(f"  {name}: stopped (experiences persisted)")
+                elif name == "evaluation_system":
+                    # v92.0: Stop Model Evaluation System
+                    from jarvis_prime.core.model_evaluation import shutdown_evaluation_orchestrator
+                    await shutdown_evaluation_orchestrator()
+                    logger.info(f"  {name}: stopped")
+                elif name == "training_pipeline":
+                    # v92.0: Stop Training Data Pipeline
+                    from jarvis_prime.core.training_data_pipeline import shutdown_training_data_pipeline
+                    await shutdown_training_data_pipeline()
+                    logger.info(f"  {name}: stopped (data synced)")
+                elif name == "resource_manager":
+                    # v92.0: Stop Resource Manager
+                    from jarvis_prime.core.resource_manager import shutdown_resource_manager
+                    if hasattr(component, 'get_status'):
+                        status = component.get_status()
+                        evictions = status.get('stats', {}).get('evictions', 0)
+                        queued = status.get('stats', {}).get('queued_requests', 0)
+                        logger.info(f"    Evictions: {evictions}, Queued requests: {queued}")
+                    await shutdown_resource_manager()
+                    logger.info(f"  {name}: stopped")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
 
