@@ -457,17 +457,36 @@ class ContextWindowManager:
     - Dynamic context truncation
     - Priority-based context selection
     - Overflow warnings and metrics
+    - Context size distribution tracking
+    - Proactive warning when approaching limits
+
+    v92.1 ENHANCEMENTS:
+    - Added comprehensive metrics tracking
+    - Added warning thresholds
+    - Added context utilization analysis
     """
 
-    __slots__ = ('_max_tokens', '_reserved_tokens', '_tokenizer', '_stats')
+    __slots__ = (
+        '_max_tokens', '_reserved_tokens', '_tokenizer', '_stats',
+        '_warning_threshold', '_critical_threshold', '_last_warning_time'
+    )
+
+    # Warning thresholds as percentage of max_tokens
+    DEFAULT_WARNING_THRESHOLD = 0.75  # 75% utilization
+    DEFAULT_CRITICAL_THRESHOLD = 0.90  # 90% utilization
 
     def __init__(
         self,
         max_tokens: int = 4096,
         reserved_tokens: int = 512,
+        warning_threshold: float = DEFAULT_WARNING_THRESHOLD,
+        critical_threshold: float = DEFAULT_CRITICAL_THRESHOLD,
     ):
-        self._max_tokens = max_tokens
-        self._reserved_tokens = reserved_tokens
+        self._max_tokens = int(os.getenv("REASONING_MAX_TOKENS", str(max_tokens)))
+        self._reserved_tokens = int(os.getenv("REASONING_RESERVED_TOKENS", str(reserved_tokens)))
+        self._warning_threshold = warning_threshold
+        self._critical_threshold = critical_threshold
+        self._last_warning_time = 0.0
         self._tokenizer = None
         self._stats = ThreadSafeStatistics()
 
@@ -475,19 +494,95 @@ class ContextWindowManager:
         try:
             import tiktoken
             self._tokenizer = tiktoken.get_encoding("cl100k_base")
+            logger.debug("Using tiktoken for accurate token counting")
         except ImportError:
-            pass
+            logger.debug("tiktoken not available, using char-based estimation")
 
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text."""
+        """Count tokens in text with caching for repeated calls."""
+        if not text:
+            return 0
         if self._tokenizer:
             return len(self._tokenizer.encode(text))
-        # Fallback: estimate ~4 chars per token
+        # Fallback: estimate ~4 chars per token (conservative)
         return len(text) // 4
 
     def available_tokens(self, current_usage: int = 0) -> int:
         """Get available tokens for context."""
         return max(0, self._max_tokens - self._reserved_tokens - current_usage)
+
+    @property
+    def effective_max_tokens(self) -> int:
+        """Get effective maximum tokens (accounting for reserved)."""
+        return self._max_tokens - self._reserved_tokens
+
+    async def check_utilization(
+        self,
+        current_tokens: int,
+        operation: str = "context",
+    ) -> Tuple[float, str]:
+        """
+        Check context utilization and log warnings if needed.
+
+        v92.1: Comprehensive utilization tracking with warnings.
+
+        Args:
+            current_tokens: Current token count
+            operation: Description of the operation for logging
+
+        Returns:
+            Tuple of (utilization_ratio, status) where status is "ok", "warning", or "critical"
+        """
+        effective_max = self.effective_max_tokens
+        utilization = current_tokens / effective_max if effective_max > 0 else 1.0
+
+        # Track utilization distribution
+        bucket = f"{int(utilization * 10) * 10}%"
+        await self._stats.record_histogram("context_utilization", bucket)
+        await self._stats.record_timing("context_tokens", current_tokens)
+
+        # Determine status
+        status = "ok"
+        if utilization >= self._critical_threshold:
+            status = "critical"
+            await self._stats.increment("context_critical_warnings")
+            # Rate-limit warnings to avoid spam
+            now = time.time()
+            if now - self._last_warning_time > 60:  # Max 1 warning per minute
+                logger.warning(
+                    f"CRITICAL: {operation} at {utilization:.1%} capacity "
+                    f"({current_tokens}/{effective_max} tokens)"
+                )
+                self._last_warning_time = now
+        elif utilization >= self._warning_threshold:
+            status = "warning"
+            await self._stats.increment("context_warnings")
+            now = time.time()
+            if now - self._last_warning_time > 300:  # Max 1 warning per 5 min
+                logger.warning(
+                    f"WARNING: {operation} at {utilization:.1%} capacity "
+                    f"({current_tokens}/{effective_max} tokens)"
+                )
+                self._last_warning_time = now
+
+        return (utilization, status)
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get context window statistics."""
+        all_stats = await self._stats.get_all_stats()
+        timing_stats = await self._stats.get_timing_stats("context_tokens")
+
+        return {
+            "max_tokens": self._max_tokens,
+            "reserved_tokens": self._reserved_tokens,
+            "effective_max": self.effective_max_tokens,
+            "tokenizer_available": self._tokenizer is not None,
+            "truncations": all_stats.get("counters", {}).get("context_truncations", 0),
+            "warnings": all_stats.get("counters", {}).get("context_warnings", 0),
+            "critical_warnings": all_stats.get("counters", {}).get("context_critical_warnings", 0),
+            "utilization_distribution": all_stats.get("histograms", {}).get("context_utilization", {}),
+            "token_usage": timing_stats,
+        }
 
     async def truncate_context(
         self,
@@ -668,6 +763,20 @@ class FeedbackDeduplicator:
 
             self._seen_hashes[hash_key] = time.time()
             return False
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get deduplicator statistics."""
+        now = time.time()
+        oldest_timestamp = None
+        if self._seen_hashes:
+            oldest_timestamp = min(self._seen_hashes.values())
+
+        return {
+            "seen_count": len(self._seen_hashes),
+            "max_size": self._max_size,
+            "utilization": len(self._seen_hashes) / self._max_size if self._max_size > 0 else 0,
+            "oldest_entry_age_seconds": (now - oldest_timestamp) if oldest_timestamp else None,
+        }
 
 
 class QualityScorer:
@@ -1426,6 +1535,87 @@ class BaseReasoningStrategy(ABC):
         """Execute reasoning strategy."""
         ...
 
+    def _format_context_for_prompt(
+        self,
+        context: Optional[Dict[str, Any]],
+        max_context_chars: int = 4000,
+    ) -> str:
+        """
+        Format context dict into a prompt-ready string.
+
+        v92.1: Properly integrates RAG retrieved context into reasoning prompts.
+
+        Args:
+            context: Context dict which may include:
+                - retrieved_context: Raw RAG retrieval results
+                - formatted_context: Pre-formatted context string
+                - system_prompt: System-level instructions
+                - Any other key-value context
+
+        Returns:
+            Formatted context string suitable for prompt injection
+        """
+        if not context:
+            return ""
+
+        parts = []
+
+        # Use pre-formatted context if available (from RAGContextCache)
+        if "formatted_context" in context and context["formatted_context"]:
+            parts.append(context["formatted_context"])
+
+        # Format retrieved RAG documents
+        elif "retrieved_context" in context:
+            retrieved = context["retrieved_context"]
+            if isinstance(retrieved, list):
+                for i, doc in enumerate(retrieved[:5], 1):  # Limit to 5 docs
+                    if isinstance(doc, dict):
+                        content = doc.get("content", doc.get("text", str(doc)))
+                        score = doc.get("score", doc.get("relevance", 0))
+                        parts.append(f"[Document {i}] (relevance: {score:.2f})\n{content}")
+                    else:
+                        parts.append(f"[Document {i}]\n{str(doc)}")
+            elif isinstance(retrieved, str):
+                parts.append(f"[Retrieved Context]\n{retrieved}")
+
+        # Add any additional context fields
+        for key, value in context.items():
+            if key in ("retrieved_context", "formatted_context", "system_prompt",
+                       "relevance_scores", "num_documents", "rag_context"):
+                continue  # Already handled or metadata
+            if isinstance(value, str) and value.strip():
+                parts.append(f"[{key.replace('_', ' ').title()}]\n{value}")
+
+        if not parts:
+            return ""
+
+        # Join and truncate if needed
+        full_context = "\n\n".join(parts)
+        if len(full_context) > max_context_chars:
+            full_context = full_context[:max_context_chars - 100] + "\n\n[Context truncated...]"
+
+        return f"=== RELEVANT CONTEXT ===\n{full_context}\n=== END CONTEXT ===\n\n"
+
+    def _build_augmented_prompt(
+        self,
+        input_text: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Build an augmented prompt with context injection.
+
+        Args:
+            input_text: The original user query
+            context: Context dict for augmentation
+
+        Returns:
+            Augmented prompt string with context prepended
+        """
+        formatted_context = self._format_context_for_prompt(context)
+        if formatted_context:
+            return f"{formatted_context}{input_text}"
+        return input_text
+
 
 class ChainOfThoughtStrategy(BaseReasoningStrategy):
     """
@@ -1442,21 +1632,28 @@ class ChainOfThoughtStrategy(BaseReasoningStrategy):
         input_text: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> ReasoningResult:
-        """Execute Chain-of-Thought reasoning."""
+        """Execute Chain-of-Thought reasoning with RAG context augmentation."""
         start = time.time()
+
+        # v92.1: Build augmented prompt with RAG context
+        augmented_prompt = self._build_augmented_prompt(input_text, context)
+        has_rag_context = augmented_prompt != input_text
 
         chain = ReasoningChain(
             strategy=self.strategy_type,
             input_text=input_text,
         )
+        # Track RAG usage in chain metadata
+        chain.metadata["has_rag_context"] = has_rag_context
+        chain.metadata["context_chars"] = len(augmented_prompt) - len(input_text)
 
         thoughts: List[Thought] = []
         total_confidence = 0.0
 
         for step in range(self.config.cot_max_steps):
-            # Generate next thought
+            # Generate next thought with augmented prompt (includes RAG context)
             new_thoughts = await self.generator.generate(
-                prompt=input_text,
+                prompt=augmented_prompt,  # v92.1: Use augmented prompt with context
                 context=thoughts,
                 num_thoughts=1,
             )
@@ -1525,18 +1722,24 @@ class TreeOfThoughtsStrategy(BaseReasoningStrategy):
         input_text: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> ReasoningResult:
-        """Execute Tree-of-Thoughts reasoning."""
+        """Execute Tree-of-Thoughts reasoning with RAG context augmentation."""
         start = time.time()
+
+        # v92.1: Build augmented prompt with RAG context
+        augmented_prompt = self._build_augmented_prompt(input_text, context)
+        has_rag_context = augmented_prompt != input_text
 
         tree = ThoughtTree(
             max_depth=self.config.tot_max_depth,
             max_branches=self.config.tot_branches_per_node,
             beam_width=self.config.tot_beam_width,
         )
+        # Track RAG usage in tree metadata
+        tree.metadata["has_rag_context"] = has_rag_context
 
-        # Create root thought
+        # Create root thought with augmented prompt
         root_thoughts = await self.generator.generate(
-            prompt=input_text,
+            prompt=augmented_prompt,  # v92.1: Use augmented prompt with context
             context=[],
             num_thoughts=1,
         )
@@ -1561,11 +1764,11 @@ class TreeOfThoughtsStrategy(BaseReasoningStrategy):
             if not frontier:
                 break
 
-            # Expand each frontier node
+            # Expand each frontier node with augmented prompt
             expansion_tasks = []
             for node in frontier:
                 expansion_tasks.append(
-                    self._expand_node(tree, node, input_text)
+                    self._expand_node(tree, node, augmented_prompt)  # v92.1: Use augmented prompt
                 )
 
             await asyncio.gather(*expansion_tasks)
@@ -1658,20 +1861,26 @@ class SelfReflectionStrategy(BaseReasoningStrategy):
         input_text: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> ReasoningResult:
-        """Execute Self-Reflection reasoning."""
+        """Execute Self-Reflection reasoning with RAG context augmentation."""
         start = time.time()
+
+        # v92.1: Build augmented prompt with RAG context
+        augmented_prompt = self._build_augmented_prompt(input_text, context)
+        has_rag_context = augmented_prompt != input_text
 
         chain = ReasoningChain(
             strategy=self.strategy_type,
             input_text=input_text,
         )
+        # Track RAG usage in chain metadata
+        chain.metadata["has_rag_context"] = has_rag_context
 
         thoughts: List[Thought] = []
         revision_count = 0
 
-        # Generate initial thought
+        # Generate initial thought with augmented prompt
         initial_thoughts = await self.generator.generate(
-            prompt=input_text,
+            prompt=augmented_prompt,  # v92.1: Use augmented prompt with context
             context=[],
             num_thoughts=1,
         )
@@ -1694,13 +1903,14 @@ class SelfReflectionStrategy(BaseReasoningStrategy):
         while (current_thought.confidence < self.config.reflection_threshold
                and revision_count < self.config.max_revisions):
 
-            # Generate critique
+            # Generate critique (use original input for clarity)
             critique = await self._generate_critique(current_thought, input_text)
             current_thought.self_critique = critique
 
-            # Generate revision based on critique
+            # Generate revision based on critique with context
+            revision_prompt = f"{augmented_prompt}\n\nPrevious attempt: {current_thought.content}\n\nCritique: {critique}\n\nImproved response:"
             revised_thoughts = await self.generator.generate(
-                prompt=f"{input_text}\n\nPrevious attempt: {current_thought.content}\n\nCritique: {critique}\n\nImproved response:",
+                prompt=revision_prompt,  # v92.1: Include RAG context in revisions
                 context=thoughts,
                 num_thoughts=1,
             )
@@ -1774,16 +1984,20 @@ class HypothesisTestStrategy(BaseReasoningStrategy):
         input_text: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> ReasoningResult:
-        """Execute Hypothesis Testing reasoning."""
+        """Execute Hypothesis Testing reasoning with RAG context augmentation."""
         start = time.time()
 
-        # Generate hypotheses
-        hypotheses = await self._generate_hypotheses(input_text)
+        # v92.1: Build augmented prompt with RAG context
+        augmented_prompt = self._build_augmented_prompt(input_text, context)
+        has_rag_context = augmented_prompt != input_text
 
-        # Test each hypothesis
+        # Generate hypotheses using augmented prompt (includes RAG context)
+        hypotheses = await self._generate_hypotheses(augmented_prompt)
+
+        # Test each hypothesis against augmented context
         tested: List[Tuple[str, float, str]] = []
         for hypothesis in hypotheses:
-            confidence, evidence = await self._test_hypothesis(hypothesis, input_text)
+            confidence, evidence = await self._test_hypothesis(hypothesis, augmented_prompt)
             tested.append((hypothesis, confidence, evidence))
 
         # Select best hypothesis
@@ -1795,6 +2009,8 @@ class HypothesisTestStrategy(BaseReasoningStrategy):
             strategy=self.strategy_type,
             input_text=input_text,
         )
+        # Track RAG usage in chain metadata
+        chain.metadata["has_rag_context"] = has_rag_context
 
         # Add hypothesis thoughts
         for hyp, conf, ev in tested:
@@ -2155,9 +2371,10 @@ class ReasoningEngine:
             await self._stats.increment("cache_misses")
 
         # Apply rate limiting
+        merged_context = None
         try:
             async with self._rate_limiter.acquire():
-                result = await self._execute_reasoning(
+                result, merged_context = await self._execute_reasoning(
                     input_text=input_text,
                     strategy=strategy,
                     context=context,
@@ -2173,15 +2390,17 @@ class ReasoningEngine:
                 confidence=0.0,
                 latency_ms=(time.time() - start_time) * 1000,
             )
+            merged_context = context  # Preserve original context for feedback
 
         # Cache result
         if use_cache and self.config.cache_thoughts and result.confidence > 0:
             cache_key = self._make_cache_key(input_text, strategy)
             await self._cache.set(cache_key, result)
 
-        # Collect training feedback (NEW in v92.0)
+        # Collect training feedback (NEW in v92.0, FIXED in v92.1)
+        # Pass merged_context to preserve RAG retrieval info for training
         if self.config.training_feedback_enabled:
-            await self._collect_feedback(input_text, result)
+            await self._collect_feedback(input_text, result, merged_context=merged_context)
 
         return result
 
@@ -2192,15 +2411,21 @@ class ReasoningEngine:
         context: Optional[Dict[str, Any]],
         use_rag: bool,
         start_time: float,
-    ) -> ReasoningResult:
-        """Execute reasoning with RAG context augmentation."""
+    ) -> Tuple[ReasoningResult, Optional[Dict[str, Any]]]:
+        """
+        Execute reasoning with RAG context augmentation.
+
+        Returns:
+            Tuple of (ReasoningResult, merged_context) where merged_context
+            includes any RAG retrieval results for training feedback.
+        """
         # Retrieve RAG context (NEW in v92.0)
         rag_context = None
         if use_rag and self.config.rag_enabled:
             rag_context = await self._retrieve_context(input_text)
 
-        # Merge contexts
-        merged_context = context or {}
+        # Merge contexts (original + RAG)
+        merged_context = context.copy() if context else {}
         if rag_context:
             merged_context = {**merged_context, **rag_context}
             await self._stats.increment("rag_retrievals")
@@ -2266,16 +2491,18 @@ class ReasoningEngine:
             )
 
             # Collect error feedback for learning (NEW in v92.1)
+            # Pass merged_context so training data includes what context was available
             if self.config.training_feedback_enabled:
-                await self._collect_feedback(input_text, result, is_error=True)
+                await self._collect_feedback(input_text, result, is_error=True, merged_context=merged_context)
 
-        return result
+        return (result, merged_context)
 
     async def _collect_feedback(
         self,
         input_text: str,
         result: ReasoningResult,
         is_error: bool = False,
+        merged_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Collect feedback for training pipeline with quality scoring and deduplication.
@@ -2285,11 +2512,14 @@ class ReasoningEngine:
         - Deduplication
         - Error case collection
         - Comprehensive metadata
+        - RAG context preservation for training
+        - System prompt capture
 
         Args:
             input_text: Original input
             result: Reasoning result
             is_error: Whether this was an error case
+            merged_context: The merged context including RAG retrieval results
         """
         # Calculate comprehensive quality score
         quality_score = self._quality_scorer.score(result, input_text)
@@ -2304,6 +2534,23 @@ class ReasoningEngine:
             await self._stats.increment("feedback_filtered_duplicate")
             return
 
+        # Extract RAG context for training (preserves what knowledge was used)
+        rag_context_summary = None
+        has_rag = False
+        if merged_context:
+            has_rag = "retrieved_context" in merged_context or "formatted_context" in merged_context
+            if has_rag:
+                rag_context_summary = {
+                    "formatted_context": merged_context.get("formatted_context"),
+                    "num_documents": merged_context.get("num_documents", 0),
+                    "relevance_scores": merged_context.get("relevance_scores", []),
+                }
+
+        # Extract system prompt if available
+        system_prompt = None
+        if merged_context:
+            system_prompt = merged_context.get("system_prompt")
+
         async with self._feedback_lock:
             feedback_item = {
                 "timestamp": time.time(),
@@ -2315,14 +2562,32 @@ class ReasoningEngine:
                 "latency_ms": result.latency_ms,
                 "total_thoughts": result.total_thoughts,
                 "is_error": is_error,
-                "has_rag_context": result.chain.metadata.get("has_rag_context", False) if result.chain else False,
+                "has_rag_context": has_rag or (result.chain.metadata.get("has_rag_context", False) if result.chain else False),
+                # NEW in v92.1: Preserve RAG context and system prompt for training
+                "rag_context": rag_context_summary,
+                "system_prompt": system_prompt,
+                # Thought chain for detailed analysis
+                "thought_chain_summary": self._summarize_thought_chain(result.chain) if result.chain else None,
             }
             self._feedback_buffer.append(feedback_item)
             await self._stats.increment("feedback_collected")
 
             # Flush to training pipeline when buffer is full
-            if len(self._feedback_buffer) >= 100:
+            buffer_threshold = int(os.getenv("REASONING_FEEDBACK_BUFFER_SIZE", "100"))
+            if len(self._feedback_buffer) >= buffer_threshold:
                 await self._flush_feedback()
+
+    def _summarize_thought_chain(self, chain: Optional["ThoughtChain"]) -> Optional[Dict[str, Any]]:
+        """Summarize thought chain for training feedback (avoid storing full chain)."""
+        if not chain:
+            return None
+        return {
+            "depth": chain.depth,
+            "total_thoughts": len(chain.thoughts) if hasattr(chain, "thoughts") else 0,
+            "final_confidence": chain.final_confidence if hasattr(chain, "final_confidence") else None,
+            "pruned_branches": chain.metadata.get("pruned_branches", 0),
+            "explored_alternatives": chain.metadata.get("explored_alternatives", 0),
+        }
 
     async def _flush_feedback(self) -> None:
         """
@@ -2358,19 +2623,28 @@ class ReasoningEngine:
             # Process feedback items
             for item in self._feedback_buffer:
                 try:
-                    # FIX: Use correct method name 'capture_conversation' not 'collect_conversation'
+                    # v92.1 FIX: Correct parameter names for capture_conversation API
+                    # Signature: capture_conversation(user_input, assistant_response, system_prompt, context)
                     await pipeline.capture_conversation(
-                        prompt=item["input"],
-                        response=item["output"],
-                        quality_score=item["quality_score"],
-                        metadata={
+                        user_input=item["input"],
+                        assistant_response=item["output"],
+                        system_prompt=item.get("system_prompt"),
+                        context={
+                            # Quality and scoring metadata
+                            "quality_score": item["quality_score"],
+                            "original_confidence": item["confidence"],
+                            # Source identification
                             "source": "reasoning_engine",
                             "strategy": item["strategy"],
+                            # Execution metadata
                             "is_error": item.get("is_error", False),
                             "has_rag_context": item.get("has_rag_context", False),
-                            "original_confidence": item["confidence"],
                             "latency_ms": item["latency_ms"],
                             "total_thoughts": item["total_thoughts"],
+                            # RAG context if available
+                            "rag_context": item.get("rag_context"),
+                            # Timestamp for ordering
+                            "captured_at": item.get("timestamp", time.time()),
                         }
                     )
                     flushed_count += 1
@@ -2509,7 +2783,11 @@ class ReasoningEngine:
                         break
 
     async def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive engine statistics (thread-safe)."""
+        """
+        Get comprehensive engine statistics (thread-safe).
+
+        v92.1 ENHANCEMENT: Added context window and deduplication metrics.
+        """
         stats = await self._stats.get_all_stats()
         cache_stats = await self._cache.get_stats()
         rate_limiter_stats = await self._rate_limiter.get_stats()
@@ -2517,6 +2795,8 @@ class ReasoningEngine:
         rag_latency_stats = await self._stats.get_timing_stats("rag_retrieval_latency_ms")
         feedback_flush_stats = await self._stats.get_timing_stats("feedback_flush_latency_ms")
         rag_cache_stats = await self._rag_cache.get_stats()
+        context_window_stats = await self._context_manager.get_stats()
+        deduplicator_stats = self._feedback_deduplicator.get_stats()
 
         return {
             "counters": stats["counters"],
@@ -2537,6 +2817,7 @@ class ReasoningEngine:
                 "flushed": stats["counters"].get("feedback_flushed", 0),
                 "filtered_duplicate": stats["counters"].get("feedback_filtered_duplicate", 0),
                 "filtered_low_quality": stats["counters"].get("feedback_filtered_low_quality", 0),
+                "deduplicator": deduplicator_stats,
             },
             "rag": {
                 "initialized": self._rag_initialized,
@@ -2545,12 +2826,16 @@ class ReasoningEngine:
                 "retrievals": stats["counters"].get("rag_retrievals", 0),
                 "errors": stats["counters"].get("rag_retrieval_errors", 0),
             },
+            # v92.1: Context window metrics
+            "context_window": context_window_stats,
             "config": {
                 "default_strategy": self.config.default_strategy.value,
                 "rag_enabled": self.config.rag_enabled,
                 "cache_enabled": self.config.cache_thoughts,
                 "max_concurrent": self.config.max_concurrent_reasoning,
                 "feedback_threshold": self.config.feedback_collection_threshold,
+                "max_tokens": self._context_manager._max_tokens,
+                "reserved_tokens": self._context_manager._reserved_tokens,
             },
         }
 
