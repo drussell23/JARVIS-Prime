@@ -59,16 +59,27 @@ import logging
 import os
 import pickle
 import random
+import shutil
+import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, Set, Tuple, TypeVar
 
 import numpy as np
+
+# Try to import aiofiles for async file I/O
+try:
+    import aiofiles
+    import aiofiles.os
+    AIOFILES_AVAILABLE = True
+except ImportError:
+    AIOFILES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +319,11 @@ class ExperienceReplayBuffer:
             }
 
     async def save(self, path: Path):
-        """Save buffer to disk."""
+        """
+        Save buffer to disk with atomic file operations.
+
+        Uses temp file + rename pattern to prevent corruption on crash.
+        """
         async with self._lock:
             data = {
                 "experiences": {k: v.to_dict() for k, v in self._experiences.items()},
@@ -320,27 +335,88 @@ class ExperienceReplayBuffer:
                 }
             }
 
-            with open(path, 'wb') as f:
-                pickle.dump(data, f)
+            # Atomic write: temp file + rename
+            path = Path(path)
+            temp_path = path.with_suffix(path.suffix + '.tmp')
 
-            logger.info(f"Saved experience buffer to {path}")
+            try:
+                # Ensure parent directory exists
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Write to temp file first
+                if AIOFILES_AVAILABLE:
+                    async with aiofiles.open(temp_path, 'wb') as f:
+                        await f.write(pickle.dumps(data))
+                else:
+                    # Fallback to sync I/O in executor
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: temp_path.write_bytes(pickle.dumps(data))
+                    )
+
+                # Atomic rename (on most filesystems)
+                if AIOFILES_AVAILABLE:
+                    await aiofiles.os.replace(str(temp_path), str(path))
+                else:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: temp_path.replace(path)
+                    )
+
+                logger.info(f"Saved experience buffer to {path}")
+
+            except Exception as e:
+                # Clean up temp file on error
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except Exception:
+                        pass
+                logger.error(f"Failed to save experience buffer: {e}")
+                raise
 
     async def load(self, path: Path):
-        """Load buffer from disk."""
+        """
+        Load buffer from disk with async I/O.
+
+        Uses aiofiles for non-blocking file reads.
+        """
         async with self._lock:
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
+            path = Path(path)
 
-            # Restore experiences
-            for id, exp_dict in data["experiences"].items():
-                self._experiences[id] = Experience(**exp_dict)
-                self._insertion_order.append(id)
+            if not path.exists():
+                logger.warning(f"Experience buffer file not found: {path}")
+                return
 
-            self._priorities = data["priorities"]
-            self._total_added = data["metadata"]["total_added"]
-            self._total_sampled = data["metadata"]["total_sampled"]
+            try:
+                if AIOFILES_AVAILABLE:
+                    async with aiofiles.open(path, 'rb') as f:
+                        content = await f.read()
+                        data = pickle.loads(content)
+                else:
+                    # Fallback to sync I/O in executor
+                    loop = asyncio.get_event_loop()
+                    data = await loop.run_in_executor(
+                        None,
+                        lambda: pickle.loads(path.read_bytes())
+                    )
 
-            logger.info(f"Loaded experience buffer from {path}")
+                # Restore experiences
+                for id, exp_dict in data["experiences"].items():
+                    self._experiences[id] = Experience(**exp_dict)
+                    self._insertion_order.append(id)
+
+                self._priorities = data["priorities"]
+                self._total_added = data["metadata"]["total_added"]
+                self._total_sampled = data["metadata"]["total_sampled"]
+
+                logger.info(f"Loaded experience buffer from {path}")
+
+            except Exception as e:
+                logger.error(f"Failed to load experience buffer: {e}")
+                raise
 
 
 # ============================================================================

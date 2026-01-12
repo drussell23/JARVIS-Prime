@@ -48,23 +48,28 @@ USAGE:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hashlib
 import json
 import logging
 import os
+import random
 import shutil
 import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from functools import wraps
 from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     Generic,
@@ -78,6 +83,177 @@ from typing import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# ADVANCED UTILITIES - Retry, Backoff, Resource Management
+# =============================================================================
+
+
+@dataclass
+class BackoffConfig:
+    """Configuration for exponential backoff."""
+    initial_delay: float = 1.0
+    max_delay: float = 300.0  # 5 minutes
+    multiplier: float = 2.0
+    jitter: float = 0.1  # Add 10% random jitter
+    max_retries: int = 5
+
+
+class ExponentialBackoff:
+    """
+    Exponential backoff with jitter for resilient retries.
+
+    Features:
+    - Exponential delay increase
+    - Random jitter to prevent thundering herd
+    - Configurable max delay and max retries
+    - Reset capability for success
+    """
+
+    __slots__ = ('_config', '_attempt', '_consecutive_failures')
+
+    def __init__(self, config: Optional[BackoffConfig] = None):
+        self._config = config or BackoffConfig()
+        self._attempt = 0
+        self._consecutive_failures = 0
+
+    def get_delay(self) -> float:
+        """Calculate delay for current attempt with jitter."""
+        base_delay = min(
+            self._config.initial_delay * (self._config.multiplier ** self._attempt),
+            self._config.max_delay
+        )
+        # Add jitter
+        jitter = base_delay * self._config.jitter * random.uniform(-1, 1)
+        return max(0, base_delay + jitter)
+
+    def should_retry(self) -> bool:
+        """Check if we should retry."""
+        return self._attempt < self._config.max_retries
+
+    def record_failure(self) -> None:
+        """Record a failure and increment attempt counter."""
+        self._attempt += 1
+        self._consecutive_failures += 1
+
+    def reset(self) -> None:
+        """Reset backoff state after success."""
+        self._attempt = 0
+        self._consecutive_failures = 0
+
+    @property
+    def attempt(self) -> int:
+        return self._attempt
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+
+def with_exponential_backoff(
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    max_delay: float = 60.0,
+    retryable_exceptions: Tuple[type, ...] = (Exception,),
+):
+    """
+    Decorator for async functions with exponential backoff retry.
+
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        max_delay: Maximum delay in seconds
+        retryable_exceptions: Tuple of exceptions that trigger retry
+    """
+    def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            backoff = ExponentialBackoff(BackoffConfig(
+                initial_delay=initial_delay,
+                max_delay=max_delay,
+                max_retries=max_retries,
+            ))
+
+            last_exception = None
+            while True:
+                try:
+                    result = await func(*args, **kwargs)
+                    backoff.reset()
+                    return result
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if not backoff.should_retry():
+                        logger.error(f"{func.__name__} failed after {backoff.attempt} attempts: {e}")
+                        raise
+
+                    delay = backoff.get_delay()
+                    logger.warning(
+                        f"{func.__name__} failed (attempt {backoff.attempt}), "
+                        f"retrying in {delay:.2f}s: {e}"
+                    )
+                    backoff.record_failure()
+                    await asyncio.sleep(delay)
+
+        return wrapper
+    return decorator
+
+
+@asynccontextmanager
+async def managed_model_resources(model_path: Path, device: str = "auto"):
+    """
+    Context manager for model loading with guaranteed cleanup.
+
+    Ensures GPU memory is properly released even on exceptions.
+    """
+    model = None
+    tokenizer = None
+
+    try:
+        # Lazy import to avoid loading torch unnecessarily
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            TORCH_AVAILABLE = True
+        except ImportError:
+            TORCH_AVAILABLE = False
+
+        if TORCH_AVAILABLE:
+            tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+            model = AutoModelForCausalLM.from_pretrained(
+                str(model_path),
+                device_map=device,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+
+        yield model, tokenizer
+
+    finally:
+        # Guaranteed cleanup
+        if model is not None:
+            try:
+                del model
+            except Exception:
+                pass
+
+        if tokenizer is not None:
+            try:
+                del tokenizer
+            except Exception:
+                pass
+
+        # Clear GPU memory
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+        # Force garbage collection
+        import gc
+        gc.collect()
 
 
 # =============================================================================
@@ -1064,8 +1240,15 @@ class TrainingScheduler:
             else:
                 interval_hours = 24.0
 
-        # Create task
+        # Create task with exponential backoff for error resilience
         async def training_loop():
+            backoff = ExponentialBackoff(BackoffConfig(
+                initial_delay=60.0,  # Start with 1 minute delay on error
+                max_delay=3600.0,    # Max 1 hour delay
+                multiplier=2.0,
+                max_retries=10,      # Allow many retries for scheduled tasks
+            ))
+
             while True:
                 try:
                     await asyncio.sleep(interval_hours * 3600)
@@ -1085,13 +1268,32 @@ class TrainingScheduler:
                             strategy=strategy,
                         )
                         self._last_training[strategy] = datetime.now()
+                        backoff.reset()  # Reset backoff on success
                     else:
                         logger.debug(f"Not enough samples for training: {unexported}")
+                        backoff.reset()  # No error, just not enough data
 
                 except asyncio.CancelledError:
+                    logger.info(f"Training loop for {strategy.value} cancelled")
                     break
                 except Exception as e:
-                    logger.error(f"Scheduled training error: {e}")
+                    backoff.record_failure()
+                    delay = backoff.get_delay()
+
+                    logger.error(
+                        f"Scheduled training error (attempt {backoff.attempt}): {e}. "
+                        f"Retrying in {delay:.0f}s"
+                    )
+
+                    if not backoff.should_retry():
+                        logger.critical(
+                            f"Training scheduler for {strategy.value} exceeded max retries. "
+                            f"Stopping scheduled training."
+                        )
+                        break
+
+                    # Wait with backoff before next attempt
+                    await asyncio.sleep(delay)
 
         self._scheduled_tasks[task_key] = asyncio.create_task(training_loop())
         logger.info(f"Scheduled {strategy.value} training every {interval_hours} hours")
