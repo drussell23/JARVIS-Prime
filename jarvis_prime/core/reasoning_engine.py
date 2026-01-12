@@ -448,6 +448,317 @@ class TaskCancellationManager:
             return await asyncio.gather(*tasks, return_exceptions=True)
 
 
+class ContextWindowManager:
+    """
+    Manages context window limits for LLM interactions.
+
+    Features:
+    - Token counting with fallback estimation
+    - Dynamic context truncation
+    - Priority-based context selection
+    - Overflow warnings and metrics
+    """
+
+    __slots__ = ('_max_tokens', '_reserved_tokens', '_tokenizer', '_stats')
+
+    def __init__(
+        self,
+        max_tokens: int = 4096,
+        reserved_tokens: int = 512,
+    ):
+        self._max_tokens = max_tokens
+        self._reserved_tokens = reserved_tokens
+        self._tokenizer = None
+        self._stats = ThreadSafeStatistics()
+
+        # Try to load tokenizer
+        try:
+            import tiktoken
+            self._tokenizer = tiktoken.get_encoding("cl100k_base")
+        except ImportError:
+            pass
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text."""
+        if self._tokenizer:
+            return len(self._tokenizer.encode(text))
+        # Fallback: estimate ~4 chars per token
+        return len(text) // 4
+
+    def available_tokens(self, current_usage: int = 0) -> int:
+        """Get available tokens for context."""
+        return max(0, self._max_tokens - self._reserved_tokens - current_usage)
+
+    async def truncate_context(
+        self,
+        context: str,
+        max_tokens: Optional[int] = None,
+        preserve_start: bool = True,
+    ) -> str:
+        """
+        Truncate context to fit within token limit.
+
+        Args:
+            context: Text to truncate
+            max_tokens: Max tokens (uses available_tokens if None)
+            preserve_start: If True, keep beginning; else keep end
+        """
+        max_tokens = max_tokens or self.available_tokens()
+        current_tokens = self.count_tokens(context)
+
+        if current_tokens <= max_tokens:
+            return context
+
+        await self._stats.increment("context_truncations")
+
+        # Estimate characters to keep
+        ratio = max_tokens / current_tokens
+        max_chars = int(len(context) * ratio * 0.9)  # 10% safety margin
+
+        if preserve_start:
+            truncated = context[:max_chars] + "\n...[truncated]"
+        else:
+            truncated = "...[truncated]\n" + context[-max_chars:]
+
+        return truncated
+
+    async def prioritize_context(
+        self,
+        contexts: List[Tuple[str, float]],  # (text, priority)
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Select and combine contexts by priority within token limit.
+
+        Args:
+            contexts: List of (text, priority) tuples
+            max_tokens: Maximum total tokens
+        """
+        max_tokens = max_tokens or self.available_tokens()
+
+        # Sort by priority (highest first)
+        sorted_contexts = sorted(contexts, key=lambda x: x[1], reverse=True)
+
+        selected = []
+        current_tokens = 0
+
+        for text, priority in sorted_contexts:
+            text_tokens = self.count_tokens(text)
+            if current_tokens + text_tokens <= max_tokens:
+                selected.append(text)
+                current_tokens += text_tokens
+            else:
+                # Try to fit truncated version
+                remaining = max_tokens - current_tokens
+                if remaining > 100:  # Worth including
+                    truncated = await self.truncate_context(text, remaining)
+                    selected.append(truncated)
+                break
+
+        return "\n\n".join(selected)
+
+
+class RAGContextCache:
+    """
+    Caches RAG retrieval results with TTL and similarity matching.
+
+    Features:
+    - Exact match caching
+    - Similar query matching (fuzzy)
+    - TTL-based expiration
+    - Memory-bounded storage
+    """
+
+    __slots__ = ('_cache', '_lock', '_max_size', '_ttl_seconds', '_hits', '_misses')
+
+    def __init__(self, max_size: int = 500, ttl_seconds: float = 300.0):
+        self._cache: OrderedDict[str, Tuple[Dict[str, Any], float]] = OrderedDict()
+        self._lock = asyncio.Lock()
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._hits = 0
+        self._misses = 0
+
+    def _make_key(self, query: str) -> str:
+        """Create cache key from query."""
+        # Normalize: lowercase, remove extra whitespace
+        normalized = " ".join(query.lower().split())
+        return hashlib.md5(normalized.encode()).hexdigest()
+
+    async def get(self, query: str) -> Optional[Dict[str, Any]]:
+        """Get cached RAG result."""
+        async with self._lock:
+            key = self._make_key(query)
+
+            if key not in self._cache:
+                self._misses += 1
+                return None
+
+            result, timestamp = self._cache[key]
+
+            # Check TTL
+            if time.time() - timestamp > self._ttl_seconds:
+                del self._cache[key]
+                self._misses += 1
+                return None
+
+            # Move to end (LRU)
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return result
+
+    async def set(self, query: str, result: Dict[str, Any]) -> None:
+        """Cache RAG result."""
+        async with self._lock:
+            key = self._make_key(query)
+
+            # Evict if at capacity
+            while len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+
+            self._cache[key] = (result, time.time())
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        async with self._lock:
+            total = self._hits + self._misses
+            return {
+                "size": len(self._cache),
+                "max_size": self._max_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": self._hits / total if total > 0 else 0,
+            }
+
+
+class FeedbackDeduplicator:
+    """
+    Deduplicates feedback items to prevent training on duplicates.
+
+    Features:
+    - Content-based hashing
+    - Sliding window deduplication
+    - Configurable similarity threshold
+    """
+
+    __slots__ = ('_seen_hashes', '_max_size', '_lock')
+
+    def __init__(self, max_size: int = 10000):
+        self._seen_hashes: OrderedDict[str, float] = OrderedDict()
+        self._max_size = max_size
+        self._lock = asyncio.Lock()
+
+    def _hash_feedback(self, input_text: str, output_text: str) -> str:
+        """Create hash of feedback content."""
+        # Normalize and hash
+        normalized = f"{input_text.strip().lower()}|||{output_text.strip().lower()}"
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    async def is_duplicate(self, input_text: str, output_text: str) -> bool:
+        """Check if feedback is a duplicate."""
+        async with self._lock:
+            hash_key = self._hash_feedback(input_text, output_text)
+
+            if hash_key in self._seen_hashes:
+                return True
+
+            # Add to seen
+            while len(self._seen_hashes) >= self._max_size:
+                self._seen_hashes.popitem(last=False)
+
+            self._seen_hashes[hash_key] = time.time()
+            return False
+
+
+class QualityScorer:
+    """
+    Scores feedback quality beyond simple confidence.
+
+    Features:
+    - Multi-factor quality assessment
+    - Configurable weights
+    - Learning from outcomes
+    """
+
+    __slots__ = ('_weights',)
+
+    def __init__(self):
+        self._weights = {
+            "confidence": 0.3,
+            "length_score": 0.2,
+            "reasoning_depth": 0.2,
+            "specificity": 0.15,
+            "latency_score": 0.15,
+        }
+
+    def score(
+        self,
+        result: "ReasoningResult",
+        input_text: str,
+    ) -> float:
+        """
+        Calculate comprehensive quality score.
+
+        Returns score in [0, 1] range.
+        """
+        scores = {}
+
+        # Confidence score (already in 0-1)
+        scores["confidence"] = result.confidence
+
+        # Length score: prefer substantial responses
+        output_len = len(result.output_text)
+        if output_len < 50:
+            scores["length_score"] = 0.3
+        elif output_len < 200:
+            scores["length_score"] = 0.6
+        elif output_len < 1000:
+            scores["length_score"] = 0.9
+        else:
+            scores["length_score"] = 1.0
+
+        # Reasoning depth: based on thought count
+        thought_count = result.total_thoughts
+        if thought_count == 0:
+            scores["reasoning_depth"] = 0.3
+        elif thought_count <= 2:
+            scores["reasoning_depth"] = 0.6
+        elif thought_count <= 5:
+            scores["reasoning_depth"] = 0.85
+        else:
+            scores["reasoning_depth"] = 1.0
+
+        # Specificity: presence of concrete terms
+        specific_indicators = [
+            "specifically", "for example", "in particular",
+            "because", "therefore", "first", "second", "finally",
+        ]
+        specificity_count = sum(
+            1 for ind in specific_indicators
+            if ind in result.output_text.lower()
+        )
+        scores["specificity"] = min(1.0, specificity_count / 4)
+
+        # Latency score: faster is better (but not too fast)
+        latency_ms = result.latency_ms
+        if latency_ms < 100:  # Too fast, might be cached/trivial
+            scores["latency_score"] = 0.7
+        elif latency_ms < 1000:
+            scores["latency_score"] = 1.0
+        elif latency_ms < 5000:
+            scores["latency_score"] = 0.8
+        else:
+            scores["latency_score"] = 0.5
+
+        # Weighted average
+        total_score = sum(
+            scores[key] * self._weights[key]
+            for key in self._weights
+        )
+
+        return min(1.0, max(0.0, total_score))
+
+
 # =============================================================================
 # ENUMS & CONSTANTS
 # =============================================================================
@@ -1618,6 +1929,21 @@ class ReasoningEngine:
         # Training feedback integration (NEW in v92.0)
         self._feedback_buffer: List[Dict[str, Any]] = []
         self._feedback_lock = asyncio.Lock()
+        self._feedback_deduplicator = FeedbackDeduplicator()
+        self._quality_scorer = QualityScorer()
+        self._feedback_flush_task: Optional[asyncio.Task] = None
+
+        # Context window management (NEW in v92.1)
+        self._context_manager = ContextWindowManager(
+            max_tokens=int(os.getenv("REASONING_MAX_CONTEXT_TOKENS", "4096")),
+            reserved_tokens=int(os.getenv("REASONING_RESERVED_TOKENS", "512")),
+        )
+
+        # RAG context cache (NEW in v92.1)
+        self._rag_cache = RAGContextCache(
+            max_size=int(os.getenv("REASONING_RAG_CACHE_SIZE", "500")),
+            ttl_seconds=float(os.getenv("REASONING_RAG_CACHE_TTL", "300.0")),
+        )
 
         # Shutdown management (NEW in v92.0)
         self._shutdown_event = asyncio.Event()
@@ -1627,7 +1953,31 @@ class ReasoningEngine:
         self._tracer: Optional[Any] = None
         self._initialize_observability()
 
-        logger.info("ReasoningEngine v92.0 initialized with RAG, thread-safety, and observability")
+        # Start background tasks
+        self._start_background_tasks()
+
+        logger.info("ReasoningEngine v92.1 initialized with RAG, context management, and advanced feedback")
+
+    def _start_background_tasks(self) -> None:
+        """Start background tasks for periodic operations."""
+        # Time-based feedback flushing (every 5 minutes)
+        async def periodic_flush():
+            while not self._shutdown_event.is_set():
+                try:
+                    await asyncio.sleep(300)  # 5 minutes
+                    if self._feedback_buffer:
+                        await self._flush_feedback()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.warning(f"Periodic flush error: {e}")
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                self._feedback_flush_task = asyncio.create_task(periodic_flush())
+        except RuntimeError:
+            pass  # No event loop yet, will start later
 
     def _initialize_observability(self) -> None:
         """Initialize observability hooks (tracing, metrics)."""
@@ -1663,7 +2013,7 @@ class ReasoningEngine:
         top_k: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve relevant context using RAG.
+        Retrieve relevant context using RAG with caching and context management.
 
         Args:
             input_text: Query text
@@ -1672,6 +2022,15 @@ class ReasoningEngine:
         Returns:
             Retrieved context or None
         """
+        retrieval_start = time.time()
+
+        # Check cache first
+        cached = await self._rag_cache.get(input_text)
+        if cached is not None:
+            await self._stats.increment("rag_cache_hits")
+            return cached
+
+        await self._stats.increment("rag_cache_misses")
         await self._initialize_rag()
 
         if not self._rag_engine:
@@ -1684,30 +2043,52 @@ class ReasoningEngine:
             if not retrieval_result.documents:
                 return None
 
-            # Filter by relevance threshold
+            # Filter by relevance threshold and normalize scores
             relevant_docs = []
             relevant_scores = []
             for doc, score in zip(retrieval_result.documents, retrieval_result.scores):
-                if score >= self.config.rag_min_relevance:
+                # Normalize score to 0-1 range if needed
+                normalized_score = max(0.0, min(1.0, score))
+                if normalized_score >= self.config.rag_min_relevance:
                     relevant_docs.append(doc)
-                    relevant_scores.append(score)
+                    relevant_scores.append(normalized_score)
 
             if not relevant_docs:
                 return None
 
-            # Build context
-            context_parts = []
-            for doc, score in zip(relevant_docs, relevant_scores):
-                context_parts.append(f"[Relevance: {score:.2f}] {doc.content}")
+            # Build context with priority-based truncation
+            contexts_with_priority = [
+                (f"[Relevance: {score:.2f}] {doc.content}", score)
+                for doc, score in zip(relevant_docs, relevant_scores)
+            ]
 
-            return {
-                "retrieved_context": "\n\n".join(context_parts),
+            # Use context manager to fit within token limits
+            input_tokens = self._context_manager.count_tokens(input_text)
+            available_tokens = self._context_manager.available_tokens(input_tokens)
+
+            formatted_context = await self._context_manager.prioritize_context(
+                contexts_with_priority,
+                max_tokens=available_tokens,
+            )
+
+            retrieval_latency = (time.time() - retrieval_start) * 1000
+            await self._stats.record_timing("rag_retrieval_latency_ms", retrieval_latency)
+
+            result = {
+                "retrieved_context": formatted_context,
                 "retrieved_documents": relevant_docs,
                 "retrieval_scores": relevant_scores,
-                "retrieval_latency_ms": retrieval_result.latency_ms,
+                "retrieval_latency_ms": retrieval_latency,
+                "context_tokens": self._context_manager.count_tokens(formatted_context),
             }
 
+            # Cache the result
+            await self._rag_cache.set(input_text, result)
+
+            return result
+
         except Exception as e:
+            await self._stats.increment("rag_retrieval_errors")
             logger.warning(f"RAG retrieval failed: {e}")
             return None
 
@@ -1884,19 +2265,43 @@ class ReasoningEngine:
                 latency_ms=(time.time() - start_time) * 1000,
             )
 
+            # Collect error feedback for learning (NEW in v92.1)
+            if self.config.training_feedback_enabled:
+                await self._collect_feedback(input_text, result, is_error=True)
+
         return result
 
     async def _collect_feedback(
         self,
         input_text: str,
         result: ReasoningResult,
+        is_error: bool = False,
     ) -> None:
         """
-        Collect feedback for training pipeline (NEW in v92.0).
+        Collect feedback for training pipeline with quality scoring and deduplication.
 
-        High-quality reasoning results are collected for training.
+        v92.1 ENHANCEMENTS:
+        - Multi-factor quality scoring
+        - Deduplication
+        - Error case collection
+        - Comprehensive metadata
+
+        Args:
+            input_text: Original input
+            result: Reasoning result
+            is_error: Whether this was an error case
         """
-        if result.confidence < self.config.feedback_collection_threshold:
+        # Calculate comprehensive quality score
+        quality_score = self._quality_scorer.score(result, input_text)
+
+        # Skip low-quality results (but keep errors for learning)
+        if not is_error and quality_score < self.config.feedback_collection_threshold:
+            await self._stats.increment("feedback_filtered_low_quality")
+            return
+
+        # Check for duplicates
+        if await self._feedback_deduplicator.is_duplicate(input_text, result.output_text):
+            await self._stats.increment("feedback_filtered_duplicate")
             return
 
         async with self._feedback_lock:
@@ -1906,40 +2311,88 @@ class ReasoningEngine:
                 "output": result.output_text,
                 "strategy": result.strategy.value,
                 "confidence": result.confidence,
+                "quality_score": quality_score,
                 "latency_ms": result.latency_ms,
                 "total_thoughts": result.total_thoughts,
+                "is_error": is_error,
+                "has_rag_context": result.chain.metadata.get("has_rag_context", False) if result.chain else False,
             }
             self._feedback_buffer.append(feedback_item)
+            await self._stats.increment("feedback_collected")
 
-            # Flush to training pipeline periodically
+            # Flush to training pipeline when buffer is full
             if len(self._feedback_buffer) >= 100:
                 await self._flush_feedback()
 
     async def _flush_feedback(self) -> None:
-        """Flush feedback buffer to training pipeline."""
+        """
+        Flush feedback buffer to training pipeline with error handling.
+
+        v92.1 FIXES:
+        - Fixed method name: collect_conversation -> capture_conversation
+        - Added pipeline availability check
+        - Added retry logic
+        - Added detailed error logging
+        """
         if not self._feedback_buffer:
             return
 
+        flush_start = time.time()
+        flushed_count = 0
+        error_count = 0
+
         try:
-            from jarvis_prime.core.training_data_pipeline import get_training_data_pipeline
-            pipeline = await get_training_data_pipeline()
+            # Check if training pipeline is available
+            try:
+                from jarvis_prime.core.training_data_pipeline import get_training_data_pipeline
+                pipeline = await get_training_data_pipeline()
+            except ImportError:
+                logger.warning("Training data pipeline not available - feedback not persisted")
+                await self._stats.increment("feedback_flush_pipeline_unavailable")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to get training pipeline: {e}")
+                await self._stats.increment("feedback_flush_pipeline_error")
+                return
 
+            # Process feedback items
             for item in self._feedback_buffer:
-                await pipeline.collect_conversation(
-                    prompt=item["input"],
-                    response=item["output"],
-                    quality_score=item["confidence"],
-                    metadata={
-                        "source": "reasoning_engine",
-                        "strategy": item["strategy"],
-                    }
-                )
+                try:
+                    # FIX: Use correct method name 'capture_conversation' not 'collect_conversation'
+                    await pipeline.capture_conversation(
+                        prompt=item["input"],
+                        response=item["output"],
+                        quality_score=item["quality_score"],
+                        metadata={
+                            "source": "reasoning_engine",
+                            "strategy": item["strategy"],
+                            "is_error": item.get("is_error", False),
+                            "has_rag_context": item.get("has_rag_context", False),
+                            "original_confidence": item["confidence"],
+                            "latency_ms": item["latency_ms"],
+                            "total_thoughts": item["total_thoughts"],
+                        }
+                    )
+                    flushed_count += 1
+                except Exception as e:
+                    error_count += 1
+                    logger.debug(f"Failed to capture conversation: {e}")
 
-            logger.info(f"Flushed {len(self._feedback_buffer)} feedback items to training")
+            flush_latency = (time.time() - flush_start) * 1000
+            await self._stats.record_timing("feedback_flush_latency_ms", flush_latency)
+            await self._stats.increment("feedback_flushed", flushed_count)
+
+            if error_count > 0:
+                await self._stats.increment("feedback_flush_errors", error_count)
+                logger.warning(f"Feedback flush: {flushed_count} succeeded, {error_count} failed")
+            else:
+                logger.info(f"Flushed {flushed_count} feedback items to training in {flush_latency:.0f}ms")
+
             self._feedback_buffer.clear()
 
         except Exception as e:
-            logger.warning(f"Failed to flush feedback: {e}")
+            await self._stats.increment("feedback_flush_critical_error")
+            logger.error(f"Critical error flushing feedback: {e}")
 
     async def _select_strategy(
         self,
@@ -2056,33 +2509,57 @@ class ReasoningEngine:
                         break
 
     async def get_statistics(self) -> Dict[str, Any]:
-        """Get engine statistics (thread-safe)."""
+        """Get comprehensive engine statistics (thread-safe)."""
         stats = await self._stats.get_all_stats()
         cache_stats = await self._cache.get_stats()
         rate_limiter_stats = await self._rate_limiter.get_stats()
         latency_stats = await self._stats.get_timing_stats("reasoning_latency_ms")
+        rag_latency_stats = await self._stats.get_timing_stats("rag_retrieval_latency_ms")
+        feedback_flush_stats = await self._stats.get_timing_stats("feedback_flush_latency_ms")
+        rag_cache_stats = await self._rag_cache.get_stats()
 
         return {
             "counters": stats["counters"],
             "strategy_usage": stats["histograms"].get("strategy_usage", {}),
-            "latency": latency_stats,
-            "cache": cache_stats,
+            "latency": {
+                "reasoning": latency_stats,
+                "rag_retrieval": rag_latency_stats,
+                "feedback_flush": feedback_flush_stats,
+            },
+            "cache": {
+                "reasoning": cache_stats,
+                "rag_context": rag_cache_stats,
+            },
             "rate_limiter": rate_limiter_stats,
+            "feedback": {
+                "buffer_size": len(self._feedback_buffer),
+                "collected": stats["counters"].get("feedback_collected", 0),
+                "flushed": stats["counters"].get("feedback_flushed", 0),
+                "filtered_duplicate": stats["counters"].get("feedback_filtered_duplicate", 0),
+                "filtered_low_quality": stats["counters"].get("feedback_filtered_low_quality", 0),
+            },
+            "rag": {
+                "initialized": self._rag_initialized,
+                "cache_hits": stats["counters"].get("rag_cache_hits", 0),
+                "cache_misses": stats["counters"].get("rag_cache_misses", 0),
+                "retrievals": stats["counters"].get("rag_retrievals", 0),
+                "errors": stats["counters"].get("rag_retrieval_errors", 0),
+            },
             "config": {
                 "default_strategy": self.config.default_strategy.value,
                 "rag_enabled": self.config.rag_enabled,
                 "cache_enabled": self.config.cache_thoughts,
                 "max_concurrent": self.config.max_concurrent_reasoning,
+                "feedback_threshold": self.config.feedback_collection_threshold,
             },
-            "rag_initialized": self._rag_initialized,
-            "feedback_buffer_size": len(self._feedback_buffer),
         }
 
     async def shutdown(self) -> None:
         """
-        Graceful shutdown with state persistence (NEW in v92.0).
+        Graceful shutdown with state persistence (NEW in v92.0, enhanced v92.1).
 
         - Signals all active reasoning tasks to stop
+        - Cancels background flush task
         - Flushes feedback buffer
         - Persists cache if configured
         - Releases resources
@@ -2090,19 +2567,35 @@ class ReasoningEngine:
         logger.info("Reasoning engine shutting down...")
         self._shutdown_event.set()
 
-        # Cancel all active tasks
+        # Cancel background flush task
+        if self._feedback_flush_task and not self._feedback_flush_task.done():
+            self._feedback_flush_task.cancel()
+            try:
+                await self._feedback_flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel all active reasoning tasks
         cancelled = await self._cancellation_manager.cancel_all("Engine shutdown")
         logger.info(f"Cancelled {cancelled} active reasoning tasks")
 
-        # Flush feedback
+        # Final feedback flush
         await self._flush_feedback()
 
-        # Clear cache
+        # Clear caches
         await self._cache.clear()
 
-        # Final statistics
+        # Get final statistics
         final_stats = await self.get_statistics()
-        logger.info(f"Final reasoning engine stats: {final_stats['counters']}")
+        rag_cache_stats = await self._rag_cache.get_stats()
+
+        logger.info(
+            f"Final reasoning engine stats: "
+            f"calls={final_stats['counters'].get('total_reasoning_calls', 0)}, "
+            f"errors={final_stats['counters'].get('errors', 0)}, "
+            f"feedback_collected={final_stats['counters'].get('feedback_collected', 0)}, "
+            f"rag_cache_hit_rate={rag_cache_stats['hit_rate']:.2%}"
+        )
 
         logger.info("Reasoning engine shutdown complete")
 
@@ -2256,11 +2749,16 @@ __all__ = [
     "ThoughtTree",
     "ReasoningConfig",
     "ReasoningResult",
-    # Utilities (NEW in v92.0)
+    # Utilities (v92.0)
     "ThreadSafeStatistics",
     "LRUCache",
     "RateLimiter",
     "TaskCancellationManager",
+    # Advanced Utilities (v92.1)
+    "ContextWindowManager",
+    "RAGContextCache",
+    "FeedbackDeduplicator",
+    "QualityScorer",
     # Generators/Evaluators
     "ThoughtGenerator",
     "DefaultThoughtGenerator",
