@@ -1758,6 +1758,38 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  GCP Cross-Repo Bridge failed: {e}")
 
+        # 5.19. Initialize GCP Import Bridge v95.1 (Enterprise-Grade Cross-Repo Integration)
+        logger.info("")
+        logger.info("Initializing GCP Import Bridge v95.1 (Enterprise-Grade)...")
+        gcp_import_bridge = None
+        gcp_import_bridge_status = {"components": {}}
+        try:
+            from jarvis_prime.core.gcp_import_bridge import GCPImportBridge
+            gcp_import_bridge = await GCPImportBridge.get_instance()
+            initialized.append(("gcp_import_bridge", gcp_import_bridge))
+            gcp_import_bridge_status = await gcp_import_bridge.get_infrastructure_status()
+
+            components = gcp_import_bridge_status.get('components', {})
+            available = sum(1 for c in components.values() if c.get('available'))
+            total = len(components)
+
+            logger.info(f"  GCP Import Bridge initialized ({available}/{total} components)")
+            for name, info in components.items():
+                state = "CONNECTED" if info.get('available') else "UNAVAILABLE"
+                cb_state = info.get('circuit_breaker', {}).get('state', 'UNKNOWN')
+                logger.info(f"    - {name}: {state} (CB: {cb_state})")
+
+            # Show repos
+            if gcp_import_bridge_status.get('jarvis_repo'):
+                logger.info(f"    - JARVIS Repo: {gcp_import_bridge_status['jarvis_repo']}")
+            if gcp_import_bridge_status.get('reactor_repo'):
+                logger.info(f"    - Reactor Repo: {gcp_import_bridge_status['reactor_repo']}")
+
+        except ImportError as e:
+            logger.warning(f"  GCP Import Bridge not available: {e}")
+        except Exception as e:
+            logger.warning(f"  GCP Import Bridge failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1808,6 +1840,9 @@ async def main_v87_unified(args):
         logger.info(f"│  Model Router:            {'✓ ACTIVE' if model_router else '✗ INACTIVE':>18} │")
         logger.info(f"│  GCP VM Manager:          {'✓ ACTIVE' if gcp_manager else '✗ INACTIVE':>18} │")
         logger.info(f"│  GCP Cross-Repo Bridge:   {'✓ ACTIVE' if gcp_cross_repo_bridge else '✗ INACTIVE':>18} │")
+        gcp_bridge_components = gcp_import_bridge_status.get('summary', {})
+        gcp_bridge_text = f"✓ {gcp_bridge_components.get('available_components', 0)}/{gcp_bridge_components.get('total_components', 0)}" if gcp_import_bridge else "✗ INACTIVE"
+        logger.info(f"│  GCP Import Bridge v95.1: {gcp_bridge_text:>18} │")
         logger.info(f"│  Trinity Orchestrator:    {'✓ ACTIVE' if orchestrator else '✗ INACTIVE':>18} │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
@@ -2114,6 +2149,16 @@ async def main_v87_unified(args):
                         logger.info(f"    Requests Routed: {stats.get('requests_routed', 0)}")
                         logger.info(f"    Preemptions Handled: {stats.get('preemptions_handled', 0)}")
                     await shutdown_gcp_cross_repo_bridge()
+                    logger.info(f"  {name}: stopped")
+                elif name == "gcp_import_bridge":
+                    # v95.1: Stop GCP Import Bridge
+                    if hasattr(component, 'get_infrastructure_status'):
+                        status = await component.get_infrastructure_status()
+                        cache_stats = status.get('cache_stats', {})
+                        logger.info(f"    Cache Hits: {cache_stats.get('hits', 0)}")
+                        logger.info(f"    Cache Hit Rate: {cache_stats.get('hit_rate', 0):.1%}")
+                    if hasattr(component, 'shutdown'):
+                        await component.shutdown()
                     logger.info(f"  {name}: stopped")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")

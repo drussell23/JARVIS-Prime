@@ -1192,16 +1192,35 @@ class GCPImportBridge:
             return None
 
         try:
+            # CRITICAL: CostTracker uses asyncio.Lock() in __init__
+            # So we CANNOT run it in an executor (no event loop in that thread)
+            # Must run synchronously in the current async context
+
             if hasattr(module, "get_cost_tracker"):
-                return await module.get_cost_tracker()
+                factory = module.get_cost_tracker
+
+                if asyncio.iscoroutinefunction(factory):
+                    instance = await factory()
+                else:
+                    # It's synchronous but creates asyncio objects internally
+                    # Run directly (not in executor!) - fast enough
+                    instance = factory()
+                return instance
+
             elif hasattr(module, "CostTracker"):
-                instance = module.CostTracker()
+                # Direct instantiation
+                if hasattr(module, "CostTrackerConfig"):
+                    config = module.CostTrackerConfig()
+                    instance = module.CostTracker(config)
+                else:
+                    instance = module.CostTracker()
+
                 if hasattr(instance, "initialize"):
-                    # Handle both sync and async initialize
                     init_result = instance.initialize()
                     if asyncio.iscoroutine(init_result):
                         await init_result
                 return instance
+
         except Exception as e:
             logger.warning(f"CostTracker creation failed: {e}")
         return None
@@ -1253,18 +1272,40 @@ class GCPImportBridge:
             return None
 
         try:
+            # AdvancedRAMMonitor requires a config dict
+            default_config = {
+                "monitoring_interval_seconds": 5.0,
+                "history_size": 60,
+                "pressure_thresholds": {
+                    "low": 50.0,
+                    "normal": 70.0,
+                    "high": 85.0,
+                    "critical": 95.0,
+                },
+                "workload_threshold_gb": 2.0,
+                "enable_predictive": True,
+            }
+
             if hasattr(module, "get_ram_monitor"):
-                return await module.get_ram_monitor()
-            elif hasattr(module, "AdvancedRAMMonitor"):
-                # Try with default config
-                if hasattr(module, "RAMMonitorConfig"):
-                    config = module.RAMMonitorConfig()
-                    instance = module.AdvancedRAMMonitor(config)
+                # get_ram_monitor may be sync or async
+                factory = module.get_ram_monitor
+                if asyncio.iscoroutinefunction(factory):
+                    instance = await factory(default_config)
                 else:
-                    instance = module.AdvancedRAMMonitor()
+                    instance = factory(default_config)
+
+                # Start monitoring if needed
                 if hasattr(instance, "start"):
                     await instance.start()
                 return instance
+
+            elif hasattr(module, "AdvancedRAMMonitor"):
+                # Direct instantiation with config
+                instance = module.AdvancedRAMMonitor(default_config)
+                if hasattr(instance, "start"):
+                    await instance.start()
+                return instance
+
         except Exception as e:
             logger.warning(f"AdvancedRAMMonitor creation failed: {e}")
         return None
