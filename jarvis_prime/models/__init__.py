@@ -21,7 +21,9 @@ FEATURES:
 """
 
 # Base models (existing)
-from jarvis_prime.models.prime_model import PrimeModel, PrimeConfig
+from jarvis_prime.models.prime_model import PrimeModel, PrimeModelConfig
+# Alias for backwards compatibility
+PrimeConfig = PrimeModelConfig
 from jarvis_prime.models.llama_model import (
     LlamaModel,
     load_llama_13b_gcp,
