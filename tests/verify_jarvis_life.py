@@ -163,6 +163,63 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 logger = setup_logging(os.getenv("JARVIS_DEMO_VERBOSE", "false").lower() == "true")
 
+
+# =============================================================================
+# OUTPUT MANAGER - Synchronized Terminal Output (Prevents Display Corruption)
+# =============================================================================
+
+class OutputManager:
+    """
+    Thread-safe and async-safe output manager.
+
+    Prevents display corruption from concurrent async tasks writing to stdout.
+    All terminal output should go through this manager.
+    """
+
+    _instance: Optional["OutputManager"] = None
+    _lock: Optional[asyncio.Lock] = None
+    _thread_lock = __import__("threading").Lock()
+
+    def __new__(cls) -> "OutputManager":
+        """Singleton pattern for global output coordination."""
+        if cls._instance is None:
+            with cls._thread_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if not hasattr(self, "_initialized"):
+            self._initialized = True
+            self._buffer: List[str] = []
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Lazy initialization of async lock (must be in async context)."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def print(self, *args, **kwargs) -> None:
+        """Thread-safe print with async lock."""
+        async with self.lock:
+            print(*args, **kwargs, flush=True)
+
+    async def print_block(self, text: str) -> None:
+        """Print a multi-line block atomically."""
+        async with self.lock:
+            print(text, flush=True)
+
+    def print_sync(self, *args, **kwargs) -> None:
+        """Synchronous print for non-async contexts."""
+        with self._thread_lock:
+            print(*args, **kwargs, flush=True)
+
+
+# Global output manager instance
+output = OutputManager()
+
+
 # =============================================================================
 # ENVIRONMENT CONFIGURATION (Zero Hardcoding)
 # =============================================================================
@@ -535,91 +592,130 @@ class IntelligentRouter:
         return self._decision_history.copy()
 
 # =============================================================================
-# VOICE ENGINE - Daniel's Voice with macOS Fallback
+# VOICE ENGINE - Robust Direct macOS TTS (No Trinity Coordinator)
 # =============================================================================
 
 class VoiceEngine:
     """
-    Text-to-Speech engine with multi-tier fallback.
+    Robust Text-to-Speech engine using direct macOS 'say' command.
 
-    Fallback chain:
-    1. Trinity Voice Coordinator (from JARVIS repo)
-    2. macOS 'say' command with Daniel voice
-    3. Silent mode (log only)
+    Features:
+    - Direct subprocess execution (bypasses Trinity queue issues)
+    - Async lock to prevent race conditions
+    - Automatic text chunking for long responses
+    - Retry with exponential backoff
+    - Process cleanup on timeout
+
+    This implementation avoids the Trinity Voice Coordinator to prevent:
+    - Stale announcement issues
+    - Worker race conditions
+    - Queue backlog problems
     """
+
+    # Maximum text length per utterance (prevents timeouts)
+    # Shorter chunks = faster individual speaks = more resilient
+    MAX_CHUNK_LENGTH: int = 200
 
     def __init__(self, config: DemoConfig):
         self.config = config
-        self._trinity_available = False
         self._macos_say_available = False
         self._initialized = False
+        self._speak_lock = asyncio.Lock()
+        self._active_process: Optional[asyncio.subprocess.Process] = None
 
     async def initialize(self) -> bool:
         """Initialize voice engine with availability detection."""
         if self._initialized:
             return True
 
-        # Try to import Trinity Voice Coordinator
-        try:
-            with suppress(ImportError, AttributeError):
-                from backend.core.trinity_voice_coordinator import (
-                    announce as trinity_announce,
-                    get_voice_coordinator,
-                    VoiceContext,
-                    VoicePriority,
-                )
-                self._trinity_available = True
-                self._trinity_announce = trinity_announce
-                self._VoiceContext = VoiceContext
-                self._VoicePriority = VoicePriority
-                logger.debug("Trinity Voice Coordinator available")
-        except Exception:
-            pass
-
-        # Check macOS 'say' command
+        # Check macOS 'say' command availability
         try:
             result = await asyncio.create_subprocess_exec(
                 "which", "say",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await result.wait()
+            await asyncio.wait_for(result.wait(), timeout=5.0)
             self._macos_say_available = (result.returncode == 0)
+
             if self._macos_say_available:
-                logger.debug("macOS 'say' command available")
-        except Exception:
-            pass
+                # Verify the voice exists
+                voice_check = await asyncio.create_subprocess_exec(
+                    "say", "-v", "?",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(
+                    voice_check.communicate(), timeout=5.0
+                )
+                available_voices = stdout.decode().lower()
+
+                if self.config.voice_name.lower() not in available_voices:
+                    logger.warning(
+                        f"[Voice] Voice '{self.config.voice_name}' not found, "
+                        f"falling back to default"
+                    )
+                    # Use system default voice
+                    self.config.voice_name = "Daniel"  # Common fallback
+
+        except asyncio.TimeoutError:
+            logger.warning("[Voice] Timeout checking voice availability")
+            self._macos_say_available = False
+        except Exception as e:
+            logger.warning(f"[Voice] Init error: {e}")
+            self._macos_say_available = False
 
         self._initialized = True
-        return self._trinity_available or self._macos_say_available
+        return self._macos_say_available
 
-    async def speak(self, text: str, context: str = "narrator") -> bool:
+    def _chunk_text(self, text: str) -> List[str]:
         """
-        Speak text using available voice engine.
+        Split text into speakable chunks at sentence boundaries.
 
-        Returns True if voice was played, False otherwise.
+        Prevents timeouts on long responses.
         """
-        if not self.config.voice_enabled:
-            logger.debug("[Voice] Disabled by configuration")
-            return False
+        if len(text) <= self.MAX_CHUNK_LENGTH:
+            return [text]
 
-        await self.initialize()
+        chunks = []
+        current_chunk = ""
 
-        # Try Trinity Voice Coordinator first
-        if self._trinity_available:
-            try:
-                await self._trinity_announce(
-                    message=text,
-                    context=self._VoiceContext.NARRATOR,
-                    priority=self._VoicePriority.NORMAL,
-                    source="jarvis_life_demo",
-                )
-                return True
-            except Exception as e:
-                logger.debug(f"[Voice] Trinity failed: {e}")
+        # Split by sentences
+        sentences = text.replace("...", "<<<ELLIPSIS>>>").split(". ")
 
-        # Fallback to macOS 'say'
-        if self._macos_say_available:
+        for sentence in sentences:
+            sentence = sentence.replace("<<<ELLIPSIS>>>", "...").strip()
+            if not sentence:
+                continue
+
+            # Add period back if it was removed
+            if not sentence.endswith((".", "!", "?", "...")):
+                sentence += "."
+
+            if len(current_chunk) + len(sentence) + 1 <= self.MAX_CHUNK_LENGTH:
+                current_chunk = f"{current_chunk} {sentence}".strip()
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = sentence
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks if chunks else [text[:self.MAX_CHUNK_LENGTH]]
+
+    async def _speak_chunk(
+        self,
+        text: str,
+        timeout: float = 15.0,  # Shorter timeout for smaller chunks
+        retries: int = 1,       # Fewer retries for faster recovery
+    ) -> bool:
+        """
+        Speak a single chunk of text with retry logic.
+
+        Uses exponential backoff on failure.
+        """
+        for attempt in range(retries + 1):
             try:
                 cmd = [
                     "say",
@@ -627,20 +723,100 @@ class VoiceEngine:
                     "-r", str(self.config.voice_rate),
                     text,
                 ]
-                process = await asyncio.create_subprocess_exec(
+
+                self._active_process = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await asyncio.wait_for(process.wait(), timeout=30.0)
-                return process.returncode == 0
-            except asyncio.TimeoutError:
-                logger.warning("[Voice] macOS say timed out")
-            except Exception as e:
-                logger.warning(f"[Voice] macOS say failed: {e}")
 
-        logger.debug("[Voice] No voice engine available")
+                try:
+                    await asyncio.wait_for(
+                        self._active_process.wait(),
+                        timeout=timeout,
+                    )
+                    success = self._active_process.returncode == 0
+                    self._active_process = None
+                    return success
+
+                except asyncio.TimeoutError:
+                    # Kill the hung process
+                    if self._active_process:
+                        try:
+                            self._active_process.kill()
+                            await asyncio.wait_for(
+                                self._active_process.wait(),
+                                timeout=2.0,
+                            )
+                        except Exception:
+                            pass
+                        self._active_process = None
+
+                    if attempt < retries:
+                        backoff = (2 ** attempt) * 0.5
+                        logger.debug(f"[Voice] Timeout, retrying in {backoff}s...")
+                        await asyncio.sleep(backoff)
+                    continue
+
+            except Exception as e:
+                if attempt < retries:
+                    backoff = (2 ** attempt) * 0.5
+                    logger.debug(f"[Voice] Error ({e}), retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.warning(f"[Voice] Failed after {retries + 1} attempts: {e}")
+                    return False
+
         return False
+
+    async def speak(self, text: str, context: str = "narrator") -> bool:
+        """
+        Speak text using macOS 'say' command.
+
+        Features:
+        - Async lock prevents concurrent speech (race conditions)
+        - Text chunking for long responses
+        - Automatic retry on failure
+
+        Returns True if voice was played successfully.
+        """
+        if not self.config.voice_enabled:
+            return False
+
+        await self.initialize()
+
+        if not self._macos_say_available:
+            logger.debug("[Voice] macOS say not available")
+            return False
+
+        # Acquire lock to prevent concurrent speech
+        async with self._speak_lock:
+            chunks = self._chunk_text(text)
+
+            for i, chunk in enumerate(chunks):
+                success = await self._speak_chunk(chunk)
+                if not success:
+                    logger.warning(f"[Voice] Failed on chunk {i + 1}/{len(chunks)}")
+                    return False
+
+                # Small pause between chunks for natural flow
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(0.1)
+
+            return True
+
+    async def stop(self) -> None:
+        """Stop any active speech."""
+        if self._active_process:
+            try:
+                self._active_process.kill()
+                await asyncio.wait_for(
+                    self._active_process.wait(),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
+            self._active_process = None
 
 # =============================================================================
 # EXPERIENCE LOGGER - Trinity Loop to Reactor
@@ -844,8 +1020,14 @@ class JARVISLifeDemo:
         self.experience_logger = ExperienceLogger(self.config)
         self.inference = MockInferenceEngine(self.config)
         self._results: List[DemoResponse] = []
+        self._output_lock = asyncio.Lock()
 
-    def _print_header(self) -> None:
+    async def _print(self, *args, **kwargs) -> None:
+        """Synchronized print to prevent display corruption."""
+        async with self._output_lock:
+            print(*args, **kwargs, flush=True)
+
+    async def _print_header(self) -> None:
         """Print demo header with ASCII art."""
         header = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -857,15 +1039,15 @@ class JARVISLifeDemo:
 ║  ╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║    ███████╗██║██║     ███████╗ ║
 ║   ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝    ╚══════╝╚═╝╚═╝     ╚══════╝ ║
 ║                                                                              ║
-║                    🧠 CAPABILITIES DEMONSTRATION v92.1 🧠                     ║
+║                    🧠 CAPABILITIES DEMONSTRATION v92.2 🧠                     ║
 ║                                                                              ║
 ║    "Is JARVIS Alive?" - Watch the Brain Think, Decide, and Speak            ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
-        print("\033[36m" + header + "\033[0m")
+        await self._print("\033[36m" + header + "\033[0m")
 
-    def _print_routing_decision(self, decision: RoutingDecision) -> None:
+    async def _print_routing_decision(self, decision: RoutingDecision) -> None:
         """Print routing decision with rich formatting."""
         tier_colors = {
             ModelTier.TIER_0_LOCAL: "\033[32m",   # Green
@@ -876,7 +1058,7 @@ class JARVISLifeDemo:
         reset = "\033[0m"
         bold = "\033[1m"
 
-        print(f"""
+        block = f"""
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ {bold}[ROUTER] DECISION{reset}                                                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -887,11 +1069,12 @@ class JARVISLifeDemo:
 │  Reasoning:      {decision.reasoning[:50]:50}│
 │  Est. Latency:   {decision.latency_estimate_ms:.0f}ms                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
-""")
+"""
+        await self._print(block)
 
-    def _print_test_case(self, test: TestCase, index: int) -> None:
+    async def _print_test_case(self, test: TestCase, index: int) -> None:
         """Print test case header."""
-        print(f"""
+        block = f"""
 {'='*80}
   {test.name}
   {'-'*len(test.name)}
@@ -899,19 +1082,20 @@ class JARVISLifeDemo:
   Expected: {test.expected_tier.value}
   Description: {test.description}
 {'='*80}
-""")
+"""
+        await self._print(block)
 
     async def _process_test_case(self, test: TestCase) -> DemoResponse:
         """Process a single test case through the full pipeline."""
         start_time = time.time()
 
         # Step 1: Route the request
-        print("\n[TEST] Sending query to Router...")
+        await self._print("\n[TEST] Sending query to Router...")
         decision = self.router.route(test.query)
-        self._print_routing_decision(decision)
+        await self._print_routing_decision(decision)
 
         # Step 2: Generate response (mock or real)
-        print("[TEST] Generating response...")
+        await self._print("[TEST] Generating response...")
         response_text, inference_latency = await self.inference.generate(
             test.query,
             decision.selected_model,
@@ -920,18 +1104,18 @@ class JARVISLifeDemo:
 
         total_latency = (time.time() - start_time) * 1000
 
-        print(f"\n[RESPONSE] ({inference_latency:.0f}ms)")
-        print(f"  {response_text[:200]}{'...' if len(response_text) > 200 else ''}")
+        await self._print(f"\n[RESPONSE] ({inference_latency:.0f}ms)")
+        await self._print(f"  {response_text[:200]}{'...' if len(response_text) > 200 else ''}")
 
         # Step 3: Play voice
         voice_played = False
         if self.config.voice_enabled:
-            print("\n[VOICE] Speaking response...")
+            await self._print("\n[VOICE] Speaking response...")
             voice_played = await self.voice.speak(response_text)
             if voice_played:
-                print("[VOICE] ✓ Audio played successfully")
+                await self._print("[VOICE] ✓ Audio played successfully")
             else:
-                print("[VOICE] ✗ Voice unavailable, continuing silently")
+                await self._print("[VOICE] ✗ Voice unavailable, continuing silently")
 
         # Step 4: Log experience to Reactor
         experience_logged = False
@@ -951,7 +1135,7 @@ class JARVISLifeDemo:
             )
             experience_logged = await self.experience_logger.log_experience(experience)
             if experience_logged:
-                print(f"[REACTOR] ✓ Experience logged to Trinity loop")
+                await self._print("[REACTOR] ✓ Experience logged to Trinity loop")
 
         # Build response
         return DemoResponse(
@@ -966,26 +1150,23 @@ class JARVISLifeDemo:
 
     async def run(self) -> List[DemoResponse]:
         """Run the full demo sequence."""
-        self._print_header()
+        await self._print_header()
 
-        print("\n🚀 Starting JARVIS Life Demo...")
-        print(f"   Voice: {'Enabled' if self.config.voice_enabled else 'Disabled'} ({self.config.voice_name})")
-        print(f"   Experience Logging: {'Enabled' if self.config.log_experiences else 'Disabled'}")
-        print(f"   Mock Inference: {'Enabled' if self.config.mock_inference else 'Disabled'}")
+        await self._print("\n🚀 Starting JARVIS Life Demo...")
+        await self._print(f"   Voice: {'Enabled' if self.config.voice_enabled else 'Disabled'} ({self.config.voice_name})")
+        await self._print(f"   Experience Logging: {'Enabled' if self.config.log_experiences else 'Disabled'}")
+        await self._print(f"   Mock Inference: {'Enabled' if self.config.mock_inference else 'Disabled'}")
 
         # Initialize components
         await self.voice.initialize()
         await self.experience_logger.initialize()
 
-        # Opening announcement
-        if self.config.voice_enabled:
-            await self.voice.speak(
-                "JARVIS Life Demo initialized. Beginning capability demonstration."
-            )
+        # Opening announcement (skip for faster demo start)
+        # Voice will play with responses instead
 
         # Process each test case
         for i, test in enumerate(self.TEST_CASES):
-            self._print_test_case(test, i)
+            await self._print_test_case(test, i)
 
             try:
                 result = await self._process_test_case(test)
@@ -993,9 +1174,9 @@ class JARVISLifeDemo:
 
                 # Verify routing was correct
                 if result.routing_decision.tier == test.expected_tier:
-                    print(f"\n✅ ROUTING CORRECT: Got {result.routing_decision.tier.value} (expected {test.expected_tier.value})")
+                    await self._print(f"\n✅ ROUTING CORRECT: Got {result.routing_decision.tier.value} (expected {test.expected_tier.value})")
                 else:
-                    print(f"\n⚠️ ROUTING MISMATCH: Got {result.routing_decision.tier.value} (expected {test.expected_tier.value})")
+                    await self._print(f"\n⚠️ ROUTING MISMATCH: Got {result.routing_decision.tier.value} (expected {test.expected_tier.value})")
 
             except Exception as e:
                 logger.error(f"Test case failed: {e}")
@@ -1019,22 +1200,25 @@ class JARVISLifeDemo:
 
             # Pause between tests for analysis
             if self.config.pause_between_tests and i < len(self.TEST_CASES) - 1:
-                print("\n" + "─"*80)
-                input("Press ENTER to continue to next test...")
+                await self._print("\n" + "─"*80)
+                # Use asyncio-safe input
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: input("Press ENTER to continue to next test...")
+                )
 
         # Print summary
-        self._print_summary()
+        await self._print_summary()
 
         return self._results
 
-    def _print_summary(self) -> None:
+    async def _print_summary(self) -> None:
         """Print final demo summary."""
         successful = sum(1 for r in self._results if r.success)
         total = len(self._results)
         voice_played = sum(1 for r in self._results if r.voice_played)
         experiences_logged = sum(1 for r in self._results if r.experience_logged)
 
-        print(f"""
+        summary = f"""
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                           DEMO SUMMARY                                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
@@ -1047,7 +1231,8 @@ class JARVISLifeDemo:
 ║  🧠 JARVIS IS ALIVE - The Brain is thinking, deciding, and speaking!        ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-""")
+"""
+        await self._print(summary)
 
 # =============================================================================
 # MAIN ENTRY POINT
