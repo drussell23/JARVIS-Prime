@@ -1708,6 +1708,96 @@ async def get_gcp_infrastructure_status() -> Dict[str, Any]:
 
 
 # =============================================================================
+# DYNAMIC MODEL REGISTRY INTEGRATION
+# =============================================================================
+
+
+async def get_model_registry():
+    """
+    Get the Dynamic Model Registry singleton.
+
+    Returns:
+        DynamicModelRegistry instance
+    """
+    from jarvis_prime.core.dynamic_model_registry import get_dynamic_model_registry
+    return await get_dynamic_model_registry()
+
+
+async def get_model_for_tier(tier_id: str, context: Optional[Dict[str, Any]] = None):
+    """
+    Get the best model for a specific tier.
+
+    Args:
+        tier_id: Tier identifier (e.g., "tier_0_local_fast")
+        context: Additional context for selection
+
+    Returns:
+        Tuple of (ModelSpec, Path)
+    """
+    registry = await get_model_registry()
+    return await registry.get_model_for_tier(tier_id, context)
+
+
+async def neural_select_model(
+    prompt: str,
+    complexity: float,
+    requirements: Optional[List[str]] = None,
+    context: Optional[Dict[str, Any]] = None,
+):
+    """
+    Use neural selection to pick the best model.
+
+    Args:
+        prompt: The prompt to process
+        complexity: Complexity score (0-1)
+        requirements: Required capabilities (e.g., ["code", "reasoning"])
+        context: Additional context
+
+    Returns:
+        Tuple of (ModelSpec, Optional[Path])
+    """
+    registry = await get_model_registry()
+    return await registry.neural_select(prompt, complexity, requirements, context)
+
+
+async def get_or_download_model(model_id: str, quantization: Optional[str] = None):
+    """
+    Get a model, downloading if necessary.
+
+    Args:
+        model_id: Model identifier (e.g., "phi-3.5-mini")
+        quantization: Quantization variant (uses default if not specified)
+
+    Returns:
+        Path to model file
+    """
+    registry = await get_model_registry()
+    return await registry.get_or_download(model_id, quantization)
+
+
+async def get_available_models() -> List[Dict[str, Any]]:
+    """
+    Get list of available (downloaded) models.
+
+    Returns:
+        List of model info dictionaries
+    """
+    registry = await get_model_registry()
+    return registry.get_available_models()
+
+
+async def get_model_registry_stats() -> Dict[str, Any]:
+    """
+    Get model registry statistics.
+
+    Returns:
+        Statistics dictionary
+    """
+    registry = await get_model_registry()
+    return registry.get_statistics()
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -1762,4 +1852,11 @@ __all__ = [
     "should_burst_to_cloud",
     "request_cloud_burst",
     "get_gcp_infrastructure_status",
+    # Model Registry Integration
+    "get_model_registry",
+    "get_model_for_tier",
+    "neural_select_model",
+    "get_or_download_model",
+    "get_available_models",
+    "get_model_registry_stats",
 ]

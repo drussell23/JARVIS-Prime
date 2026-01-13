@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cross-Repo Integration Test Suite v95.1
+Cross-Repo Integration Test Suite v95.2
 ========================================
 
 Comprehensive tests for cross-repo integration between:
@@ -14,6 +14,9 @@ Tests:
 3. Elastic cloud burst
 4. Circuit breakers and rate limiting
 5. Event bus coordination
+6. HybridTieredRouter with tier selection
+7. Budget and RAM monitoring
+8. Dynamic Model Registry with neural selection
 
 Run:
     python3 tests/test_cross_repo_integration.py
@@ -338,11 +341,77 @@ async def test_budget_and_ram(results: TestResults) -> None:
         results.record_fail("Budget/RAM", str(e))
 
 
+async def test_dynamic_model_registry(results: TestResults) -> None:
+    """Test Dynamic Model Registry v95.2."""
+    print()
+    print("8. Testing Dynamic Model Registry...")
+
+    try:
+        from jarvis_prime.core.dynamic_model_registry import (
+            get_dynamic_model_registry,
+            KNOWN_MODELS,
+            TIER_MODEL_MAPPING,
+            NeuralModelSelector,
+        )
+
+        # Test KNOWN_MODELS catalog
+        if len(KNOWN_MODELS) >= 5:
+            results.record_pass("KNOWN_MODELS catalog")
+        else:
+            results.record_fail("KNOWN_MODELS catalog", f"only {len(KNOWN_MODELS)} models")
+
+        # Test TIER_MODEL_MAPPING
+        required_tiers = ["tier_0_local_fast", "tier_05_local_capable", "tier_1_cloud_intelligent"]
+        has_all_tiers = all(t in TIER_MODEL_MAPPING for t in required_tiers)
+        if has_all_tiers:
+            results.record_pass("TIER_MODEL_MAPPING")
+        else:
+            results.record_fail("TIER_MODEL_MAPPING", "missing tiers")
+
+        # Test registry initialization
+        registry = await get_dynamic_model_registry()
+        if registry._initialized:
+            results.record_pass("DynamicModelRegistry.initialized")
+        else:
+            results.record_fail("DynamicModelRegistry.initialized", "not initialized")
+
+        # Test get_model_spec
+        spec = registry.get_model_spec("phi-3.5-mini")
+        if spec and spec.parameter_count == "3.8B":
+            results.record_pass("DynamicModelRegistry.get_model_spec")
+        else:
+            results.record_fail("DynamicModelRegistry.get_model_spec", "spec not found")
+
+        # Test Neural Model Selector
+        selector = NeuralModelSelector()
+        available_specs = list(KNOWN_MODELS.values())[:4]
+        selected = await selector.select(
+            prompt="implement async caching",
+            complexity_score=0.6,
+            available_models=available_specs,
+            requirements=["code"],
+        )
+        if selected and selected.model_id:
+            results.record_pass("NeuralModelSelector.select")
+        else:
+            results.record_fail("NeuralModelSelector.select", "no model selected")
+
+        # Test registry statistics
+        stats = registry.get_statistics()
+        if "total_known_models" in stats and stats["total_known_models"] >= 5:
+            results.record_pass("DynamicModelRegistry.get_statistics")
+        else:
+            results.record_fail("DynamicModelRegistry.get_statistics", "missing stats")
+
+    except Exception as e:
+        results.record_fail("DynamicModelRegistry", str(e))
+
+
 async def main():
     """Run all integration tests."""
     print("=" * 70)
-    print("  CROSS-REPO INTEGRATION TEST SUITE v95.1")
-    print("  Enterprise-Grade GCP Bridge + HybridTieredRouter")
+    print("  CROSS-REPO INTEGRATION TEST SUITE v95.2")
+    print("  GCP Bridge + HybridTieredRouter + Dynamic Model Registry")
     print("=" * 70)
 
     results = TestResults()
@@ -355,6 +424,7 @@ async def main():
     await test_event_bus(results)
     await test_hybrid_tiered_router(results)
     await test_budget_and_ram(results)
+    await test_dynamic_model_registry(results)
 
     # Print summary
     print()

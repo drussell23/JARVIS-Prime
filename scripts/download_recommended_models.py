@@ -1,36 +1,46 @@
 #!/usr/bin/env python3
 """
-JARVIS-Prime Model Downloader - Get Claude-3.5-Sonnet Equivalent Local Models
-==============================================================================
+JARVIS-Prime Model Downloader v95.2 - Dynamic Model Registry Integration
+=========================================================================
 
-Downloads recommended GGUF models from Hugging Face for local inference.
+Downloads and manages GGUF models for local inference using the Dynamic Model Registry.
 
-RECOMMENDED MODELS (Claude-3.5-Sonnet alternatives):
+This script integrates with the DynamicModelRegistry for:
+- Auto-discovery of local models
+- On-demand download from HuggingFace
+- Neural model selection
+- Tier-aware model mapping
+- SHA256 checksum verification
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  Model              │ Size   │ Quality │ Speed  │ Best For                 │
-├─────────────────────┼────────┼─────────┼────────┼──────────────────────────┤
-│  Qwen 2.5 3B        │ 1.8GB  │ ⭐⭐⭐    │ 50t/s  │ Fast testing             │
-│  Llama 3.2 3B       │ 2.0GB  │ ⭐⭐⭐    │ 45t/s  │ Fast, good quality       │
-│  Phi-3 Mini 3.8B    │ 2.3GB  │ ⭐⭐⭐⭐   │ 40t/s  │ Efficient reasoning      │
-│  Qwen 2.5 7B        │ 4.4GB  │ ⭐⭐⭐⭐   │ 25t/s  │ Best balance             │
-│  Llama 3.1 8B       │ 4.7GB  │ ⭐⭐⭐⭐   │ 22t/s  │ General purpose          │
-│  Qwen 2.5 14B       │ 8.5GB  │ ⭐⭐⭐⭐⭐  │ 12t/s  │ High quality             │
-│  Qwen 2.5 32B       │ 19GB   │ ⭐⭐⭐⭐⭐  │ 5t/s   │ Closest to Sonnet        │
-└─────────────────────────────────────────────────────────────────────────────┘
+RECOMMENDED MODELS (Tier-Optimized):
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Tier    │ Model              │ Params  │ Speed  │ Best For                     │
+├──────────┼────────────────────┼─────────┼────────┼──────────────────────────────┤
+│  0-Fast  │ Phi-3.5 Mini       │ 3.8B    │ 55t/s  │ Voice interface, quick chat  │
+│  0-Fast  │ DeepSeek-R1-8B     │ 8B      │ 25t/s  │ Local reasoning              │
+│  0-Fast  │ Qwen 2.5 7B        │ 7B      │ 28t/s  │ General tasks                │
+│  0.5     │ Qwen 2.5 32B       │ 32B     │ 8t/s   │ Complex coding (local best)  │
+│  1-Cloud │ Llama-3.3-70B      │ 70B     │ 45t/s* │ Expert tasks (cloud)         │
+│  2-Deep  │ DeepSeek-V2        │ 16B MoE │ 50t/s* │ Deep reasoning (cloud)       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+* Cloud inference speeds on A100
 
 Usage:
-    # List available models
+    # List available models (from Dynamic Registry)
     python3 scripts/download_recommended_models.py --list
 
-    # Download recommended model (Qwen 2.5 7B)
-    python3 scripts/download_recommended_models.py --download qwen-7b
+    # Download model using registry
+    python3 scripts/download_recommended_models.py --download phi-3.5-mini
 
-    # Download specific model
-    python3 scripts/download_recommended_models.py --download llama-8b
+    # Download all essential models
+    python3 scripts/download_recommended_models.py --download-essential
 
     # Set as current model
-    python3 scripts/download_recommended_models.py --set-current qwen-7b
+    python3 scripts/download_recommended_models.py --set-current qwen-2.5-7b
+
+    # Neural selection demo
+    python3 scripts/download_recommended_models.py --neural-select "implement async caching"
 """
 
 import argparse
