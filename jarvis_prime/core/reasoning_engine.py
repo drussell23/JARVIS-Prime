@@ -2793,6 +2793,25 @@ class ReasoningEngine:
         # Calculate comprehensive quality score
         quality_score = self._quality_scorer.score(result, input_text)
 
+        # v92.1: Record feedback for adaptive strategy selector (online learning)
+        try:
+            from jarvis_prime.core.adaptive_strategy_selector import (
+                get_adaptive_strategy_selector,
+            )
+            selector = await get_adaptive_strategy_selector()
+            await selector.record_feedback(
+                input_text=input_text,
+                strategy=result.strategy.value,
+                quality_score=quality_score,
+                execution_time_ms=result.latency_ms,
+                context=merged_context,
+            )
+            await self._stats.increment("adaptive_selector_feedback_recorded")
+        except ImportError:
+            pass  # Adaptive selector not available
+        except Exception as e:
+            logger.debug(f"Failed to record adaptive selector feedback: {e}")
+
         # Skip low-quality results (but keep errors for learning)
         if not is_error and quality_score < self.config.feedback_collection_threshold:
             await self._stats.increment("feedback_filtered_low_quality")
@@ -2945,11 +2964,63 @@ class ReasoningEngine:
         """
         Automatically select best strategy for input.
 
-        Uses RAG-retrieved context to improve selection (NEW in v92.0).
+        v92.1: Uses ML-based adaptive selector with heuristic fallback.
+        - Learns from historical performance
+        - Extracts features (complexity, domain, task type)
+        - Uses neural network for prediction when enough data exists
+        - Falls back to heuristics for cold start or errors
         """
         if not self.config.enable_adaptive:
             return self.config.default_strategy
 
+        # v92.1: Try ML-based adaptive selection first
+        ml_strategy: Optional[ReasoningStrategy] = None
+        ml_confidence: float = 0.0
+
+        try:
+            from jarvis_prime.core.adaptive_strategy_selector import (
+                get_adaptive_strategy_selector,
+                ReasoningStrategy as AdaptiveReasoningStrategy,
+            )
+
+            selector = await get_adaptive_strategy_selector()
+            adaptive_strategy, ml_confidence = await selector.select_strategy(
+                input_text,
+                context,
+            )
+
+            # Map adaptive strategy to engine strategy
+            strategy_mapping = {
+                AdaptiveReasoningStrategy.CHAIN_OF_THOUGHT: ReasoningStrategy.CHAIN_OF_THOUGHT,
+                AdaptiveReasoningStrategy.TREE_OF_THOUGHTS: ReasoningStrategy.TREE_OF_THOUGHTS,
+                AdaptiveReasoningStrategy.SELF_REFLECTION: ReasoningStrategy.SELF_REFLECTION,
+                AdaptiveReasoningStrategy.HYPOTHESIS_TESTING: ReasoningStrategy.HYPOTHESIS_TEST,
+                AdaptiveReasoningStrategy.DIRECT: ReasoningStrategy.CHAIN_OF_THOUGHT,  # No direct strategy
+            }
+
+            ml_strategy = strategy_mapping.get(adaptive_strategy)
+
+            if ml_strategy and ml_confidence >= 0.6:
+                await self._stats.record_histogram(
+                    "strategy_selection_ml",
+                    ml_strategy.value,
+                )
+                await self._stats.record_timing(
+                    "ml_strategy_confidence",
+                    ml_confidence * 1000,  # Convert to ms-like value for histogram
+                )
+                logger.debug(
+                    f"ML strategy selection: {ml_strategy.value} "
+                    f"(confidence={ml_confidence:.2f})"
+                )
+                return ml_strategy
+
+        except ImportError:
+            logger.debug("Adaptive strategy selector not available, using heuristics")
+        except Exception as e:
+            logger.debug(f"ML strategy selection failed, falling back to heuristics: {e}")
+
+        # Fall back to heuristics if ML confidence is too low or unavailable
         input_lower = input_text.lower()
 
         # Check if RAG context suggests a strategy
@@ -2987,8 +3058,13 @@ class ReasoningEngine:
         # Select highest scoring or default
         best_strategy = max(scores, key=scores.get)
         if scores[best_strategy] > 0:
-            await self._stats.record_histogram("strategy_selection", best_strategy.value)
+            await self._stats.record_histogram("strategy_selection_heuristic", best_strategy.value)
             return best_strategy
+
+        # If ML had low confidence but still made a prediction, use it as tiebreaker
+        if ml_strategy and ml_confidence > 0.3:
+            await self._stats.record_histogram("strategy_selection_ml_fallback", ml_strategy.value)
+            return ml_strategy
 
         return self.config.default_strategy
 

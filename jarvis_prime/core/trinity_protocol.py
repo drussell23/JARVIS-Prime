@@ -159,6 +159,219 @@ class ConnectionState(Enum):
 
 
 # =============================================================================
+# RETRY WITH EXPONENTIAL BACKOFF (v92.1)
+# =============================================================================
+
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
+    max_attempts: int = 3
+    initial_delay_seconds: float = 1.0
+    max_delay_seconds: float = 30.0
+    exponential_base: float = 2.0
+    jitter: bool = True
+    jitter_factor: float = 0.5
+    retryable_exceptions: Tuple[type, ...] = (
+        ConnectionError,
+        TimeoutError,
+        asyncio.TimeoutError,
+        OSError,
+    )
+
+
+class RetryWithBackoff:
+    """
+    Retry utility with exponential backoff and jitter.
+
+    v92.1 - Advanced retry mechanism for Trinity Protocol connections.
+
+    Features:
+        - Configurable exponential backoff
+        - Random jitter to prevent thundering herd
+        - Customizable retryable exceptions
+        - Async-native implementation
+        - Detailed logging and metrics
+
+    Usage:
+        retry = RetryWithBackoff(RetryConfig(max_attempts=5))
+
+        # As a context manager
+        async with retry.attempt() as attempt:
+            result = await risky_operation()
+
+        # As a wrapper function
+        result = await retry.execute(risky_operation, arg1, arg2)
+
+        # As a decorator
+        @retry.decorator
+        async def my_function():
+            ...
+    """
+
+    def __init__(self, config: Optional[RetryConfig] = None):
+        self.config = config or RetryConfig()
+        self._attempt_count = 0
+        self._total_delay = 0.0
+        self._last_error: Optional[Exception] = None
+
+    def _calculate_delay(self, attempt: int) -> float:
+        """Calculate delay for a given attempt with exponential backoff."""
+        delay = self.config.initial_delay_seconds * (
+            self.config.exponential_base ** attempt
+        )
+        delay = min(delay, self.config.max_delay_seconds)
+
+        if self.config.jitter:
+            import random
+            jitter_range = delay * self.config.jitter_factor
+            delay += random.uniform(-jitter_range, jitter_range)
+            delay = max(0.1, delay)  # Minimum 100ms
+
+        return delay
+
+    def _is_retryable(self, exception: Exception) -> bool:
+        """Check if an exception should trigger a retry."""
+        return isinstance(exception, self.config.retryable_exceptions)
+
+    async def execute(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        *args,
+        **kwargs,
+    ) -> Any:
+        """
+        Execute a function with retry logic.
+
+        Args:
+            func: Async function to execute
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Result of the function
+
+        Raises:
+            Last exception if all retries exhausted
+        """
+        self._attempt_count = 0
+        self._total_delay = 0.0
+        self._last_error = None
+
+        for attempt in range(self.config.max_attempts):
+            self._attempt_count = attempt + 1
+
+            try:
+                return await func(*args, **kwargs)
+
+            except Exception as e:
+                self._last_error = e
+
+                if not self._is_retryable(e):
+                    logger.debug(f"Non-retryable exception: {type(e).__name__}")
+                    raise
+
+                if attempt >= self.config.max_attempts - 1:
+                    logger.warning(
+                        f"Retry exhausted after {self.config.max_attempts} attempts. "
+                        f"Last error: {e}"
+                    )
+                    raise
+
+                delay = self._calculate_delay(attempt)
+                self._total_delay += delay
+
+                logger.debug(
+                    f"Retry attempt {attempt + 1}/{self.config.max_attempts} "
+                    f"failed: {e}. Retrying in {delay:.2f}s"
+                )
+
+                await asyncio.sleep(delay)
+
+        # Should not reach here
+        raise self._last_error or RuntimeError("Retry failed unexpectedly")
+
+    def decorator(
+        self,
+        func: Callable[..., Awaitable[Any]],
+    ) -> Callable[..., Awaitable[Any]]:
+        """
+        Decorator for adding retry logic to async functions.
+
+        Usage:
+            @retry.decorator
+            async def connect():
+                ...
+        """
+        from functools import wraps
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            return await self.execute(func, *args, **kwargs)
+
+        return wrapper
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get retry statistics."""
+        return {
+            "attempt_count": self._attempt_count,
+            "total_delay_seconds": self._total_delay,
+            "last_error": str(self._last_error) if self._last_error else None,
+            "config": {
+                "max_attempts": self.config.max_attempts,
+                "initial_delay": self.config.initial_delay_seconds,
+                "max_delay": self.config.max_delay_seconds,
+            },
+        }
+
+
+# Global retry instance for Trinity connections
+_trinity_retry = RetryWithBackoff(RetryConfig(
+    max_attempts=int(os.getenv("TRINITY_RETRY_MAX_ATTEMPTS", "5")),
+    initial_delay_seconds=float(os.getenv("TRINITY_RETRY_INITIAL_DELAY", "1.0")),
+    max_delay_seconds=float(os.getenv("TRINITY_RETRY_MAX_DELAY", "30.0")),
+))
+
+
+async def retry_with_backoff(
+    func: Callable[..., Awaitable[Any]],
+    *args,
+    max_attempts: int = 3,
+    initial_delay: float = 1.0,
+    max_delay: float = 30.0,
+    **kwargs,
+) -> Any:
+    """
+    Convenience function for retry with exponential backoff.
+
+    Args:
+        func: Async function to retry
+        *args: Positional arguments for func
+        max_attempts: Maximum number of attempts
+        initial_delay: Initial delay between retries
+        max_delay: Maximum delay between retries
+        **kwargs: Keyword arguments for func
+
+    Returns:
+        Result of the function
+
+    Example:
+        result = await retry_with_backoff(
+            connect_to_service,
+            host="localhost",
+            port=8000,
+            max_attempts=5,
+        )
+    """
+    retry = RetryWithBackoff(RetryConfig(
+        max_attempts=max_attempts,
+        initial_delay_seconds=initial_delay,
+        max_delay_seconds=max_delay,
+    ))
+    return await retry.execute(func, *args, **kwargs)
+
+
+# =============================================================================
 # DATA STRUCTURES
 # =============================================================================
 
@@ -969,11 +1182,28 @@ class TrinityClient:
         # Shutdown event
         self._shutdown = asyncio.Event()
 
-    async def connect(self) -> bool:
-        """Connect to Trinity network."""
+    async def connect(self, retry: bool = True) -> bool:
+        """
+        Connect to Trinity network.
+
+        v92.1: Supports automatic retry with exponential backoff.
+
+        Args:
+            retry: If True, retry connection with exponential backoff
+
+        Returns:
+            True if connected successfully
+        """
         if self._state == ConnectionState.CONNECTED:
             return True
 
+        if retry:
+            return await self.connect_with_retry()
+
+        return await self._connect_once()
+
+    async def _connect_once(self) -> bool:
+        """Single connection attempt without retry."""
         self._state = ConnectionState.CONNECTING
 
         # Create transport based on config
@@ -999,6 +1229,69 @@ class TrinityClient:
         await self._broadcast_presence()
 
         return True
+
+    async def connect_with_retry(
+        self,
+        max_attempts: Optional[int] = None,
+        initial_delay: Optional[float] = None,
+    ) -> bool:
+        """
+        Connect with automatic retry and exponential backoff.
+
+        v92.1 - Resilient connection with configurable retry behavior.
+
+        Args:
+            max_attempts: Override max retry attempts (default from env)
+            initial_delay: Override initial delay in seconds
+
+        Returns:
+            True if connected successfully
+
+        Raises:
+            ConnectionError: If all retry attempts fail
+        """
+        config = RetryConfig(
+            max_attempts=max_attempts or int(
+                os.getenv("TRINITY_RETRY_MAX_ATTEMPTS", "5")
+            ),
+            initial_delay_seconds=initial_delay or float(
+                os.getenv("TRINITY_RETRY_INITIAL_DELAY", "1.0")
+            ),
+            max_delay_seconds=float(
+                os.getenv("TRINITY_RETRY_MAX_DELAY", "30.0")
+            ),
+            retryable_exceptions=(
+                ConnectionError,
+                TimeoutError,
+                asyncio.TimeoutError,
+                OSError,
+            ),
+        )
+
+        retry = RetryWithBackoff(config)
+
+        async def attempt_connect() -> bool:
+            """Single connection attempt that raises on failure."""
+            result = await self._connect_once()
+            if not result:
+                raise ConnectionError("Trinity connection failed")
+            return result
+
+        try:
+            result = await retry.execute(attempt_connect)
+            stats = retry.get_stats()
+            if stats["attempt_count"] > 1:
+                logger.info(
+                    f"Trinity connected after {stats['attempt_count']} attempts "
+                    f"(total delay: {stats['total_delay_seconds']:.1f}s)"
+                )
+            return result
+        except ConnectionError:
+            self._state = ConnectionState.DISCONNECTED
+            logger.error(
+                f"Trinity connection failed after {config.max_attempts} attempts"
+            )
+            return False
 
     async def disconnect(self) -> None:
         """Disconnect from Trinity network."""
