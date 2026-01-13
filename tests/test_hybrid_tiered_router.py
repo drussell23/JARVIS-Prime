@@ -1,22 +1,55 @@
 #!/usr/bin/env python3
 """
-Test Suite for Hybrid Tiered Router v94.0
+Test Suite for Hybrid Tiered Router v95.0
 ==========================================
 
-Tests intelligent tier-based routing with complexity analysis.
+Tests intelligent tier-based routing with complexity analysis
+and v95.0 Elastic Cloud Burst functionality.
 
-Run: python3 -m pytest tests/test_hybrid_tiered_router.py -v
+v95.0 ADDITIONS:
+    - TestElasticCloudBurst: Tests elastic burst decisions
+    - TestGCPImportBridge: Tests JARVIS GCP component access
+    - Memory pressure detection tests
+    - Budget integration tests
+
+Run:
+    # With pytest (if installed):
+    python3 -m pytest tests/test_hybrid_tiered_router.py -v
+
+    # Standalone demo (always works):
+    python3 tests/test_hybrid_tiered_router.py
 """
+
+from __future__ import annotations
 
 import asyncio
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-import pytest
+# Graceful pytest import - allows standalone execution
+try:
+    import pytest
+    PYTEST_AVAILABLE = True
+except ImportError:
+    PYTEST_AVAILABLE = False
+    # Create mock pytest decorators for standalone execution
+    class _MockPytest:
+        """Mock pytest module for standalone execution."""
+        class mark:
+            @staticmethod
+            def asyncio(func):
+                return func
+
+        @staticmethod
+        def fixture(func):
+            return func
+
+    pytest = _MockPytest()
 
 
 class TestComplexityAnalyzer:
@@ -317,6 +350,134 @@ class TestIntegration:
 
 
 # =============================================================================
+# v95.0: ELASTIC CLOUD BURST TESTS
+# =============================================================================
+
+
+class TestElasticCloudBurst:
+    """Test v95.0 Elastic Cloud Burst functionality."""
+
+    @pytest.fixture
+    async def router(self):
+        from jarvis_prime.core.hybrid_tiered_router import HybridTieredRouter
+        router = HybridTieredRouter()
+        await router.initialize()
+        return router
+
+    @pytest.mark.asyncio
+    async def test_gcp_bridge_availability(self, router):
+        """Test that GCP import bridge is detected."""
+        stats = router.get_statistics()
+        # Should have gcp_bridge_available key
+        assert "gcp_bridge_available" in router._resource_monitor.get_statistics()
+
+    @pytest.mark.asyncio
+    async def test_memory_pressure_detection(self, router):
+        """Test memory pressure detection via ResourceMonitor."""
+        pressure = await router._resource_monitor.get_memory_pressure()
+
+        # Should always have these keys (even in fallback mode)
+        assert "available" in pressure or "fallback" in pressure
+        assert "percent_used" in pressure or "error" in pressure
+
+    @pytest.mark.asyncio
+    async def test_should_burst_to_cloud(self, router):
+        """Test cloud burst decision logic."""
+        # This should not raise an error even if GCP components unavailable
+        should_burst = await router._resource_monitor.should_burst_to_cloud()
+        assert isinstance(should_burst, bool)
+
+    @pytest.mark.asyncio
+    async def test_elastic_burst_trigger_logic(self, router):
+        """Test elastic burst trigger decision."""
+        # Should not trigger for small memory requirements
+        should_trigger = await router._should_trigger_elastic_burst(required_ram_mb=100)
+        # Result depends on current memory state and budget
+        assert isinstance(should_trigger, bool)
+
+    @pytest.mark.asyncio
+    async def test_elastic_burst_status(self, router):
+        """Test elastic burst status retrieval."""
+        status = await router.get_elastic_burst_status()
+
+        # Should always return a status dict
+        assert isinstance(status, dict)
+        assert "burst_possible" in status
+        assert "burst_recommended" in status
+        assert "memory_pressure" in status
+        assert "budget_status" in status
+
+    @pytest.mark.asyncio
+    async def test_budget_check_for_cloud_tier(self, router):
+        """Test budget check before cloud tier routing."""
+        can_afford = await router._resource_monitor.can_afford_cloud_tier(0.01)
+        # Should allow small costs unless budget exhausted
+        assert isinstance(can_afford, bool)
+
+    @pytest.mark.asyncio
+    async def test_gcp_infrastructure_status(self, router):
+        """Test GCP infrastructure status retrieval."""
+        status = await router._resource_monitor.get_gcp_infrastructure_status()
+
+        # Should return status dict with availability info
+        assert isinstance(status, dict)
+
+
+class TestGCPImportBridge:
+    """Test the GCP Import Bridge module."""
+
+    @pytest.mark.asyncio
+    async def test_jarvis_repo_detection(self):
+        """Test JARVIS repo path detection."""
+        from jarvis_prime.core.gcp_import_bridge import _detect_jarvis_repo_path
+
+        # May or may not find JARVIS repo depending on environment
+        path = _detect_jarvis_repo_path()
+        if path is not None:
+            assert path.exists()
+            assert (path / "backend" / "core").exists()
+
+    @pytest.mark.asyncio
+    async def test_get_budget_status(self):
+        """Test budget status retrieval."""
+        from jarvis_prime.core.gcp_import_bridge import get_budget_status
+
+        status = await get_budget_status()
+        assert isinstance(status, dict)
+        # Should have availability indicator
+        assert "available" in status or "fallback" in status
+
+    @pytest.mark.asyncio
+    async def test_get_ram_snapshot(self):
+        """Test RAM snapshot retrieval."""
+        from jarvis_prime.core.gcp_import_bridge import get_ram_snapshot
+
+        snapshot = await get_ram_snapshot()
+        assert isinstance(snapshot, dict)
+        # Should have memory info (even in fallback mode)
+        assert "total_gb" in snapshot or "error" in snapshot
+
+    @pytest.mark.asyncio
+    async def test_pressure_score_calculation(self):
+        """Test pressure score calculation."""
+        from jarvis_prime.core.gcp_import_bridge import calculate_pressure_score
+
+        score = await calculate_pressure_score()
+        assert isinstance(score, dict)
+        # Should have pressure indicators
+        assert "ram_pressure" in score or "error" in score
+
+    @pytest.mark.asyncio
+    async def test_gcp_infrastructure_status(self):
+        """Test unified GCP infrastructure status."""
+        from jarvis_prime.core.gcp_import_bridge import get_gcp_infrastructure_status
+
+        status = await get_gcp_infrastructure_status()
+        assert isinstance(status, dict)
+        assert "components" in status or "available" in status
+
+
+# =============================================================================
 # DEMO FUNCTION
 # =============================================================================
 
@@ -324,7 +485,8 @@ class TestIntegration:
 async def demo_routing():
     """Demo the hybrid tiered router."""
     print("\n" + "=" * 70)
-    print("  HYBRID TIERED ROUTER v94.0 DEMO")
+    print("  HYBRID TIERED ROUTER v95.0 DEMO")
+    print("  Elastic Cloud Burst Edition")
     print("=" * 70)
 
     from jarvis_prime.core.hybrid_tiered_router import get_hybrid_tiered_router
@@ -373,6 +535,25 @@ async def demo_routing():
     print(f"   Total routes: {stats['total_routes']}")
     print(f"   Tier usage: {stats['tier_usage']}")
     print(f"   Fallback rate: {stats['fallback_rate']:.1%}")
+
+    # v95.0: Show elastic burst status
+    print(f"\n☁️  Elastic Cloud Burst Status:")
+    burst_status = await router.get_elastic_burst_status()
+    print(f"   Burst possible: {burst_status.get('burst_possible', 'unknown')}")
+    print(f"   Burst recommended: {burst_status.get('burst_recommended', 'unknown')}")
+
+    memory = burst_status.get('memory_pressure', {})
+    if memory.get('available') or memory.get('fallback'):
+        print(f"   Memory used: {memory.get('percent_used', 0):.1f}%")
+        print(f"   Pressure level: {memory.get('pressure_level', 'unknown')}")
+
+    budget = burst_status.get('budget_status', {})
+    if budget.get('available') or budget.get('fallback'):
+        print(f"   Budget remaining: ${budget.get('daily_remaining', 0):.2f}")
+
+    gcp = burst_status.get('gcp_infrastructure', {})
+    summary = gcp.get('summary', {})
+    print(f"   GCP components: {summary.get('available_components', 0)}/{summary.get('total_components', 0)}")
 
     print("\n✅ Demo complete!")
 

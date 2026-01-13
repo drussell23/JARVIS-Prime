@@ -1,10 +1,17 @@
 """
-Hybrid Tiered Router - v94.0 Intelligent Multi-Tier Model Routing
-===================================================================
+Hybrid Tiered Router - v95.0 Elastic Hybrid Cloud Intelligence
+================================================================
 
 The Brain's Decision-Making System for Model Selection
 
-This module implements the v94.0 Hybrid Tiered Architecture from unified_config.yaml:
+v95.0 ENHANCEMENTS:
+    - Elastic cloud burst to GCP when local resources are insufficient
+    - Integrated with JARVIS CostTracker for unified budget management
+    - Memory pressure detection via JARVIS AdvancedRAMMonitor
+    - Intelligent GCP optimizer for VM provisioning decisions
+    - Cross-repo integration (no code duplication)
+
+This module implements the v95.0 Hybrid Tiered Architecture from unified_config.yaml:
 
     ┌─────────────────────────────────────────────────────────────────────────┐
     │                    JARVIS-Prime Hybrid Model Tiers                       │
@@ -82,6 +89,29 @@ from typing import (
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# v95.0: GCP IMPORT BRIDGE - Access JARVIS infrastructure without duplication
+# =============================================================================
+
+# Lazy import to avoid circular dependencies
+_gcp_bridge_available: Optional[bool] = None
+
+
+def _get_gcp_bridge():
+    """Lazily import GCP bridge module."""
+    global _gcp_bridge_available
+    if _gcp_bridge_available is False:
+        return None
+    try:
+        from jarvis_prime.core import gcp_import_bridge
+        _gcp_bridge_available = True
+        return gcp_import_bridge
+    except ImportError as e:
+        logger.debug(f"GCP import bridge not available: {e}")
+        _gcp_bridge_available = False
+        return None
+
 
 # =============================================================================
 # CONFIGURATION LOADING
@@ -831,6 +861,136 @@ class ResourceMonitor:
             self._last_health_check[tier_id] = now
             return False
 
+    # =========================================================================
+    # v95.0: GCP INTEGRATION - Uses JARVIS components (no duplication)
+    # =========================================================================
+
+    async def get_gcp_budget_status(self) -> Dict[str, Any]:
+        """
+        Get budget status from JARVIS CostTracker.
+
+        Uses the GCP import bridge to access JARVIS's budget tracking.
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is None:
+            return {
+                "available": False,
+                "fallback": True,
+                "daily_remaining": self._max_daily_budget - self._daily_spend.get(
+                    datetime.now().strftime("%Y-%m-%d"), 0.0
+                ),
+            }
+
+        return await bridge.get_budget_status()
+
+    async def can_afford_cloud_tier(self, estimated_cost: float) -> bool:
+        """
+        Check if budget allows a cloud tier request.
+
+        First checks JARVIS CostTracker, falls back to local tracking.
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is not None:
+            try:
+                return await bridge.can_afford_cloud_tier(estimated_cost)
+            except Exception as e:
+                logger.warning(f"GCP budget check failed, using local: {e}")
+
+        # Fallback to local budget tracking
+        return await self.can_spend(estimated_cost)
+
+    async def get_memory_pressure(self) -> Dict[str, Any]:
+        """
+        Get memory pressure from JARVIS AdvancedRAMMonitor.
+
+        Falls back to basic psutil if JARVIS components unavailable.
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is not None:
+            try:
+                return await bridge.get_ram_snapshot()
+            except Exception as e:
+                logger.warning(f"JARVIS RAM monitor failed: {e}")
+
+        # Fallback to basic monitoring
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            return {
+                "available": True,
+                "fallback": True,
+                "total_gb": mem.total / (1024**3),
+                "used_gb": mem.used / (1024**3),
+                "available_gb": mem.available / (1024**3),
+                "percent_used": mem.percent,
+                "pressure_level": "critical" if mem.percent > 90 else "high" if mem.percent > 80 else "normal",
+            }
+        except ImportError:
+            return {"available": False, "error": "psutil not available"}
+
+    async def should_burst_to_cloud(self) -> bool:
+        """
+        Determine if system should burst to GCP cloud.
+
+        Uses JARVIS IntelligentGCPOptimizer for multi-factor decision.
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is not None:
+            try:
+                return await bridge.should_burst_to_cloud()
+            except Exception as e:
+                logger.warning(f"GCP burst decision failed: {e}")
+
+        # Fallback: simple RAM threshold
+        pressure = await self.get_memory_pressure()
+        return pressure.get("percent_used", 0) > 80
+
+    async def request_cloud_burst(
+        self,
+        reason: str,
+        required_ram_gb: float = 0.0,
+        estimated_duration_minutes: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Request elastic cloud burst to GCP.
+
+        This triggers JARVIS's GCPVMManager to provision a Spot VM.
+
+        Args:
+            reason: Why burst is needed
+            required_ram_gb: Minimum RAM required
+            estimated_duration_minutes: Expected usage duration
+
+        Returns:
+            Result dict with success status and VM info if provisioned
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is None:
+            return {
+                "success": False,
+                "error": "gcp_bridge_unavailable",
+                "message": "GCP import bridge not available",
+            }
+
+        return await bridge.request_cloud_burst(
+            reason=reason,
+            required_ram_gb=required_ram_gb,
+            estimated_duration_minutes=estimated_duration_minutes,
+        )
+
+    async def get_gcp_infrastructure_status(self) -> Dict[str, Any]:
+        """
+        Get unified status of all JARVIS GCP infrastructure.
+        """
+        bridge = _get_gcp_bridge()
+        if bridge is None:
+            return {
+                "available": False,
+                "error": "GCP import bridge not available",
+            }
+
+        return await bridge.get_gcp_infrastructure_status()
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get resource monitor statistics."""
         today = datetime.now().strftime("%Y-%m-%d")
@@ -838,6 +998,7 @@ class ResourceMonitor:
             "daily_spend": self._daily_spend.get(today, 0.0),
             "remaining_budget": self._max_daily_budget - self._daily_spend.get(today, 0.0),
             "tier_health": self._tier_health.copy(),
+            "gcp_bridge_available": _gcp_bridge_available is True,
         }
 
 
@@ -1098,6 +1259,11 @@ class HybridTieredRouter:
                 )
                 if not can_load:
                     unavailable[tier_id] = reason
+
+                    # v95.0: Check if we should burst to cloud
+                    if await self._should_trigger_elastic_burst(tier.memory_required_mb):
+                        logger.info(f"Elastic burst triggered for tier {tier_id} (reason: {reason})")
+                        # Cloud tiers will be preferred in selection
                     continue
 
             # Check capability requirements
@@ -1185,6 +1351,126 @@ class HybridTieredRouter:
             return "tier_1_cloud_intelligent"
         else:
             return "tier_2_deep_reasoning"
+
+    # =========================================================================
+    # v95.0: ELASTIC CLOUD BURST - GCP Integration
+    # =========================================================================
+
+    async def _should_trigger_elastic_burst(self, required_ram_mb: int = 0) -> bool:
+        """
+        Determine if elastic cloud burst should be triggered.
+
+        Checks multiple factors:
+        - Memory pressure from JARVIS AdvancedRAMMonitor
+        - Budget availability from JARVIS CostTracker
+        - Intelligent optimization from IntelligentGCPOptimizer
+
+        Args:
+            required_ram_mb: RAM needed for the requested operation
+
+        Returns:
+            True if cloud burst is recommended
+        """
+        # First check budget - no point bursting if we can't afford it
+        can_afford = await self._resource_monitor.can_afford_cloud_tier(0.05)  # ~$0.05 estimate
+        if not can_afford:
+            logger.debug("Elastic burst blocked: insufficient budget")
+            return False
+
+        # Check if burst is actually needed via JARVIS intelligent optimizer
+        should_burst = await self._resource_monitor.should_burst_to_cloud()
+        if should_burst:
+            logger.info("Elastic burst recommended by JARVIS optimizer")
+            return True
+
+        # Fallback: check if required RAM exceeds available
+        if required_ram_mb > 0:
+            pressure = await self._resource_monitor.get_memory_pressure()
+            available_gb = pressure.get("available_gb", 16.0)
+            required_gb = required_ram_mb / 1024.0
+
+            if required_gb > available_gb * 0.8:  # Need 80%+ of available
+                logger.info(f"Elastic burst needed: {required_gb:.1f}GB required, {available_gb:.1f}GB available")
+                return True
+
+        return False
+
+    async def request_elastic_burst(
+        self,
+        reason: str = "routing_decision",
+        complexity_score: float = 0.0,
+    ) -> Dict[str, Any]:
+        """
+        Request elastic cloud burst to GCP.
+
+        This is called when local resources are insufficient and we need
+        to burst to cloud. Uses JARVIS's GCPVMManager for provisioning.
+
+        Args:
+            reason: Why burst is needed
+            complexity_score: Complexity of the task requiring burst
+
+        Returns:
+            Result dict with success status and burst details
+        """
+        # Estimate requirements based on complexity
+        if complexity_score > 0.8:
+            required_ram_gb = 32.0  # High complexity needs more RAM
+            estimated_duration = 60.0
+        elif complexity_score > 0.5:
+            required_ram_gb = 16.0
+            estimated_duration = 30.0
+        else:
+            required_ram_gb = 8.0
+            estimated_duration = 15.0
+
+        result = await self._resource_monitor.request_cloud_burst(
+            reason=reason,
+            required_ram_gb=required_ram_gb,
+            estimated_duration_minutes=estimated_duration,
+        )
+
+        if result.get("success"):
+            logger.info(f"Elastic burst successful: {result.get('vm_info', {})}")
+            # Update tier availability after burst
+            # Cloud tiers should now be accessible
+        else:
+            logger.warning(f"Elastic burst failed: {result.get('error', 'unknown')}")
+
+        return result
+
+    async def get_elastic_burst_status(self) -> Dict[str, Any]:
+        """
+        Get current elastic burst status.
+
+        Returns:
+            Status dict with burst availability and GCP infrastructure state
+        """
+        # Get GCP infrastructure status
+        gcp_status = await self._resource_monitor.get_gcp_infrastructure_status()
+
+        # Get memory pressure
+        pressure = await self._resource_monitor.get_memory_pressure()
+
+        # Get budget status
+        budget = await self._resource_monitor.get_gcp_budget_status()
+
+        # Determine if burst is possible
+        burst_possible = (
+            gcp_status.get("summary", {}).get("available_components", 0) >= 2 and
+            budget.get("daily_remaining", 0) > 0.05
+        )
+
+        # Determine if burst is recommended
+        burst_recommended = await self._resource_monitor.should_burst_to_cloud()
+
+        return {
+            "burst_possible": burst_possible,
+            "burst_recommended": burst_recommended,
+            "gcp_infrastructure": gcp_status,
+            "memory_pressure": pressure,
+            "budget_status": budget,
+        }
 
     def record_success(self, tier_id: str) -> None:
         """Record successful request to a tier."""

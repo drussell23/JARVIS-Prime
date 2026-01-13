@@ -1,6 +1,12 @@
 """
-GCP Cross-Repo Bridge v1.0 - Unified Cloud Infrastructure Coordination
-======================================================================
+GCP Cross-Repo Bridge v95.0 - Unified Cloud Infrastructure Coordination
+=======================================================================
+
+v95.0 ENHANCEMENTS:
+    - Uses gcp_import_bridge.py to access JARVIS GCP components (no duplication)
+    - Elastic cloud burst integration with HybridTieredRouter
+    - Memory pressure detection via JARVIS AdvancedRAMMonitor
+    - Unified budget management via JARVIS CostTracker
 
 Coordinates GCP infrastructure across JARVIS (Body), JARVIS-Prime (Mind),
 and Reactor-Core (Nervous System) repositories.
@@ -1026,11 +1032,15 @@ class GCPCrossRepoBridge:
         logger.info("GCP Cross-Repo Bridge stopped")
 
     async def _connect_vm_manager(self):
-        """Connect to JARVIS-Prime's GCPVMManager."""
+        """Connect to JARVIS's GCPVMManager via import bridge."""
         try:
-            from jarvis_prime.core.gcp_vm_manager import get_gcp_manager
-            self._gcp_vm_manager = await get_gcp_manager()
-            logger.info("Connected to GCPVMManager")
+            # v95.0: Use the GCP import bridge to access JARVIS's components
+            from jarvis_prime.core.gcp_import_bridge import get_gcp_vm_manager
+            self._gcp_vm_manager = await get_gcp_vm_manager()
+            if self._gcp_vm_manager:
+                logger.info("Connected to JARVIS GCPVMManager via import bridge")
+            else:
+                logger.warning("GCPVMManager not available from JARVIS repo")
         except Exception as e:
             logger.warning(f"Could not connect to GCPVMManager: {e}")
 
