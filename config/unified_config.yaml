@@ -86,128 +86,415 @@ components:
       - "jarvis_prime"
 
 # =============================================================================
-# MODEL ROUTING CONFIGURATION
+# MODEL ROUTING CONFIGURATION (v94.0 Hybrid Tiered Architecture)
 # =============================================================================
+#
+# ARCHITECTURE:
+#   ┌─────────────────────────────────────────────────────────────────────────┐
+#   │                    JARVIS-Prime Hybrid Model Tiers                       │
+#   │                                                                          │
+#   │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐       │
+#   │  │  TIER 0: LOCAL   │  │  TIER 1: CLOUD   │  │  TIER 2: DEEP    │       │
+#   │  │  (M1 Mac Fast)   │  │  (GCP A100)      │  │  (Opus-Level)    │       │
+#   │  │                  │  │                  │  │                  │       │
+#   │  │  • Llama 3 8B    │  │  • Llama 3.3 70B │  │  • DeepSeek V3   │       │
+#   │  │  • Qwen 2.5 7B   │  │  • Qwen 2.5 72B  │  │  • Claude Opus   │       │
+#   │  │  • Mistral 7B    │  │  • Mixtral 8x22B │  │  • GPT-4 Turbo   │       │
+#   │  │                  │  │                  │  │                  │       │
+#   │  │  Speed: ~20t/s   │  │  Speed: ~40t/s   │  │  Speed: ~50t/s   │       │
+#   │  │  Cost: FREE      │  │  Cost: ~$0.50/hr │  │  Cost: ~$0.01/1k │       │
+#   │  │  Complexity: <0.4│  │  Complexity: 0.4-│  │  Complexity: >0.8│       │
+#   │  └──────────────────┘  │             0.8  │  └──────────────────┘       │
+#   │                        └──────────────────┘                             │
+#   └─────────────────────────────────────────────────────────────────────────┘
+#
+# ROUTING LOGIC:
+#   1. Analyze query complexity (lexical, pattern, semantic)
+#   2. Check resource availability (RAM, GPU, network)
+#   3. Route to optimal tier based on complexity + resources
+#   4. Fallback to next tier if primary unavailable
+#   5. Log experience for adaptive learning
+#
 
 model_routing:
-  # Tier definitions
+  version: "94.0"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER DEFINITIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
   tiers:
-    local_7b:
-      name: "Local 7B Quantized"
-      description: "Fast local inference on M1/M2/M3 Mac"
-      priority: 1  # Highest priority (try first)
+    # ─────────────────────────────────────────────────────────────────────────
+    # TIER 0: LOCAL (M1/M2/M3 Mac - Always Available, Free)
+    # ─────────────────────────────────────────────────────────────────────────
+    tier_0_local_fast:
+      name: "Local 8B Fast"
+      description: "Lightning-fast local inference for simple tasks"
+      tier_level: 0
+      priority: 1
+      enabled: true
+
+      # Endpoint
       endpoint: "http://localhost:8000"
       model_type: "llama_cpp"
-      model_path: "${MODEL_PATH:-~/.jarvis/prime/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf}"
-      capabilities:
-        - chat
-        - summarize
-        - format
-        - code_simple
-        - creative
-      max_context_tokens: 4096
-      max_output_tokens: 2048
-      tokens_per_second: 15  # Approximate for M1
-      cost_per_1k_tokens: 0.0  # Local = free
-      memory_required_mb: 6144  # ~6GB for 7B Q4
-      gpu_layers: -1  # All layers on GPU (Metal)
 
-    gcp_13b:
-      name: "GCP 13B Reasoning"
-      description: "Cloud inference for complex reasoning"
+      # Model variants (tried in order)
+      models:
+        primary:
+          name: "Llama-3-8B-Instruct"
+          path: "${HOME}/.jarvis/prime/models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+          quantization: "Q4_K_M"
+        fallbacks:
+          - name: "Qwen-2.5-7B-Instruct"
+            path: "${HOME}/Documents/ai-models/qwen2.5-7b-instruct-q4_k_m.gguf"
+            quantization: "Q4_K_M"
+          - name: "Mistral-7B-Instruct"
+            path: "${HOME}/Documents/ai-models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+            quantization: "Q4_K_M"
+
+      # Capabilities this tier handles well
+      capabilities:
+        - chat                # "What time is it?"
+        - greeting            # "Hello JARVIS"
+        - simple_qa           # "What's 2+2?"
+        - summarize_short     # Summarize < 1000 words
+        - format              # JSON/markdown formatting
+        - code_simple         # Simple code snippets
+        - translate_short     # Short translations
+
+      # Performance characteristics
+      performance:
+        tokens_per_second: 20           # Apple Silicon Metal
+        max_context_tokens: 8192
+        max_output_tokens: 2048
+        average_latency_ms: 500
+        warm_start_latency_ms: 100
+        cold_start_latency_ms: 10000    # Model loading
+
+      # Resource requirements
+      resources:
+        memory_required_mb: 5120        # ~5GB for 8B Q4
+        gpu_layers: -1                  # All on Metal GPU
+        cpu_threads: 4
+        requires_gpu: false             # Can run CPU-only
+
+      # Cost
+      cost:
+        per_1k_input_tokens: 0.0        # Free
+        per_1k_output_tokens: 0.0
+        per_hour: 0.0
+
+      # Routing hints
+      routing:
+        max_complexity: 0.45            # Only simple tasks
+        max_input_tokens: 2000          # Short prompts only
+        prefer_for_latency_ms: 2000     # Use if need < 2s response
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TIER 0.5: LOCAL CAPABLE (For medium complexity on M1)
+    # ─────────────────────────────────────────────────────────────────────────
+    tier_05_local_capable:
+      name: "Local 14B Capable"
+      description: "More capable local model for moderate tasks"
+      tier_level: 0
       priority: 2
-      endpoint: "${GCP_PRIME_URL:-http://localhost:8001}"
+      enabled: true
+
+      endpoint: "http://localhost:8000"
       model_type: "llama_cpp"
-      model_path: "meta-llama/Llama-2-13b-chat-hf"
+
+      models:
+        primary:
+          name: "Qwen-2.5-14B-Instruct"
+          path: "${HOME}/.jarvis/prime/models/qwen2.5-14b-instruct-q4_k_m.gguf"
+          quantization: "Q4_K_M"
+        fallbacks:
+          - name: "Phi-3-Medium-14B"
+            path: "${HOME}/.jarvis/prime/models/phi-3-medium-14b-q4_k_m.gguf"
+            quantization: "Q4_K_M"
+
       capabilities:
         - chat
-        - summarize
+        - greeting
+        - simple_qa
+        - summarize_short
+        - summarize_medium
         - format
         - code_simple
-        - code_complex
-        - creative
-        - analyze
-        - reason
-      max_context_tokens: 4096
-      max_output_tokens: 2048
-      tokens_per_second: 25  # Approximate for A100
-      cost_per_1k_tokens: 0.002  # GCP Spot pricing estimate
-      memory_required_mb: 26624  # ~26GB for 13B
-      gpu_layers: -1
+        - code_medium
+        - translate
+        - analyze_simple
+        - creative_short
 
-    claude_api:
-      name: "Claude API"
-      description: "Anthropic Claude for specialized tasks"
-      priority: 3  # Fallback
-      endpoint: "https://api.anthropic.com/v1"
-      model_type: "anthropic"
-      model_id: "${CLAUDE_MODEL:-claude-3-5-sonnet-20241022}"
+      performance:
+        tokens_per_second: 12
+        max_context_tokens: 8192
+        max_output_tokens: 4096
+        average_latency_ms: 1500
+        warm_start_latency_ms: 300
+        cold_start_latency_ms: 20000
+
+      resources:
+        memory_required_mb: 8192        # ~8GB for 14B Q4
+        gpu_layers: -1
+        cpu_threads: 6
+        requires_gpu: false
+
+      cost:
+        per_1k_input_tokens: 0.0
+        per_1k_output_tokens: 0.0
+        per_hour: 0.0
+
+      routing:
+        max_complexity: 0.65
+        max_input_tokens: 4000
+        prefer_for_latency_ms: 5000
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TIER 1: CLOUD INTELLIGENT (GCP A100 - Complex Reasoning)
+    # ─────────────────────────────────────────────────────────────────────────
+    tier_1_cloud_intelligent:
+      name: "Cloud 70B Intelligent"
+      description: "GCP A100 with Llama 3.3 70B for complex reasoning"
+      tier_level: 1
+      priority: 3
+      enabled: "${GCP_ENABLED:-false}"
+
+      endpoint: "${GCP_PRIME_URL:-https://jarvis-prime-xxxxx-uc.a.run.app}"
+      model_type: "vllm"  # or llama_cpp
+
+      models:
+        primary:
+          name: "Llama-3.3-70B-Instruct"
+          hf_id: "meta-llama/Llama-3.3-70B-Instruct"
+          quantization: "AWQ"  # 4-bit quantization for A100
+        fallbacks:
+          - name: "Qwen-2.5-72B-Instruct"
+            hf_id: "Qwen/Qwen2.5-72B-Instruct-AWQ"
+            quantization: "AWQ"
+          - name: "Mixtral-8x22B-Instruct"
+            hf_id: "mistralai/Mixtral-8x22B-Instruct-v0.1"
+            quantization: "AWQ"
+
       capabilities:
         - chat
-        - summarize
+        - greeting
+        - simple_qa
+        - summarize_short
+        - summarize_medium
+        - summarize_long
         - format
         - code_simple
-        - code_complex
-        - creative
-        - analyze
-        - reason
-        - multimodal
-        - search
-      max_context_tokens: 200000
-      max_output_tokens: 8192
-      tokens_per_second: 50
-      cost_per_1k_tokens: 0.003  # Input tokens
-      cost_per_1k_output_tokens: 0.015  # Output tokens
+        - code_medium
+        - code_complex        # Full codebase analysis
+        - translate
+        - analyze_simple
+        - analyze_complex     # Deep analysis
+        - reason              # Multi-step reasoning
+        - creative_short
+        - creative_long
+        - math                # Complex math
+        - science             # Scientific reasoning
 
-  # Routing rules
+      performance:
+        tokens_per_second: 45           # A100 with vLLM
+        max_context_tokens: 131072      # 128K context
+        max_output_tokens: 16384
+        average_latency_ms: 3000
+        warm_start_latency_ms: 500
+        cold_start_latency_ms: 180000   # VM spin-up + model load
+
+      resources:
+        memory_required_mb: 45056       # ~44GB VRAM for 70B AWQ
+        gpu_type: "nvidia-a100-40gb"
+        gpu_count: 1
+        requires_gpu: true
+
+      cost:
+        per_1k_input_tokens: 0.0004     # vLLM is efficient
+        per_1k_output_tokens: 0.0008
+        per_hour: 1.20                  # A100 spot pricing
+
+      routing:
+        min_complexity: 0.40            # Medium+ complexity
+        max_complexity: 0.85
+        max_input_tokens: 32000
+        prefer_for_latency_ms: 30000
+
+      # GCP VM configuration
+      gcp_config:
+        machine_type: "a2-highgpu-1g"   # 12 vCPU, 85GB RAM, 1x A100
+        accelerator_type: "nvidia-tesla-a100"
+        accelerator_count: 1
+        boot_disk_size_gb: 200
+        boot_disk_type: "pd-ssd"
+        preemptible: true               # Spot VM for cost savings
+        auto_delete: true
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TIER 2: DEEP REASONING (Opus-Level Intelligence)
+    # ─────────────────────────────────────────────────────────────────────────
+    tier_2_deep_reasoning:
+      name: "Deep Reasoning (Opus-Level)"
+      description: "Maximum intelligence for hardest problems"
+      tier_level: 2
+      priority: 4
+      enabled: true
+
+      # Can be GCP with larger model or Claude API
+      endpoint: "${DEEP_REASONING_URL:-https://api.anthropic.com/v1}"
+      model_type: "anthropic"  # or vllm for DeepSeek
+
+      models:
+        primary:
+          name: "Claude-Opus-4"
+          provider: "anthropic"
+          model_id: "claude-opus-4-20250514"
+        fallbacks:
+          - name: "Claude-3.5-Sonnet"
+            provider: "anthropic"
+            model_id: "claude-3-5-sonnet-20241022"
+          - name: "DeepSeek-V3"
+            provider: "deepseek"
+            model_id: "deepseek-chat"
+          - name: "GPT-4-Turbo"
+            provider: "openai"
+            model_id: "gpt-4-turbo-preview"
+
+      capabilities:
+        - all                 # Handles everything
+        - multimodal          # Image understanding
+        - search              # Web search integration
+        - code_architect      # System design
+        - paper_analysis      # Research paper understanding
+        - math_advanced       # Advanced mathematics
+        - legal               # Legal document analysis
+        - medical             # Medical information
+        - financial           # Financial analysis
+
+      performance:
+        tokens_per_second: 80
+        max_context_tokens: 200000
+        max_output_tokens: 32768
+        average_latency_ms: 5000
+        warm_start_latency_ms: 100
+        cold_start_latency_ms: 500
+
+      resources:
+        memory_required_mb: 0           # API-based
+        requires_gpu: false
+
+      cost:
+        per_1k_input_tokens: 0.015
+        per_1k_output_tokens: 0.075
+        per_hour: 0.0                   # Pay per token
+
+      routing:
+        min_complexity: 0.75            # Only hard problems
+        max_input_tokens: 100000
+        prefer_for_latency_ms: 60000
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # INTELLIGENT ROUTING RULES
+  # ═══════════════════════════════════════════════════════════════════════════
+
   routing_rules:
-    # Complexity thresholds (0.0 - 1.0)
+    # Complexity thresholds
     complexity_thresholds:
-      tier_0_max: 0.40  # Below this → definitely local
-      tier_1_min: 0.65  # Above this → cloud/API
-      tier_2_min: 0.85  # Above this → Claude API required
+      tier_0_fast_max: 0.35       # Simple → Local Fast (8B)
+      tier_05_capable_max: 0.55   # Medium → Local Capable (14B)
+      tier_1_cloud_max: 0.80      # Complex → Cloud (70B)
+      tier_2_deep_min: 0.75       # Very Complex → Deep (Opus)
 
-    # Task type → preferred tier mapping
+    # Task type → preferred tier
     task_type_routing:
-      chat: "local_7b"
-      summarize: "local_7b"
-      format: "local_7b"
-      code_simple: "local_7b"
-      code_complex: "gcp_13b"
-      creative: "local_7b"
-      analyze: "gcp_13b"
-      reason: "gcp_13b"
-      multimodal: "claude_api"
-      search: "claude_api"
+      # Tier 0 Fast (8B)
+      greeting: "tier_0_local_fast"
+      chat: "tier_0_local_fast"
+      simple_qa: "tier_0_local_fast"
+      time_query: "tier_0_local_fast"
+      format: "tier_0_local_fast"
+      translate_short: "tier_0_local_fast"
 
-    # Fallback chain (in order)
-    fallback_chain:
-      - "local_7b"
-      - "gcp_13b"
-      - "claude_api"
+      # Tier 0.5 Capable (14B)
+      summarize: "tier_05_local_capable"
+      code_simple: "tier_05_local_capable"
+      creative_short: "tier_05_local_capable"
+      analyze_simple: "tier_05_local_capable"
+
+      # Tier 1 Cloud (70B)
+      code_complex: "tier_1_cloud_intelligent"
+      analyze_complex: "tier_1_cloud_intelligent"
+      reason: "tier_1_cloud_intelligent"
+      math: "tier_1_cloud_intelligent"
+      creative_long: "tier_1_cloud_intelligent"
+
+      # Tier 2 Deep (Opus)
+      multimodal: "tier_2_deep_reasoning"
+      search: "tier_2_deep_reasoning"
+      code_architect: "tier_2_deep_reasoning"
+      paper_analysis: "tier_2_deep_reasoning"
+      legal: "tier_2_deep_reasoning"
+
+    # Fallback chains per starting tier
+    fallback_chains:
+      tier_0_local_fast:
+        - "tier_05_local_capable"
+        - "tier_1_cloud_intelligent"
+        - "tier_2_deep_reasoning"
+      tier_05_local_capable:
+        - "tier_0_local_fast"
+        - "tier_1_cloud_intelligent"
+        - "tier_2_deep_reasoning"
+      tier_1_cloud_intelligent:
+        - "tier_05_local_capable"
+        - "tier_2_deep_reasoning"
+        - "tier_0_local_fast"
+      tier_2_deep_reasoning:
+        - "tier_1_cloud_intelligent"
+        - "tier_05_local_capable"
 
     # Resource-based routing
-    resource_thresholds:
-      # If RAM usage exceeds these thresholds, skip the tier
-      local_max_ram_percent: 85  # Skip local if RAM > 85%
-      local_max_ram_mb: 14336    # Skip local if RAM > 14GB used
+    resource_routing:
+      # Local resource thresholds
+      local_max_ram_percent: 85
+      local_max_ram_mb: 14336
+      local_min_free_ram_mb: 2048
 
-      # Latency thresholds for tier selection
-      max_local_latency_ms: 30000  # 30 seconds
-      max_gcp_latency_ms: 60000    # 60 seconds
-      max_api_latency_ms: 120000   # 2 minutes
+      # Skip cloud if network is slow
+      cloud_min_bandwidth_mbps: 10
+      cloud_max_ping_ms: 200
 
-    # Token count routing
+      # Latency-based routing
+      latency_routing:
+        realtime_max_ms: 1000         # Use local only
+        interactive_max_ms: 5000      # Prefer local
+        batch_max_ms: 60000           # Can use cloud
+
+    # Token-based routing
     token_routing:
-      local_max_tokens: 2000      # Route long prompts to cloud
-      gcp_max_tokens: 8000        # Route very long prompts to Claude
+      # Route based on prompt length
+      local_8b_max_tokens: 2000
+      local_14b_max_tokens: 4000
+      cloud_70b_max_tokens: 32000
+      # Longer → Cloud/API
 
-    # Adaptive learning
+    # Cost-based routing
+    cost_routing:
+      enabled: true
+      daily_budget_usd: 10.0
+      prefer_free_until_complexity: 0.6
+      cloud_only_if_complexity_above: 0.5
+
+    # Adaptive learning (learns from usage patterns)
     adaptive:
       enabled: true
       learning_rate: 0.05
-      min_samples_for_adjustment: 10
-      success_rate_threshold: 0.7
+      min_samples: 20
+      success_rate_threshold: 0.8
+      latency_weight: 0.3
+      quality_weight: 0.5
+      cost_weight: 0.2
 
 # =============================================================================
 # GCP INFRASTRUCTURE

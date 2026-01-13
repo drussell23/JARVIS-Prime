@@ -2,29 +2,31 @@
 Unified Inference - Seamless Local/API Fallback System
 =========================================================
 
-v91.0 - Production-Grade Unified Inference with Seamless Fallback
+v94.0 - Hybrid Tiered Inference with Intelligent Routing
 
 This module provides a unified interface for model inference with:
+- Intelligent complexity-based tier routing (v94.0)
 - Automatic fallback from local models to Claude API
 - Health-aware routing and circuit breakers
 - Retry logic with exponential backoff
 - Cost tracking and budget management
 - Comprehensive metrics and observability
 
-ARCHITECTURE:
-    Request → UnifiedClient → HealthChecker → RouteDecision
+ARCHITECTURE (v94.0):
+    Request → UnifiedClient → HybridTieredRouter → TierDecision
                                    ↓
-                    Local Model (primary) → Claude API (fallback)
+    ┌──────────────────────────────────────────────────────────────┐
+    │  TIER 0: Local Fast    │  TIER 1: Cloud   │  TIER 2: Deep   │
+    │  (8B, FREE, ~20t/s)    │  (70B, $1.20/hr) │  (Opus, $0.015) │
+    └──────────────────────────────────────────────────────────────┘
                                    ↓
                     Response ← CircuitBreaker ← RetryHandler
 
-FALLBACK CHAIN:
-    1. Local 7B Model (fastest, free)
-    2. Local 13B Model (more capable)
-    3. GCP Hosted Model (if available)
-    4. Claude Haiku (fast, cheap)
-    5. Claude Sonnet (balanced)
-    6. Claude Opus (most capable)
+FALLBACK CHAIN (v94.0 Tiered):
+    Tier 0: Local 8B Fast (Llama 3 8B, Qwen 7B)
+    Tier 0.5: Local 14B Capable (Qwen 14B, Phi-3 Medium)
+    Tier 1: Cloud 70B Intelligent (Llama 3.3 70B on GCP A100)
+    Tier 2: Deep Reasoning (Claude Opus, DeepSeek V3)
 
 USAGE:
     client = await get_unified_client()
@@ -78,6 +80,27 @@ from typing import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# HYBRID TIERED ROUTER INTEGRATION (v94.0)
+# =============================================================================
+
+# Lazy import to avoid circular dependencies
+_hybrid_router = None
+
+
+async def _get_hybrid_router():
+    """Get the HybridTieredRouter singleton lazily."""
+    global _hybrid_router
+    if _hybrid_router is None:
+        try:
+            from jarvis_prime.core.hybrid_tiered_router import get_hybrid_tiered_router
+            _hybrid_router = await get_hybrid_tiered_router()
+        except ImportError:
+            logger.warning("HybridTieredRouter not available, using fallback routing")
+            _hybrid_router = None
+    return _hybrid_router
 
 
 # =============================================================================
@@ -1418,6 +1441,194 @@ class UnifiedInferenceClient:
         """Chat interface."""
         return await self.generate(messages=messages, **kwargs)
 
+    async def generate_with_tier_routing(
+        self,
+        prompt: Optional[str] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        context: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> InferenceResponse:
+        """
+        Generate with intelligent tier-based routing (v94.0).
+
+        Uses the HybridTieredRouter to analyze prompt complexity and
+        select the optimal model tier automatically.
+
+        Args:
+            prompt: Text prompt
+            messages: Chat messages
+            max_tokens: Maximum tokens
+            temperature: Sampling temperature
+            context: Additional context for routing:
+                - max_latency_ms: Maximum acceptable latency
+                - max_cost_usd: Maximum cost for this request
+                - prefer_local: Prefer local models (default: True)
+                - require_capability: Required capability
+
+        Returns:
+            InferenceResponse with tier routing metadata
+
+        Example:
+            response = await client.generate_with_tier_routing(
+                "Explain quantum computing in detail",
+                context={"max_latency_ms": 5000}
+            )
+            print(f"Tier used: {response.model}")  # "Llama-3.3-70B-Instruct"
+        """
+        # Get the hybrid router
+        router = await _get_hybrid_router()
+
+        if router is None:
+            # Fallback to standard generation
+            logger.warning("Tier routing unavailable, using standard fallback")
+            return await self.generate(
+                prompt=prompt,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs
+            )
+
+        # Format prompt for complexity analysis
+        analysis_prompt = prompt or ""
+        if messages:
+            analysis_prompt = " ".join(m.get("content", "") for m in messages)
+
+        # Route to optimal tier
+        routing_result = await router.route(analysis_prompt, context)
+
+        logger.info(
+            f"Tier routing: {routing_result.tier_name} "
+            f"(complexity={routing_result.complexity_score:.2f})"
+        )
+
+        # Map tier to model chain
+        model_chain = self._build_tier_model_chain(routing_result)
+
+        # Create request
+        request = InferenceRequest(
+            prompt=prompt,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            **{k: v for k, v in kwargs.items() if k in InferenceRequest.__dataclass_fields__}
+        )
+
+        # Execute with tier-aware fallback
+        response = await self._execute_with_tier_chain(request, model_chain, routing_result)
+
+        # Record cost if applicable
+        if response.cost_usd > 0:
+            await router.record_cost(routing_result.tier_id, response.cost_usd)
+
+        return response
+
+    def _build_tier_model_chain(self, routing_result) -> List[str]:
+        """Build model chain from tier routing result."""
+        chain = []
+
+        # Primary model from selected tier
+        tier_to_model = {
+            "tier_0_local_fast": "prime-7b-chat-v1",
+            "tier_05_local_capable": "prime-13b-reasoning-v1",
+            "tier_1_cloud_intelligent": "gcp-llama-70b",
+            "tier_2_deep_reasoning": "claude-opus-4",
+        }
+
+        # Add primary model
+        primary = tier_to_model.get(routing_result.tier_id, self._config.primary_model)
+        chain.append(primary)
+
+        # Add fallback chain
+        for fallback_tier_id in routing_result.fallback_chain:
+            fallback_model = tier_to_model.get(fallback_tier_id)
+            if fallback_model and fallback_model not in chain:
+                chain.append(fallback_model)
+
+        # Ensure Claude fallbacks at the end
+        if "claude-3-5-sonnet" not in chain:
+            chain.append("claude-3-5-sonnet")
+        if "claude-opus-4" not in chain:
+            chain.append("claude-opus-4")
+
+        return chain
+
+    async def _execute_with_tier_chain(
+        self,
+        request: InferenceRequest,
+        model_chain: List[str],
+        routing_result,
+    ) -> InferenceResponse:
+        """Execute request with tier-based model chain."""
+        self._total_requests += 1
+
+        last_error: Optional[Exception] = None
+        was_fallback = False
+        fallback_reason = None
+
+        for model_name in model_chain:
+            # Check circuit breaker
+            breaker = self._circuit_breakers.get(model_name)
+            if breaker and not breaker.should_allow_request():
+                was_fallback = True
+                fallback_reason = f"Circuit breaker open for {model_name}"
+                continue
+
+            # Check budget for API models
+            if model_name.startswith("claude-") and self._budget_tracker:
+                estimated_cost = 0.01
+                if not await self._budget_tracker.can_spend(estimated_cost):
+                    was_fallback = True
+                    fallback_reason = "Budget exceeded"
+                    continue
+
+            try:
+                response = await self._execute_single(request, model_name)
+
+                # Record success
+                if breaker:
+                    breaker.record_success()
+
+                # Record cost
+                if self._budget_tracker and response.cost_usd > 0:
+                    await self._budget_tracker.record_spend(response.cost_usd)
+
+                response.was_fallback = was_fallback
+                response.fallback_reason = fallback_reason
+
+                if was_fallback:
+                    self._total_fallbacks += 1
+
+                # Add tier routing metadata
+                self._request_history.append({
+                    "request_id": request.id,
+                    "model": model_name,
+                    "tier_id": routing_result.tier_id,
+                    "tier_name": routing_result.tier_name,
+                    "complexity_score": routing_result.complexity_score,
+                    "was_fallback": was_fallback,
+                    "latency_ms": response.latency_ms,
+                    "cost": response.cost_usd,
+                    "timestamp": time.time(),
+                })
+
+                return response
+
+            except Exception as e:
+                logger.warning(f"Tier chain: {model_name} failed: {e}")
+                last_error = e
+                was_fallback = True
+                fallback_reason = str(e)
+
+                if breaker:
+                    breaker.record_failure()
+
+        # All models failed
+        self._total_failures += 1
+        raise RuntimeError(f"All models in tier chain failed. Last error: {last_error}")
+
     async def stream(
         self,
         prompt: Optional[str] = None,
@@ -1720,3 +1931,91 @@ __all__ = [
     "get_unified_inference_client",
     "shutdown_unified_inference_client",
 ]
+
+
+# =============================================================================
+# HYBRID TIERED ROUTING CONVENIENCE FUNCTIONS (v94.0)
+# =============================================================================
+
+
+async def generate_with_routing(
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> InferenceResponse:
+    """
+    Convenience function to generate with intelligent tier routing.
+
+    v94.0 - Automatically routes to optimal tier based on complexity.
+
+    Args:
+        prompt: The prompt to generate from
+        context: Optional routing context:
+            - max_latency_ms: Maximum acceptable latency
+            - max_cost_usd: Maximum cost for this request
+            - prefer_local: Prefer local models
+        **kwargs: Additional generation parameters
+
+    Returns:
+        InferenceResponse with tier routing metadata
+
+    Example:
+        # Simple usage - automatic routing
+        response = await generate_with_routing("What is AI?")
+
+        # With constraints
+        response = await generate_with_routing(
+            "Design a microservice architecture",
+            context={"max_latency_ms": 10000}
+        )
+        print(f"Used tier: {response.model}")  # Shows which model handled it
+    """
+    client = await get_unified_client()
+    return await client.generate_with_tier_routing(prompt=prompt, context=context, **kwargs)
+
+
+async def analyze_and_route(
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Analyze prompt complexity and return routing decision without executing.
+
+    Useful for debugging or UI display.
+
+    Args:
+        prompt: The prompt to analyze
+        context: Optional routing context
+
+    Returns:
+        Dict with complexity analysis and routing decision
+    """
+    router = await _get_hybrid_router()
+
+    if router is None:
+        return {
+            "error": "HybridTieredRouter not available",
+            "fallback_mode": True,
+        }
+
+    routing_result = await router.route(prompt, context)
+
+    return {
+        "complexity_score": routing_result.complexity_score,
+        "confidence": routing_result.confidence,
+        "selected_tier": routing_result.tier_id,
+        "selected_tier_name": routing_result.tier_name,
+        "model_name": routing_result.model_name,
+        "reasoning": routing_result.reasoning,
+        "estimated_latency_ms": routing_result.estimated_latency_ms,
+        "estimated_cost_usd": routing_result.estimated_cost_usd,
+        "available_tiers": routing_result.available_tiers,
+        "unavailable_tiers": routing_result.unavailable_tiers,
+    }
+
+
+# Add to exports
+__all__.extend([
+    "generate_with_routing",
+    "analyze_and_route",
+])
