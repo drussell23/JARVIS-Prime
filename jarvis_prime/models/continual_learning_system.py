@@ -318,6 +318,18 @@ class ExperienceReplayBuffer:
                 ) if self._priorities else (0, 0),
             }
 
+    async def get_all(self) -> List[Experience]:
+        """
+        Get all experiences in the buffer.
+
+        v92.1: Used for vector store seeding and batch operations.
+
+        Returns:
+            List of all experiences
+        """
+        async with self._lock:
+            return list(self._experiences.values())
+
     async def save(self, path: Path):
         """
         Save buffer to disk with atomic file operations.
@@ -1057,6 +1069,164 @@ class ContinualLearningEngine:
                     self.metrics.average_feedback = data["average_feedback"]
 
             logger.info(f"Loaded learning state from {self._data_dir}")
+
+    async def initialize_vector_store(
+        self,
+        auto_populate: bool = True,
+        seed_from_training_data: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Initialize and optionally populate the vector store.
+
+        v92.1: Auto-population from existing data sources.
+
+        Args:
+            auto_populate: Whether to auto-populate from existing conversations
+            seed_from_training_data: Whether to seed from training data pipeline
+
+        Returns:
+            Initialization statistics
+        """
+        stats = {
+            "documents_added": 0,
+            "conversations_processed": 0,
+            "training_samples_loaded": 0,
+            "errors": 0,
+            "sources": [],
+        }
+
+        if not self.rag_engine:
+            logger.warning("RAG engine not available - skipping vector store initialization")
+            return stats
+
+        async with self._lock:
+            # 1. Seed from existing experience buffer
+            if auto_populate:
+                try:
+                    experiences = await self.experience_buffer.get_all()
+                    docs_to_add = []
+                    metas = []
+
+                    for exp in experiences:
+                        if exp.feedback > 0.3:  # Only positive-ish experiences
+                            doc_text = f"Q: {exp.prompt}\nA: {exp.response}"
+                            docs_to_add.append(doc_text)
+                            metas.append({
+                                "source": "experience_buffer",
+                                "task_type": exp.task_type,
+                                "feedback": exp.feedback,
+                                "timestamp": exp.timestamp,
+                            })
+
+                    if docs_to_add:
+                        await self.rag_engine.add_documents(docs_to_add, metas)
+                        stats["documents_added"] += len(docs_to_add)
+                        stats["sources"].append("experience_buffer")
+                        logger.info(f"Seeded {len(docs_to_add)} documents from experience buffer")
+
+                except Exception as e:
+                    logger.warning(f"Failed to seed from experience buffer: {e}")
+                    stats["errors"] += 1
+
+            # 2. Seed from training data pipeline if available
+            if seed_from_training_data:
+                try:
+                    training_data_dir = Path.home() / ".jarvis" / "training_data"
+                    if training_data_dir.exists():
+                        conversation_files = list(training_data_dir.glob("conversations_*.json"))
+
+                        for conv_file in conversation_files[:10]:  # Limit to recent files
+                            try:
+                                with open(conv_file, 'r') as f:
+                                    conversations = json.load(f)
+
+                                docs_to_add = []
+                                metas = []
+
+                                for conv in conversations:
+                                    if isinstance(conv, dict):
+                                        user_input = conv.get("user_input", conv.get("prompt", ""))
+                                        response = conv.get("assistant_response", conv.get("response", ""))
+                                        quality = conv.get("quality_score", 0.5)
+
+                                        if user_input and response and quality > 0.5:
+                                            doc_text = f"Q: {user_input}\nA: {response}"
+                                            docs_to_add.append(doc_text)
+                                            metas.append({
+                                                "source": "training_pipeline",
+                                                "file": conv_file.name,
+                                                "quality_score": quality,
+                                            })
+
+                                if docs_to_add:
+                                    await self.rag_engine.add_documents(docs_to_add, metas)
+                                    stats["documents_added"] += len(docs_to_add)
+                                    stats["conversations_processed"] += len(conversations)
+
+                            except Exception as e:
+                                logger.warning(f"Failed to process {conv_file}: {e}")
+                                stats["errors"] += 1
+
+                        if stats["conversations_processed"] > 0:
+                            stats["sources"].append("training_pipeline")
+                            logger.info(f"Seeded {stats['documents_added']} documents from training pipeline")
+
+                except Exception as e:
+                    logger.warning(f"Failed to seed from training data: {e}")
+                    stats["errors"] += 1
+
+            # 3. Seed from cross-repo shared knowledge
+            try:
+                cross_repo_dir = Path.home() / ".jarvis" / "cross_repo"
+                knowledge_file = cross_repo_dir / "shared_knowledge.json"
+
+                if knowledge_file.exists():
+                    with open(knowledge_file, 'r') as f:
+                        knowledge = json.load(f)
+
+                    docs_to_add = []
+                    metas = []
+
+                    for item in knowledge.get("items", []):
+                        if isinstance(item, dict) and item.get("content"):
+                            docs_to_add.append(item["content"])
+                            metas.append({
+                                "source": "cross_repo",
+                                "type": item.get("type", "unknown"),
+                            })
+
+                    if docs_to_add:
+                        await self.rag_engine.add_documents(docs_to_add, metas)
+                        stats["documents_added"] += len(docs_to_add)
+                        stats["sources"].append("cross_repo")
+
+            except Exception as e:
+                logger.debug(f"No cross-repo knowledge to seed: {e}")
+
+            logger.info(f"Vector store initialization complete: {stats}")
+            return stats
+
+    async def ensure_initialized(self) -> None:
+        """
+        Ensure the engine is fully initialized with populated vector store.
+
+        v92.1: Idempotent initialization check.
+        """
+        if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
+            async with self._lock:
+                if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
+                    # Load persisted state
+                    try:
+                        await self.load_state()
+                    except Exception as e:
+                        logger.warning(f"Could not load state: {e}")
+
+                    # Initialize vector store
+                    auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
+                    if auto_init and self.rag_engine:
+                        await self.initialize_vector_store()
+
+                    self._fully_initialized = True
 
     def get_status(self) -> Dict[str, Any]:
         """Get engine status."""
@@ -1851,7 +2021,11 @@ _learner_lock = asyncio.Lock()
 
 
 async def get_continual_learner() -> ContinualLearningEngine:
-    """Get or create global continual learner."""
+    """
+    Get or create global continual learner with full initialization.
+
+    v92.1: Auto-initializes vector store from existing data.
+    """
     global _continual_learner
 
     async with _learner_lock:
@@ -1867,11 +2041,16 @@ async def get_continual_learner() -> ContinualLearningEngine:
                 rag_enabled=os.getenv("RAG_ENABLED", "true").lower() == "true"
             )
 
-            # Try to load existing state
+            # v92.1: Use ensure_initialized for complete setup including vector store
             try:
-                await _continual_learner.load_state()
+                await _continual_learner.ensure_initialized()
             except Exception as e:
-                logger.warning(f"Could not load learning state: {e}")
+                logger.warning(f"Could not fully initialize learning engine: {e}")
+                # Fallback to basic load_state
+                try:
+                    await _continual_learner.load_state()
+                except Exception as e2:
+                    logger.warning(f"Could not load learning state: {e2}")
 
         return _continual_learner
 

@@ -448,6 +448,240 @@ class TaskCancellationManager:
             return await asyncio.gather(*tasks, return_exceptions=True)
 
 
+class CircuitBreaker:
+    """
+    Circuit breaker pattern for external service resilience.
+
+    v92.1: Provides graceful degradation for RAG and other external services.
+
+    States:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Failures exceeded threshold, requests fail fast
+    - HALF_OPEN: Testing if service recovered
+
+    Features:
+    - Configurable failure threshold and recovery timeout
+    - Automatic state transitions
+    - Statistics and observability
+    - Thread-safe async operations
+    """
+
+    __slots__ = (
+        '_name', '_failure_threshold', '_recovery_timeout', '_half_open_max_calls',
+        '_state', '_failure_count', '_last_failure_time', '_half_open_calls',
+        '_lock', '_stats', '_state_change_callbacks'
+    )
+
+    # States
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        name: str = "default",
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        half_open_max_calls: int = 3,
+    ):
+        """
+        Initialize circuit breaker.
+
+        Args:
+            name: Circuit breaker identifier
+            failure_threshold: Failures before opening circuit
+            recovery_timeout: Seconds before attempting recovery
+            half_open_max_calls: Max calls allowed in half-open state
+        """
+        self._name = name
+        self._failure_threshold = int(os.getenv(
+            f"CB_{name.upper()}_FAILURE_THRESHOLD", str(failure_threshold)
+        ))
+        self._recovery_timeout = float(os.getenv(
+            f"CB_{name.upper()}_RECOVERY_TIMEOUT", str(recovery_timeout)
+        ))
+        self._half_open_max_calls = half_open_max_calls
+
+        self._state = self.CLOSED
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+        self._half_open_calls = 0
+
+        self._lock = asyncio.Lock()
+        self._stats = {
+            "total_calls": 0,
+            "successful_calls": 0,
+            "failed_calls": 0,
+            "rejected_calls": 0,
+            "state_changes": 0,
+        }
+        self._state_change_callbacks: List[Callable[[str, str], None]] = []
+
+    @property
+    def state(self) -> str:
+        """Get current circuit breaker state."""
+        return self._state
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is open (blocking requests)."""
+        return self._state == self.OPEN
+
+    async def call(
+        self,
+        func: Callable[..., Any],
+        *args,
+        fallback: Optional[Callable[..., Any]] = None,
+        **kwargs,
+    ) -> Any:
+        """
+        Execute function through circuit breaker.
+
+        Args:
+            func: Async function to call
+            *args: Function arguments
+            fallback: Optional fallback function if circuit is open
+            **kwargs: Function keyword arguments
+
+        Returns:
+            Function result or fallback result
+
+        Raises:
+            CircuitBreakerOpen: If circuit is open and no fallback provided
+        """
+        async with self._lock:
+            self._stats["total_calls"] += 1
+
+            # Check if we should allow the call
+            if not await self._should_allow_call():
+                self._stats["rejected_calls"] += 1
+
+                if fallback:
+                    logger.warning(f"Circuit breaker '{self._name}' open - using fallback")
+                    if asyncio.iscoroutinefunction(fallback):
+                        return await fallback(*args, **kwargs)
+                    return fallback(*args, **kwargs)
+
+                raise CircuitBreakerOpenError(
+                    f"Circuit breaker '{self._name}' is open - service unavailable"
+                )
+
+        # Execute the function outside the lock
+        try:
+            if asyncio.iscoroutinefunction(func):
+                result = await func(*args, **kwargs)
+            else:
+                result = func(*args, **kwargs)
+
+            await self._record_success()
+            return result
+
+        except Exception as e:
+            await self._record_failure(e)
+            raise
+
+    async def _should_allow_call(self) -> bool:
+        """Check if a call should be allowed based on circuit state."""
+        now = time.time()
+
+        if self._state == self.CLOSED:
+            return True
+
+        if self._state == self.OPEN:
+            # Check if recovery timeout has passed
+            if now - self._last_failure_time >= self._recovery_timeout:
+                await self._transition_to(self.HALF_OPEN)
+                return True
+            return False
+
+        if self._state == self.HALF_OPEN:
+            # Allow limited calls in half-open state
+            if self._half_open_calls < self._half_open_max_calls:
+                self._half_open_calls += 1
+                return True
+            return False
+
+        return False
+
+    async def _record_success(self) -> None:
+        """Record a successful call."""
+        async with self._lock:
+            self._stats["successful_calls"] += 1
+
+            if self._state == self.HALF_OPEN:
+                # Success in half-open state - close the circuit
+                await self._transition_to(self.CLOSED)
+            elif self._state == self.CLOSED:
+                # Reset failure count on success
+                self._failure_count = 0
+
+    async def _record_failure(self, error: Exception) -> None:
+        """Record a failed call."""
+        async with self._lock:
+            self._stats["failed_calls"] += 1
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            logger.warning(
+                f"Circuit breaker '{self._name}' recorded failure "
+                f"({self._failure_count}/{self._failure_threshold}): {error}"
+            )
+
+            if self._state == self.HALF_OPEN:
+                # Failure in half-open state - back to open
+                await self._transition_to(self.OPEN)
+            elif self._state == self.CLOSED:
+                if self._failure_count >= self._failure_threshold:
+                    await self._transition_to(self.OPEN)
+
+    async def _transition_to(self, new_state: str) -> None:
+        """Transition to a new state."""
+        old_state = self._state
+        self._state = new_state
+        self._stats["state_changes"] += 1
+
+        if new_state == self.CLOSED:
+            self._failure_count = 0
+            self._half_open_calls = 0
+        elif new_state == self.HALF_OPEN:
+            self._half_open_calls = 0
+
+        logger.info(f"Circuit breaker '{self._name}' state: {old_state} -> {new_state}")
+
+        # Notify callbacks
+        for callback in self._state_change_callbacks:
+            try:
+                callback(old_state, new_state)
+            except Exception as e:
+                logger.warning(f"State change callback error: {e}")
+
+    def on_state_change(self, callback: Callable[[str, str], None]) -> None:
+        """Register a state change callback."""
+        self._state_change_callbacks.append(callback)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get circuit breaker statistics."""
+        return {
+            "name": self._name,
+            "state": self._state,
+            "failure_count": self._failure_count,
+            "failure_threshold": self._failure_threshold,
+            "recovery_timeout": self._recovery_timeout,
+            **self._stats,
+        }
+
+    async def reset(self) -> None:
+        """Manually reset the circuit breaker to closed state."""
+        async with self._lock:
+            await self._transition_to(self.CLOSED)
+            logger.info(f"Circuit breaker '{self._name}' manually reset")
+
+
+class CircuitBreakerOpenError(Exception):
+    """Exception raised when circuit breaker is open."""
+    pass
+
+
 class ContextWindowManager:
     """
     Manages context window limits for LLM interactions.
@@ -2161,6 +2395,13 @@ class ReasoningEngine:
             ttl_seconds=float(os.getenv("REASONING_RAG_CACHE_TTL", "300.0")),
         )
 
+        # Circuit breaker for RAG operations (NEW in v92.1)
+        self._rag_circuit_breaker = CircuitBreaker(
+            name="rag",
+            failure_threshold=int(os.getenv("RAG_CIRCUIT_FAILURE_THRESHOLD", "5")),
+            recovery_timeout=float(os.getenv("RAG_CIRCUIT_RECOVERY_TIMEOUT", "30.0")),
+        )
+
         # Shutdown management (NEW in v92.0)
         self._shutdown_event = asyncio.Event()
         self._active_reasoning_tasks: Set[asyncio.Task] = set()
@@ -2252,9 +2493,11 @@ class ReasoningEngine:
         if not self._rag_engine:
             return None
 
-        try:
-            top_k = top_k or self.config.rag_top_k
-            retrieval_result = await self._rag_engine.retrieve(input_text, top_k)
+        # Define the actual retrieval function
+        async def _do_retrieval() -> Optional[Dict[str, Any]]:
+            """Perform the actual RAG retrieval."""
+            effective_top_k = top_k or self.config.rag_top_k
+            retrieval_result = await self._rag_engine.retrieve(input_text, effective_top_k)
 
             if not retrieval_result.documents:
                 return None
@@ -2290,18 +2533,44 @@ class ReasoningEngine:
             retrieval_latency = (time.time() - retrieval_start) * 1000
             await self._stats.record_timing("rag_retrieval_latency_ms", retrieval_latency)
 
-            result = {
+            # Check context utilization
+            context_tokens = self._context_manager.count_tokens(formatted_context)
+            await self._context_manager.check_utilization(context_tokens, "RAG context")
+
+            return {
                 "retrieved_context": formatted_context,
+                "formatted_context": formatted_context,  # v92.1: Add for strategy use
                 "retrieved_documents": relevant_docs,
-                "retrieval_scores": relevant_scores,
+                "relevance_scores": relevant_scores,
+                "num_documents": len(relevant_docs),
                 "retrieval_latency_ms": retrieval_latency,
-                "context_tokens": self._context_manager.count_tokens(formatted_context),
+                "context_tokens": context_tokens,
             }
 
-            # Cache the result
-            await self._rag_cache.set(input_text, result)
+        # Fallback when circuit breaker is open
+        async def _retrieval_fallback() -> None:
+            """Fallback when RAG is unavailable - proceed without context."""
+            await self._stats.increment("rag_circuit_breaker_fallbacks")
+            logger.info("RAG circuit breaker open - proceeding without context")
+            return None
+
+        # v92.1: Execute through circuit breaker for graceful degradation
+        try:
+            result = await self._rag_circuit_breaker.call(
+                _do_retrieval,
+                fallback=_retrieval_fallback,
+            )
+
+            # Cache the result if successful
+            if result is not None:
+                await self._rag_cache.set(input_text, result)
 
             return result
+
+        except CircuitBreakerOpenError:
+            # Circuit is open and no fallback was provided (shouldn't happen)
+            await self._stats.increment("rag_circuit_breaker_rejections")
+            return None
 
         except Exception as e:
             await self._stats.increment("rag_retrieval_errors")
@@ -2825,6 +3094,9 @@ class ReasoningEngine:
                 "cache_misses": stats["counters"].get("rag_cache_misses", 0),
                 "retrievals": stats["counters"].get("rag_retrievals", 0),
                 "errors": stats["counters"].get("rag_retrieval_errors", 0),
+                # v92.1: Circuit breaker stats
+                "circuit_breaker": self._rag_circuit_breaker.get_stats(),
+                "circuit_breaker_fallbacks": stats["counters"].get("rag_circuit_breaker_fallbacks", 0),
             },
             # v92.1: Context window metrics
             "context_window": context_window_stats,
@@ -3044,6 +3316,8 @@ __all__ = [
     "RAGContextCache",
     "FeedbackDeduplicator",
     "QualityScorer",
+    "CircuitBreaker",
+    "CircuitBreakerOpenError",
     # Generators/Evaluators
     "ThoughtGenerator",
     "DefaultThoughtGenerator",
