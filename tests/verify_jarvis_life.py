@@ -893,41 +893,197 @@ class ExperienceLogger:
             return False
 
 # =============================================================================
-# MOCK INFERENCE ENGINE - For Demo Without Full Model Load
+# LOCAL LLM INFERENCE ENGINE - Real llama-cpp-python Integration
 # =============================================================================
 
-class MockInferenceEngine:
+class LocalLLMEngine:
     """
-    Generates plausible mock responses for demo purposes.
+    Real local LLM inference using llama-cpp-python.
 
-    In production, this would be replaced by actual model inference.
+    Features:
+    - Auto-detects available GGUF models
+    - Metal GPU acceleration on Apple Silicon
+    - Async thread pool execution
+    - Graceful fallback to mock if no model available
+    - Performance metrics tracking
+
+    Recommended Models (Claude-3.5-Sonnet alternatives):
+    - Qwen 2.5 32B (closest quality, needs 16GB)
+    - Llama 3.1 8B (fast, good quality, 4GB)
+    - Phi-3 Medium 14B (efficient, 7GB)
+    - TinyLlama 1.1B (fast testing, 600MB) <- Currently installed
     """
 
-    RESPONSES = {
-        "time": [
-            "The current time is {time}. Is there anything else I can help you with?",
-            "It's currently {time}. Have a great day!",
-        ],
-        "quantum_crypto": [
-            "The strategic implications of quantum computing on cryptography are profound. "
-            "Current RSA and ECC encryption could be broken by Shor's algorithm on a sufficiently "
-            "powerful quantum computer. This has led to the development of post-quantum cryptography "
-            "standards by NIST, including lattice-based and hash-based approaches. Organizations "
-            "should begin transitioning to quantum-resistant algorithms now, as encrypted data "
-            "harvested today could be decrypted by future quantum systems.",
-        ],
-        "action": [
-            "I'll open {app} for you right away.",
-            "Opening {app}. Let me know if you need anything else.",
-        ],
-        "default": [
-            "I understand your query. Let me process that for you.",
-            "That's an interesting question. Here's my analysis...",
-        ],
-    }
+    # Model paths to search (in priority order - best models first)
+    MODEL_SEARCH_PATHS = [
+        Path.home() / ".jarvis" / "prime" / "models",  # Llama 3 8B here!
+        Path.home() / "Documents" / "ai-models",       # Mistral 7B here!
+        Path.home() / "Documents" / "repos" / "jarvis-prime" / "models",
+        Path.home() / ".jarvis" / "models",
+        Path.home() / ".cache" / "huggingface",
+    ]
+
+    # Prefer larger/better models when multiple found
+    MODEL_PREFERENCE_ORDER = [
+        "llama-3", "llama3", "qwen", "mistral", "phi",  # Best models
+        "tinyllama",  # Fallback
+    ]
 
     def __init__(self, config: DemoConfig):
         self.config = config
+        self._llm: Optional[Any] = None
+        self._model_path: Optional[Path] = None
+        self._model_name: str = "Unknown"
+        self._initialized = False
+        self._use_mock = False
+        self._executor = __import__("concurrent.futures").futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="llm_inference"
+        )
+        self._load_lock = asyncio.Lock()
+
+        # Performance tracking
+        self._total_tokens = 0
+        self._total_time_ms = 0.0
+        self._inference_count = 0
+
+    def _find_model(self) -> Optional[Path]:
+        """Auto-detect available GGUF models, preferring better models."""
+        all_models: List[Path] = []
+
+        for search_path in self.MODEL_SEARCH_PATHS:
+            if not search_path.exists():
+                continue
+
+            # Check for symlink first (current.gguf)
+            current_link = search_path / "current.gguf"
+            if current_link.exists() and current_link.is_symlink():
+                # Symlink takes priority if it points to a good model
+                target = current_link.resolve()
+                if target.exists():
+                    all_models.append(target)
+
+            # Collect all GGUF files
+            for gguf_file in search_path.glob("*.gguf"):
+                if gguf_file.is_file() and gguf_file not in all_models:
+                    all_models.append(gguf_file)
+
+        if not all_models:
+            return None
+
+        # Sort by preference (prefer larger/better models)
+        def model_score(path: Path) -> int:
+            name = path.name.lower()
+            for i, pref in enumerate(self.MODEL_PREFERENCE_ORDER):
+                if pref in name:
+                    return i
+            return len(self.MODEL_PREFERENCE_ORDER)  # Unknown models last
+
+        # Also prefer larger files (generally better quality)
+        def model_key(path: Path) -> Tuple[int, int]:
+            pref_score = model_score(path)
+            # Negative size so larger files sort first
+            size_score = -path.stat().st_size if path.exists() else 0
+            return (pref_score, size_score)
+
+        all_models.sort(key=model_key)
+        return all_models[0]
+
+    async def initialize(self) -> bool:
+        """Initialize the local LLM engine."""
+        if self._initialized:
+            return not self._use_mock
+
+        async with self._load_lock:
+            if self._initialized:
+                return not self._use_mock
+
+            # Find model
+            self._model_path = self._find_model()
+
+            if not self._model_path:
+                logger.warning("[LocalLLM] No GGUF model found, using mock mode")
+                self._use_mock = True
+                self._initialized = True
+                return False
+
+            # Try to load llama-cpp-python
+            try:
+                from llama_cpp import Llama
+
+                # Detect hardware
+                import platform
+                is_apple_silicon = (
+                    platform.system() == "Darwin" and
+                    platform.machine() == "arm64"
+                )
+
+                # Load model with Metal acceleration on Apple Silicon
+                logger.info(f"[LocalLLM] Loading {self._model_path.name}...")
+                start_time = time.time()
+
+                loop = asyncio.get_event_loop()
+                self._llm = await loop.run_in_executor(
+                    self._executor,
+                    lambda: Llama(
+                        model_path=str(self._model_path),
+                        n_ctx=2048,
+                        n_threads=4,
+                        n_gpu_layers=32 if is_apple_silicon else 0,  # Metal layers
+                        verbose=False,
+                        use_mlock=True,  # Lock model in RAM
+                    )
+                )
+
+                load_time = time.time() - start_time
+                model_size_mb = self._model_path.stat().st_size / (1024 * 1024)
+                self._model_name = self._model_path.stem
+
+                logger.info(
+                    f"[LocalLLM] ✓ Loaded {self._model_name} "
+                    f"({model_size_mb:.0f}MB) in {load_time:.1f}s"
+                )
+
+                self._initialized = True
+                return True
+
+            except ImportError:
+                logger.warning("[LocalLLM] llama-cpp-python not installed, using mock")
+                self._use_mock = True
+                self._initialized = True
+                return False
+
+            except Exception as e:
+                logger.error(f"[LocalLLM] Failed to load model: {e}")
+                self._use_mock = True
+                self._initialized = True
+                return False
+
+    def _generate_sync(
+        self,
+        prompt: str,
+        max_tokens: int = 128,
+        temperature: float = 0.7,
+        stop: Optional[List[str]] = None,
+    ) -> Tuple[str, int, float]:
+        """Synchronous generation (runs in thread pool)."""
+        if not self._llm:
+            return "", 0, 0.0
+
+        start_time = time.time()
+
+        output = self._llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop or ["\n\n", "User:", "Human:"],
+            echo=False,
+        )
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        response_text = output["choices"][0]["text"].strip()
+        tokens_generated = output["usage"]["completion_tokens"]
+
+        return response_text, tokens_generated, elapsed_ms
 
     async def generate(
         self,
@@ -936,13 +1092,66 @@ class MockInferenceEngine:
         complexity_level: ComplexityLevel,
     ) -> Tuple[str, float]:
         """
-        Generate a mock response based on query type.
+        Generate a response using local LLM or mock fallback.
 
         Returns (response_text, latency_ms)
         """
+        await self.initialize()
+
+        # Use mock if no real model available
+        if self._use_mock:
+            return await self._generate_mock(query, model, complexity_level)
+
+        # Build chat prompt
+        if complexity_level == ComplexityLevel.ACTION:
+            # Simple action response
+            prompt = f"User: {query}\nAssistant: I'll help you with that."
+            max_tokens = 32
+        elif complexity_level == ComplexityLevel.COMPLEX:
+            # Detailed analysis
+            prompt = (
+                f"User: {query}\n\n"
+                f"Assistant: Let me provide a detailed analysis.\n\n"
+            )
+            max_tokens = 256
+        else:
+            # Standard response
+            prompt = f"User: {query}\nAssistant:"
+            max_tokens = 64
+
+        # Run inference in thread pool
+        loop = asyncio.get_event_loop()
+        try:
+            response_text, tokens, latency_ms = await loop.run_in_executor(
+                self._executor,
+                lambda: self._generate_sync(prompt, max_tokens, 0.7)
+            )
+
+            # Update stats
+            self._total_tokens += tokens
+            self._total_time_ms += latency_ms
+            self._inference_count += 1
+
+            # Clean up response
+            if not response_text:
+                response_text = "I understand your request."
+
+            return response_text, latency_ms
+
+        except Exception as e:
+            logger.error(f"[LocalLLM] Inference error: {e}")
+            return await self._generate_mock(query, model, complexity_level)
+
+    async def _generate_mock(
+        self,
+        query: str,
+        model: str,
+        complexity_level: ComplexityLevel,
+    ) -> Tuple[str, float]:
+        """Fallback mock generation."""
         query_lower = query.lower()
 
-        # Simulate processing time based on model
+        # Simulate latency
         latency_map = {
             "Prime-7B-Chat": 200,
             "Prime-13B-Instruct": 500,
@@ -950,32 +1159,52 @@ class MockInferenceEngine:
             "Claude-3-Opus": 3000,
             "JARVIS-Tool-Agent": 100,
         }
-        base_latency = latency_map.get(model, 500)
-
-        # Add some variance
-        latency = base_latency + random.randint(-50, 150)
-
-        # Simulate async processing
+        latency = latency_map.get(model, 500) + random.randint(-50, 150)
         await asyncio.sleep(latency / 1000)
 
-        # Generate response based on query type
+        # Generate response
         if "time" in query_lower:
-            response = random.choice(self.RESPONSES["time"]).format(
-                time=datetime.now().strftime("%I:%M %p")
-            )
+            response = f"The current time is {datetime.now().strftime('%I:%M %p')}."
         elif "quantum" in query_lower or "cryptography" in query_lower:
-            response = random.choice(self.RESPONSES["quantum_crypto"])
+            response = (
+                "The strategic implications of quantum computing on cryptography are profound. "
+                "Current RSA and ECC encryption could be broken by Shor's algorithm. "
+                "Organizations should transition to post-quantum cryptography standards."
+            )
         elif complexity_level == ComplexityLevel.ACTION:
-            app_name = "Google Chrome"  # Extract from query in real implementation
+            app = "Chrome"
             for word in ["chrome", "safari", "firefox", "slack", "terminal"]:
                 if word in query_lower:
-                    app_name = word.title()
+                    app = word.title()
                     break
-            response = random.choice(self.RESPONSES["action"]).format(app=app_name)
+            response = f"Opening {app}. Let me know if you need anything else."
         else:
-            response = random.choice(self.RESPONSES["default"])
+            response = "I understand your query. Let me process that for you."
 
         return response, latency
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get inference statistics."""
+        avg_tokens_per_sec = 0.0
+        if self._total_time_ms > 0:
+            avg_tokens_per_sec = (self._total_tokens / self._total_time_ms) * 1000
+
+        return {
+            "model": self._model_name,
+            "model_path": str(self._model_path) if self._model_path else None,
+            "using_mock": self._use_mock,
+            "inference_count": self._inference_count,
+            "total_tokens": self._total_tokens,
+            "total_time_ms": self._total_time_ms,
+            "avg_tokens_per_sec": avg_tokens_per_sec,
+        }
+
+    async def shutdown(self) -> None:
+        """Clean shutdown of the engine."""
+        if self._llm:
+            del self._llm
+            self._llm = None
+        self._executor.shutdown(wait=False)
 
 # =============================================================================
 # DEMO ORCHESTRATOR - The Main Show
@@ -1018,7 +1247,7 @@ class JARVISLifeDemo:
         self.router = IntelligentRouter(self.config)
         self.voice = VoiceEngine(self.config)
         self.experience_logger = ExperienceLogger(self.config)
-        self.inference = MockInferenceEngine(self.config)
+        self.inference = LocalLLMEngine(self.config)  # Real local LLM!
         self._results: List[DemoResponse] = []
         self._output_lock = asyncio.Lock()
 
@@ -1039,7 +1268,7 @@ class JARVISLifeDemo:
 ║  ╚█████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║███████║    ███████╗██║██║     ███████╗ ║
 ║   ╚════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝╚══════╝    ╚══════╝╚═╝╚═╝     ╚══════╝ ║
 ║                                                                              ║
-║                    🧠 CAPABILITIES DEMONSTRATION v92.2 🧠                     ║
+║                    🧠 CAPABILITIES DEMONSTRATION v92.3 🧠                     ║
 ║                                                                              ║
 ║    "Is JARVIS Alive?" - Watch the Brain Think, Decide, and Speak            ║
 ║                                                                              ║
@@ -1155,11 +1384,18 @@ class JARVISLifeDemo:
         await self._print("\n🚀 Starting JARVIS Life Demo...")
         await self._print(f"   Voice: {'Enabled' if self.config.voice_enabled else 'Disabled'} ({self.config.voice_name})")
         await self._print(f"   Experience Logging: {'Enabled' if self.config.log_experiences else 'Disabled'}")
-        await self._print(f"   Mock Inference: {'Enabled' if self.config.mock_inference else 'Disabled'}")
 
         # Initialize components
         await self.voice.initialize()
         await self.experience_logger.initialize()
+
+        # Initialize local LLM
+        llm_ready = await self.inference.initialize()
+        if llm_ready:
+            stats = self.inference.get_stats()
+            await self._print(f"   Local LLM: ✓ {stats['model']} loaded")
+        else:
+            await self._print("   Local LLM: Mock mode (no GGUF model found)")
 
         # Opening announcement (skip for faster demo start)
         # Voice will play with responses instead
@@ -1218,6 +1454,15 @@ class JARVISLifeDemo:
         voice_played = sum(1 for r in self._results if r.voice_played)
         experiences_logged = sum(1 for r in self._results if r.experience_logged)
 
+        # Get LLM stats
+        llm_stats = self.inference.get_stats()
+        model_name = llm_stats.get("model", "Mock")[:25]
+        tokens_per_sec = llm_stats.get("avg_tokens_per_sec", 0)
+        using_real_llm = not llm_stats.get("using_mock", True)
+
+        llm_status = f"✓ {model_name}" if using_real_llm else "Mock Mode"
+        perf_str = f"{tokens_per_sec:.1f} tok/s" if using_real_llm else "N/A"
+
         summary = f"""
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                           DEMO SUMMARY                                       ║
@@ -1227,12 +1472,18 @@ class JARVISLifeDemo:
 ║  Voice Responses:    {voice_played:3}                                                   ║
 ║  Experiences Logged: {experiences_logged:3}                                                   ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  Local LLM:          {llm_status:25}                           ║
+║  Performance:        {perf_str:25}                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
 ║  🧠 JARVIS IS ALIVE - The Brain is thinking, deciding, and speaking!        ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
         await self._print(summary)
+
+        # Shutdown LLM
+        await self.inference.shutdown()
 
 # =============================================================================
 # MAIN ENTRY POINT
