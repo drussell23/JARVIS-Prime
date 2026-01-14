@@ -7,11 +7,11 @@ v99.0 - Advanced Digital Biology Demonstration
 
 This script demonstrates that JARVIS is a LIVING SYSTEM by showing:
 
-┌──────────────────────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────────────────────┐
 │                         🧬 DIGITAL BIOLOGY 🧬                                │
 │                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────┐    │
-│  │                        🧠 THE BRAIN                                  │    │
+│  │                        🧠 THE BRAIN                                   │   |
 │  │  The Router analyzes the complexity of the thought.                  │   │
 │  │  Watch: Neural Switchboard v99.0 making intelligent decisions        │   │
 │  │  "I'm routing this to Claude because it requires deep reasoning"     │   │
@@ -35,27 +35,27 @@ This script demonstrates that JARVIS is a LIVING SYSTEM by showing:
 
 ARCHITECTURE:
     ┌─────────────────────────────────────────────────────────────────────────┐
-    │                    TRINITY: THE LIVING SYSTEM                            │
-    │                                                                          │
-    │  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐             │
-    │  │   JARVIS    │ ◄──► │ JARVIS-Prime│ ◄──► │Reactor-Core │             │
-    │  │   (Body)    │      │   (Mind)    │      │  (Nerves)   │             │
-    │  │             │      │             │      │             │             │
-    │  │ • macOS API │      │ • Router    │      │ • Learning  │             │
-    │  │ • Voice TTS │      │ • Inference │      │ • Training  │             │
-    │  │ • Actions   │      │ • Neural SW │      │ • Memories  │             │
-    │  └─────────────┘      └─────────────┘      └─────────────┘             │
+    │                    TRINITY: THE LIVING SYSTEM                           │
+    │                                                                         │
+    │  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐              │
+    │  │   JARVIS    │ ◄──► │ JARVIS-Prime│ ◄──► │Reactor-Core │              │
+    │  │   (Body)    │      │   (Mind)    │      │  (Nerves)   │              │
+    │  │             │      │             │      │             │              │
+    │  │ • macOS API │      │ • Router    │      │ • Learning  │              │
+    │  │ • Voice TTS │      │ • Inference │      │ • Training  │              │
+    │  │ • Actions   │      │ • Neural SW │      │ • Memories  │              │
+    │  └─────────────┘      └─────────────┘      └─────────────┘              │
     │         │                    │                    │                     │
     │         └────────────────────┼────────────────────┘                     │
     │                              │                                          │
-    │                    ┌─────────▼─────────┐                               │
-    │                    │  MEMORY PRESSURE  │                               │
-    │                    │    DETECTION      │                               │
-    │                    │                   │                               │
-    │                    │  Local RAM ──►  │                               │ 
-    │                    │  Cloud Burst      │                               │
-    │                    └───────────────────┘                               │
-    │                                                                          │
+    │                    ┌─────────▼─────────┐                                │
+    │                    │  MEMORY PRESSURE  │                                │
+    │                    │    DETECTION      │                                │
+    │                    │                   │                                │
+    │                    │  Local RAM ──►  │                                  │ 
+    │                    │  Cloud Burst      │                                │
+    │                    └───────────────────┘                                │
+    │                                                                         │
     └─────────────────────────────────────────────────────────────────────────┘
 
 USAGE:
