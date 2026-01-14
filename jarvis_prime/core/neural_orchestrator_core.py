@@ -1444,11 +1444,13 @@ class CrossRepoStateManager:
     Manages shared state across JARVIS, JARVIS-Prime, and Reactor-Core.
 
     Uses atomic file operations for safe state sharing.
+    Integrates with existing CrossRepoBridge and TrinityBridge.
     """
 
     def __init__(self, config: DynamicConfig):
         self._config = config
         self._state_dir = Path(os.path.expanduser(config.cross_repo_state_dir))
+        self._trinity_dir = Path(os.path.expanduser(config.trinity_state_dir))
         self._lock = asyncio.Lock()
         self._initialized = False
 
@@ -1456,15 +1458,48 @@ class CrossRepoStateManager:
         self._cached_state: Optional[CrossRepoMemoryState] = None
         self._cache_time: Optional[datetime] = None
 
+        # Cross-repo bridge instances (lazy init)
+        self._cross_repo_bridge: Optional[Any] = None
+        self._trinity_bridge: Optional[Any] = None
+
     async def initialize(self) -> None:
-        """Initialize state directory."""
+        """Initialize state directory and connect to existing bridges."""
         async with self._lock:
             if self._initialized:
                 return
 
+            # Create state directories
             self._state_dir.mkdir(parents=True, exist_ok=True)
             (self._state_dir / "memory").mkdir(exist_ok=True)
+            (self._state_dir / "routing").mkdir(exist_ok=True)
+            self._trinity_dir.mkdir(parents=True, exist_ok=True)
+            (self._trinity_dir / "neural_orchestrator").mkdir(exist_ok=True)
+
+            # Try to connect to existing bridges
+            await self._connect_to_bridges()
+
             self._initialized = True
+            logger.info("CrossRepoStateManager: Initialized with state sharing")
+
+    async def _connect_to_bridges(self) -> None:
+        """Connect to existing cross-repo and trinity bridges."""
+        # Try cross-repo bridge
+        try:
+            from jarvis_prime.core.cross_repo_bridge import CrossRepoBridge
+            # Just store reference, don't create new instance
+            self._cross_repo_bridge = True  # Mark as available
+            logger.debug("CrossRepoStateManager: CrossRepoBridge available")
+        except ImportError:
+            logger.debug("CrossRepoStateManager: CrossRepoBridge not available")
+
+        # Try trinity bridge
+        try:
+            from jarvis_prime.core.trinity_bridge import TRINITY_ENABLED
+            if TRINITY_ENABLED:
+                self._trinity_bridge = True  # Mark as available
+                logger.debug("CrossRepoStateManager: TrinityBridge available")
+        except ImportError:
+            logger.debug("CrossRepoStateManager: TrinityBridge not available")
 
     async def write_memory_state(
         self,
@@ -1562,12 +1597,143 @@ class CrossRepoStateManager:
 
             return state
 
+    async def write_routing_state(
+        self,
+        routing_stats: Dict[str, Any],
+        active_model: Optional[str] = None,
+    ) -> None:
+        """Write routing state for cross-repo visibility."""
+        await self.initialize()
+
+        state_file = self._state_dir / "routing" / "neural_orchestrator_state.json"
+        temp_file = state_file.with_suffix(".tmp")
+
+        data = {
+            "version": "100.0",
+            "timestamp": datetime.now().isoformat(),
+            "active_model": active_model,
+            "routing_stats": routing_stats,
+        }
+
+        async with self._lock:
+            try:
+                temp_file.write_text(json.dumps(data, indent=2))
+                temp_file.replace(state_file)
+            except Exception as e:
+                logger.warning(f"Failed to write routing state: {e}")
+                with suppress(FileNotFoundError):
+                    temp_file.unlink()
+
+    async def write_trinity_command(
+        self,
+        command: str,
+        payload: Dict[str, Any],
+        request_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Write a command to Trinity for JARVIS Body execution.
+
+        This enables Neural Orchestrator decisions to trigger actions
+        in the broader JARVIS ecosystem.
+        """
+        if not self._trinity_bridge:
+            return None
+
+        await self.initialize()
+
+        request_id = request_id or str(uuid.uuid4())
+        command_file = self._trinity_dir / "neural_orchestrator" / f"{request_id}.json"
+
+        data = {
+            "source": "neural_orchestrator_v100",
+            "request_id": request_id,
+            "command": command,
+            "payload": payload,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        try:
+            temp_file = command_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(data, indent=2))
+            temp_file.replace(command_file)
+            logger.debug(f"Trinity command written: {command} (id={request_id})")
+            return request_id
+        except Exception as e:
+            logger.warning(f"Failed to write Trinity command: {e}")
+            return None
+
+    async def notify_model_switch(
+        self,
+        from_model: Optional[str],
+        to_model: str,
+        reason: str,
+    ) -> None:
+        """Notify other repos about a model switch decision."""
+        await self.write_memory_state(
+            pressure=MemoryPressureLevel.NORMAL,
+            should_burst=False,
+            metadata={
+                "event": "model_switch",
+                "from_model": from_model,
+                "to_model": to_model,
+                "reason": reason,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+
+        # Also write to Trinity if available
+        if self._trinity_bridge:
+            await self.write_trinity_command(
+                command="model_switched",
+                payload={
+                    "from_model": from_model,
+                    "to_model": to_model,
+                    "reason": reason,
+                },
+            )
+
+    async def get_jarvis_body_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Read JARVIS Body state from Trinity.
+
+        This allows Neural Orchestrator to be aware of the broader
+        system state for better routing decisions.
+        """
+        await self.initialize()
+
+        jarvis_state_file = self._state_dir / "jarvis_state.json"
+        if not jarvis_state_file.exists():
+            return None
+
+        try:
+            return json.loads(jarvis_state_file.read_text())
+        except Exception as e:
+            logger.debug(f"Failed to read JARVIS state: {e}")
+            return None
+
+    async def get_reactor_core_state(self) -> Optional[Dict[str, Any]]:
+        """Read Reactor-Core state."""
+        await self.initialize()
+
+        reactor_state_file = self._state_dir / "reactor_state.json"
+        if not reactor_state_file.exists():
+            return None
+
+        try:
+            return json.loads(reactor_state_file.read_text())
+        except Exception as e:
+            logger.debug(f"Failed to read Reactor-Core state: {e}")
+            return None
+
     def get_stats(self) -> Dict[str, Any]:
         """Get state manager statistics."""
         return {
             "state_dir": str(self._state_dir),
+            "trinity_dir": str(self._trinity_dir),
             "initialized": self._initialized,
             "cached": self._cached_state is not None,
+            "cross_repo_bridge_available": self._cross_repo_bridge is not None,
+            "trinity_bridge_available": self._trinity_bridge is not None,
         }
 
 
@@ -1850,7 +2016,7 @@ class NeuralOrchestratorCore:
 
             self._stats["successful_routes"] += 1
 
-            return RoutingResult(
+            result = RoutingResult(
                 request_id=request_id,
                 tier=target_tier,
                 model_id=model_id,
@@ -1864,6 +2030,16 @@ class NeuralOrchestratorCore:
                     "should_burst": should_burst,
                 },
             )
+
+            # Async notification to cross-repo state (non-blocking)
+            asyncio.create_task(
+                self._state_manager.write_routing_state(
+                    routing_stats=self._stats.copy(),
+                    active_model=model_id,
+                )
+            )
+
+            return result
 
         except Exception as e:
             logger.error(f"Routing failed for {request_id}: {e}")

@@ -49,6 +49,9 @@ logger = logging.getLogger("jarvis-prime")
 # Cross-repo bridge (lazy import)
 _bridge = None
 
+# Neural Orchestrator Core v100.0 (lazy import)
+_neural_orchestrator = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="JARVIS-Prime Server")
@@ -185,6 +188,36 @@ async def main():
         logger.warning(f"AGI Integration Hub not available: {e}")
     except Exception as e:
         logger.warning(f"AGI Integration Hub initialization failed: {e}")
+
+    # v100.0: Initialize Neural Orchestrator Core - Unified Intelligent Routing
+    global _neural_orchestrator
+    neural_routing_enabled = False
+    try:
+        from jarvis_prime.core.neural_orchestrator_core import (
+            NeuralOrchestratorCore,
+            DynamicConfig as NeuralConfig,
+            neural_route,
+            get_neural_orchestrator,
+            shutdown_neural_orchestrator,
+            RoutingTier,
+        )
+
+        neural_config = NeuralConfig.from_env_and_yaml()
+        _neural_orchestrator = await get_neural_orchestrator(neural_config)
+        neural_routing_enabled = True
+        logger.info("Neural Orchestrator Core v100.0: Initialized")
+        logger.info("  - Unified Routing: Active")
+        logger.info("  - Task Classification: Active")
+        logger.info("  - Memory Pressure Monitor: Active")
+        logger.info("  - Sticky Routing: Active")
+        logger.info("  - Request Buffering: Active")
+        logger.info("  - Circuit Breakers: Active")
+    except ImportError as e:
+        logger.warning(f"Neural Orchestrator not available: {e}")
+    except Exception as e:
+        logger.warning(f"Neural Orchestrator initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Check model exists
     model_path = Path(args.model)
@@ -431,7 +464,7 @@ async def main():
     # Endpoints
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
-        """OpenAI-compatible chat completions with streaming support."""
+        """OpenAI-compatible chat completions with unified intelligent routing (v100.0)."""
         if not executor.is_loaded():
             raise HTTPException(
                 status_code=503,
@@ -445,6 +478,43 @@ async def main():
         prompt_tokens = len(prompt.split())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created = int(time.time())
+
+        # v100.0: Neural Orchestrator Routing Decision
+        routing_result = None
+        routing_metadata = {}
+        if _neural_orchestrator and neural_routing_enabled:
+            try:
+                # Extract last user message for classification
+                user_messages = [m.content for m in request.messages if m.role == "user"]
+                classification_prompt = user_messages[-1] if user_messages else prompt
+
+                # Get routing decision
+                routing_result = await _neural_orchestrator.route(
+                    prompt=classification_prompt,
+                    context={
+                        "request_id": completion_id,
+                        "message_count": len(request.messages),
+                        "model_requested": request.model,
+                        "stream": request.stream,
+                    }
+                )
+
+                routing_metadata = {
+                    "tier": routing_result.tier.name if routing_result else "unknown",
+                    "model_id": routing_result.model_id if routing_result else None,
+                    "decision_reason": routing_result.decision_reason.value if routing_result else "none",
+                    "confidence": routing_result.confidence if routing_result else 0.0,
+                    "routing_latency_ms": routing_result.latency_ms if routing_result else 0.0,
+                }
+
+                # Log routing decision
+                logger.debug(
+                    f"Neural Routing: {completion_id} -> {routing_metadata['tier']} "
+                    f"(confidence={routing_metadata['confidence']:.2f}, "
+                    f"reason={routing_metadata['decision_reason']})"
+                )
+            except Exception as e:
+                logger.warning(f"Neural routing failed, using default: {e}")
 
         # v74.0: Streaming Response (SSE format)
         if request.stream:
@@ -576,6 +646,13 @@ async def main():
                 except Exception:
                     pass  # Don't fail inference for metrics
 
+            # v100.0: Record circuit breaker success
+            if _neural_orchestrator and routing_result:
+                try:
+                    await _neural_orchestrator.record_circuit_success(routing_result.tier.name)
+                except Exception:
+                    pass
+
             return {
                 "id": completion_id,
                 "object": "chat.completion",
@@ -592,6 +669,7 @@ async def main():
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
                 "x_latency_ms": latency_ms,
+                "x_routing": routing_metadata,  # v100.0: Include routing decision
             }
         except Exception as e:
             logger.error(f"Chat error: {e}")
@@ -601,16 +679,42 @@ async def main():
                     trinity_record_inference(latency_ms=0, success=False)
                 except Exception:
                     pass
+            # v100.0: Record circuit breaker failure
+            if _neural_orchestrator and routing_result:
+                try:
+                    await _neural_orchestrator.record_circuit_failure(routing_result.tier.name)
+                except Exception:
+                    pass
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/generate")
     async def generate(request: GenerateRequest):
-        """Simple text generation."""
+        """Simple text generation with unified intelligent routing (v100.0)."""
         if not executor.is_loaded():
             raise HTTPException(
                 status_code=503,
                 detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
             )
+
+        # v100.0: Neural Orchestrator Routing Decision
+        generate_id = f"gen-{uuid.uuid4().hex[:8]}"
+        routing_result = None
+        routing_metadata = {}
+        if _neural_orchestrator and neural_routing_enabled:
+            try:
+                routing_result = await _neural_orchestrator.route(
+                    prompt=request.prompt,
+                    context={"request_id": generate_id, "endpoint": "generate"}
+                )
+                routing_metadata = {
+                    "tier": routing_result.tier.name if routing_result else "unknown",
+                    "model_id": routing_result.model_id if routing_result else None,
+                    "decision_reason": routing_result.decision_reason.value if routing_result else "none",
+                    "confidence": routing_result.confidence if routing_result else 0.0,
+                }
+            except Exception as e:
+                logger.warning(f"Neural routing failed for generate: {e}")
+
         try:
             start = time.time()
 
@@ -645,9 +749,17 @@ async def main():
                 except Exception:
                     pass
 
+            # v100.0: Record circuit breaker success
+            if _neural_orchestrator and routing_result:
+                try:
+                    await _neural_orchestrator.record_circuit_success(routing_result.tier.name)
+                except Exception:
+                    pass
+
             return {
                 "text": response,
                 "latency_ms": latency_ms,
+                "x_routing": routing_metadata,  # v100.0: Include routing decision
             }
         except Exception as e:
             logger.error(f"Generate error: {e}")
@@ -655,6 +767,12 @@ async def main():
             if trinity_record_inference:
                 try:
                     trinity_record_inference(latency_ms=0, success=False)
+                except Exception:
+                    pass
+            # v100.0: Record circuit breaker failure
+            if _neural_orchestrator and routing_result:
+                try:
+                    await _neural_orchestrator.record_circuit_failure(routing_result.tier.name)
                 except Exception:
                     pass
             raise HTTPException(status_code=500, detail=str(e))
@@ -1048,9 +1166,162 @@ async def main():
                 "error": str(e),
             }
 
+    # ==========================================================================
+    # NEURAL ORCHESTRATOR v100.0 ENDPOINTS - Unified Intelligent Routing
+    # ==========================================================================
+
+    class NeuralRouteRequest(BaseModel):
+        """Request for neural routing decision."""
+        prompt: str
+        context: dict = {}
+
+    @app.get("/neural-orchestrator/health")
+    async def neural_orchestrator_health():
+        """Get Neural Orchestrator health status."""
+        if not _neural_orchestrator or not neural_routing_enabled:
+            return {
+                "status": "not_initialized",
+                "message": "Neural Orchestrator not available",
+            }
+
+        try:
+            health = _neural_orchestrator.get_health_status()
+            return {
+                "status": "ok",
+                **health,
+            }
+        except Exception as e:
+            logger.error(f"Neural Orchestrator health error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
+
+    @app.get("/neural-orchestrator/stats")
+    async def neural_orchestrator_stats():
+        """Get comprehensive Neural Orchestrator statistics."""
+        if not _neural_orchestrator or not neural_routing_enabled:
+            return {
+                "status": "not_initialized",
+                "message": "Neural Orchestrator not available",
+            }
+
+        try:
+            stats = _neural_orchestrator.get_comprehensive_stats()
+            return {
+                "status": "ok",
+                **stats,
+            }
+        except Exception as e:
+            logger.error(f"Neural Orchestrator stats error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
+
+    @app.post("/neural-orchestrator/route")
+    async def neural_orchestrator_route(request: NeuralRouteRequest):
+        """Get routing decision without executing inference."""
+        if not _neural_orchestrator or not neural_routing_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="Neural Orchestrator not available"
+            )
+
+        try:
+            result = await _neural_orchestrator.route(
+                prompt=request.prompt,
+                context=request.context,
+            )
+            return {
+                "status": "ok",
+                "routing": result.to_dict() if result else None,
+                "task_classification": {
+                    "task_type": result.task_classification.task_type.value if result and result.task_classification else None,
+                    "complexity": result.task_classification.complexity if result and result.task_classification else None,
+                    "confidence": result.task_classification.confidence if result and result.task_classification else None,
+                    "recommended_tier": result.task_classification.recommended_tier.name if result and result.task_classification else None,
+                } if result and result.task_classification else None,
+            }
+        except Exception as e:
+            logger.error(f"Neural routing error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/neural-orchestrator/memory")
+    async def neural_orchestrator_memory():
+        """Get current memory pressure status."""
+        if not _neural_orchestrator or not neural_routing_enabled:
+            return {
+                "status": "not_initialized",
+                "message": "Neural Orchestrator not available",
+            }
+
+        try:
+            memory = await _neural_orchestrator.get_memory_status()
+            should_burst = await _neural_orchestrator.should_burst_to_cloud()
+            return {
+                "status": "ok",
+                "memory": memory,
+                "should_burst_to_cloud": should_burst,
+            }
+        except Exception as e:
+            logger.error(f"Neural Orchestrator memory error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
+
+    @app.post("/neural-orchestrator/classify")
+    async def neural_orchestrator_classify(request: NeuralRouteRequest):
+        """Classify a task without routing."""
+        if not _neural_orchestrator or not neural_routing_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="Neural Orchestrator not available"
+            )
+
+        try:
+            classification = await _neural_orchestrator.classify_task(
+                prompt=request.prompt,
+                context=request.context,
+            )
+            return {
+                "status": "ok",
+                "task_type": classification.task_type.value,
+                "complexity": classification.complexity,
+                "confidence": classification.confidence,
+                "signals": classification.signals,
+                "recommended_tier": classification.recommended_tier.name,
+                "requires_fast_response": classification.requires_fast_response,
+                "is_coding_session": classification.is_coding_session,
+            }
+        except Exception as e:
+            logger.error(f"Neural classification error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.on_event("shutdown")
     async def shutdown():
         logger.info("Shutting down...")
+
+        # v100.0: Shutdown Neural Orchestrator
+        if _neural_orchestrator:
+            try:
+                stats = _neural_orchestrator.get_comprehensive_stats()
+                routing_stats = stats.get("routing", {})
+                logger.info("=" * 50)
+                logger.info("Neural Orchestrator v100.0 Session Summary")
+                logger.info("=" * 50)
+                logger.info(f"  Total Requests Routed: {routing_stats.get('total_requests', 0)}")
+                logger.info(f"  Successful Routes: {routing_stats.get('successful_routes', 0)}")
+                logger.info(f"  Fallback Routes: {routing_stats.get('fallback_routes', 0)}")
+                logger.info(f"  Sticky Session Hits: {routing_stats.get('sticky_hits', 0)}")
+                logger.info(f"  Cloud Burst Triggers: {routing_stats.get('burst_triggers', 0)}")
+                logger.info("=" * 50)
+
+                await shutdown_neural_orchestrator()
+                logger.info("Neural Orchestrator v100.0 shutdown complete")
+            except Exception as e:
+                logger.warning(f"Neural Orchestrator shutdown error: {e}")
 
         # v77.0: Shutdown AGI Integration Hub
         if agi_hub:
@@ -1146,6 +1417,15 @@ async def main():
         logger.info(f"  POST http://localhost:{args.port}/agi/learning/trigger")
         logger.info(f"  GET  http://localhost:{args.port}/agi/status")
         logger.info(f"  GET  http://localhost:{args.port}/agi/learning/stats")
+
+    if neural_routing_enabled:
+        logger.info("")
+        logger.info("Neural Orchestrator Endpoints (v100.0):")
+        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/health")
+        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/stats")
+        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/memory")
+        logger.info(f"  POST http://localhost:{args.port}/neural-orchestrator/route")
+        logger.info(f"  POST http://localhost:{args.port}/neural-orchestrator/classify")
     logger.info("=" * 60)
 
     # Run server

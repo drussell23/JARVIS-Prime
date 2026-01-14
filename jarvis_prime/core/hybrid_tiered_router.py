@@ -96,6 +96,8 @@ logger = logging.getLogger(__name__)
 
 # Lazy import to avoid circular dependencies
 _gcp_bridge_available: Optional[bool] = None
+_neural_orchestrator_available: Optional[bool] = None
+_neural_orchestrator_instance: Optional[Any] = None
 
 
 def _get_gcp_bridge():
@@ -110,6 +112,40 @@ def _get_gcp_bridge():
     except ImportError as e:
         logger.debug(f"GCP import bridge not available: {e}")
         _gcp_bridge_available = False
+        return None
+
+
+async def _get_neural_orchestrator():
+    """
+    Lazily get the Neural Orchestrator instance.
+
+    v100.0: HybridTieredRouter can delegate to NeuralOrchestratorCore
+    for unified routing decisions.
+    """
+    global _neural_orchestrator_available, _neural_orchestrator_instance
+
+    if _neural_orchestrator_available is False:
+        return None
+
+    if _neural_orchestrator_instance is not None:
+        return _neural_orchestrator_instance
+
+    try:
+        from jarvis_prime.core.neural_orchestrator_core import (
+            NeuralOrchestratorCore,
+            get_neural_orchestrator,
+        )
+        _neural_orchestrator_instance = await get_neural_orchestrator()
+        _neural_orchestrator_available = True
+        logger.info("HybridTieredRouter: Connected to NeuralOrchestratorCore v100.0")
+        return _neural_orchestrator_instance
+    except ImportError as e:
+        logger.debug(f"Neural Orchestrator not available: {e}")
+        _neural_orchestrator_available = False
+        return None
+    except Exception as e:
+        logger.debug(f"Neural Orchestrator initialization failed: {e}")
+        _neural_orchestrator_available = False
         return None
 
 
@@ -1116,6 +1152,9 @@ class HybridTieredRouter:
         """
         Route a prompt to the optimal model tier.
 
+        v100.0: Optionally delegates to NeuralOrchestratorCore for unified
+        intelligent routing. Falls back to native implementation if unavailable.
+
         Args:
             prompt: The prompt to route
             context: Optional context including:
@@ -1123,6 +1162,7 @@ class HybridTieredRouter:
                 - max_cost_usd: Maximum cost for this request
                 - prefer_local: Prefer local models
                 - require_capability: Required capability
+                - use_neural_orchestrator: Enable/disable Neural Orchestrator (default: True)
 
         Returns:
             RoutingResult with selected tier and metadata
@@ -1133,6 +1173,63 @@ class HybridTieredRouter:
         context = context or {}
         self._total_routes += 1
 
+        # v100.0: Try Neural Orchestrator first (unified intelligent routing)
+        use_neural = context.get("use_neural_orchestrator", True)
+        if use_neural:
+            neural_orchestrator = await _get_neural_orchestrator()
+            if neural_orchestrator:
+                try:
+                    neural_result = await neural_orchestrator.route(prompt, context)
+                    if neural_result:
+                        # Convert Neural Orchestrator result to HybridTieredRouter result
+                        tier_mapping = {
+                            "TIER_0_ULTRA_FAST": "tier_0_local_fast",
+                            "TIER_0_FAST": "tier_0_local_fast",
+                            "TIER_05_CAPABLE": "tier_05_local_capable",
+                            "TIER_1_CLOUD": "tier_1_cloud_intelligent",
+                            "TIER_2_DEEP": "tier_2_deep_reasoning",
+                        }
+                        tier_id = tier_mapping.get(
+                            neural_result.tier.name, "tier_0_local_fast"
+                        )
+
+                        # Get tier config
+                        tier_config = self._tiers.get(tier_id)
+                        if tier_config:
+                            self._tier_usage[tier_id] = self._tier_usage.get(tier_id, 0) + 1
+
+                            result = RoutingResult(
+                                tier_id=tier_id,
+                                tier_name=tier_config.name,
+                                tier_level=tier_config.tier_level,
+                                model_name=neural_result.model_id or tier_config.primary_model.get("name", "unknown"),
+                                endpoint=neural_result.endpoint or tier_config.endpoint,
+                                complexity_score=neural_result.task_classification.complexity if neural_result.task_classification else 0.5,
+                                confidence=neural_result.confidence,
+                                reasoning=f"Neural Orchestrator v100.0: {neural_result.decision_reason.value}",
+                                estimated_latency_ms=tier_config.average_latency_ms,
+                                estimated_cost_usd=0.0,
+                                estimated_tokens_per_second=tier_config.tokens_per_second,
+                                was_fallback=neural_result.decision_reason.value == "fallback",
+                                fallback_reason=None,
+                                fallback_chain=[],
+                                available_tiers=list(self._tiers.keys()),
+                                unavailable_tiers={},
+                            )
+
+                            self._route_history.append(result)
+                            if len(self._route_history) > 1000:
+                                self._route_history = self._route_history[-500:]
+
+                            logger.debug(
+                                f"Neural Orchestrator routed to {tier_id} "
+                                f"(reason={neural_result.decision_reason.value})"
+                            )
+                            return result
+                except Exception as e:
+                    logger.warning(f"Neural Orchestrator routing failed, using native: {e}")
+
+        # Fallback to native HybridTieredRouter implementation
         # Analyze prompt complexity
         analysis = await self._analyzer.analyze(prompt, context)
 
