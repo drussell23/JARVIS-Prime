@@ -139,6 +139,31 @@ try:
 except ImportError:
     OBSERVABILITY_AVAILABLE = False
 
+# v100.1: Neural Orchestrator Integration
+NEURAL_ORCHESTRATOR_AVAILABLE = False
+_neural_orchestrator_instance = None
+
+async def _get_neural_orchestrator():
+    """Lazily get Neural Orchestrator instance."""
+    global NEURAL_ORCHESTRATOR_AVAILABLE, _neural_orchestrator_instance
+
+    if NEURAL_ORCHESTRATOR_AVAILABLE is False and _neural_orchestrator_instance is None:
+        try:
+            from jarvis_prime.core.neural_orchestrator_core import (
+                get_neural_orchestrator,
+                RoutingTier,
+            )
+            _neural_orchestrator_instance = await get_neural_orchestrator()
+            NEURAL_ORCHESTRATOR_AVAILABLE = True
+            logger.info("IntelligentRequestRouter: Connected to NeuralOrchestratorCore v100.1")
+        except ImportError:
+            NEURAL_ORCHESTRATOR_AVAILABLE = False
+        except Exception as e:
+            logger.debug(f"Neural Orchestrator not available: {e}")
+            NEURAL_ORCHESTRATOR_AVAILABLE = False
+
+    return _neural_orchestrator_instance if NEURAL_ORCHESTRATOR_AVAILABLE else None
+
 
 # =============================================================================
 # ENUMS
@@ -2239,8 +2264,31 @@ class IntelligentRequestRouter:
             except Exception:
                 pass  # Observability is optional
 
-        # Find best endpoint
-        routing_result = await self._find_best_endpoint(context)
+        # v100.1: Try Neural Orchestrator for unified routing
+        neural_routing_result = None
+        neural_orchestrator = await _get_neural_orchestrator()
+        if neural_orchestrator:
+            try:
+                neural_routing_result = await neural_orchestrator.route(
+                    prompt=prompt,
+                    context={
+                        "request_id": context.request_id,
+                        "required_capabilities": [c.value for c in (required_capabilities or set())],
+                        "priority": priority.value,
+                        "max_latency_ms": max_latency_ms,
+                        "max_cost": max_cost,
+                    }
+                )
+                if neural_routing_result:
+                    logger.debug(
+                        f"Neural Orchestrator: {context.request_id} -> "
+                        f"{neural_routing_result.tier.name} ({neural_routing_result.confidence:.2f})"
+                    )
+            except Exception as e:
+                logger.debug(f"Neural Orchestrator routing failed, using native: {e}")
+
+        # Find best endpoint (optionally informed by Neural Orchestrator)
+        routing_result = await self._find_best_endpoint(context, neural_routing_result)
 
         if not routing_result.success or not routing_result.endpoint:
             self._failed_requests += 1
@@ -2365,9 +2413,24 @@ class IntelligentRequestRouter:
     # INTERNAL ROUTING LOGIC
     # =========================================================================
 
-    async def _find_best_endpoint(self, context: RoutingContext) -> RoutingResult:
-        """Find the best endpoint for a request."""
+    async def _find_best_endpoint(
+        self,
+        context: RoutingContext,
+        neural_routing_result: Optional[Any] = None,
+    ) -> RoutingResult:
+        """
+        Find the best endpoint for a request.
+
+        v100.1: Optionally uses Neural Orchestrator routing hints.
+        """
         start_time = time.time()
+
+        # v100.1: If Neural Orchestrator provided a routing decision, use it as hint
+        neural_tier_hint = None
+        if neural_routing_result:
+            from jarvis_prime.core.neural_orchestrator_core import RoutingTier
+            neural_tier_hint = neural_routing_result.tier
+            logger.debug(f"Using Neural Orchestrator hint: {neural_tier_hint.name}")
 
         # Get candidate endpoints
         if context.required_capabilities:

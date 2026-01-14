@@ -137,6 +137,1011 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 # =============================================================================
+# ADVANCED IMPORTS (Optional - graceful degradation if unavailable)
+# =============================================================================
+
+try:
+    from collections import deque
+    from threading import RLock
+    import random
+    import tempfile
+    import fcntl
+    ADVANCED_IMPORTS_AVAILABLE = True
+except ImportError:
+    ADVANCED_IMPORTS_AVAILABLE = False
+    deque = list  # type: ignore
+
+# Observability bridge availability
+OBSERVABILITY_AVAILABLE = False
+try:
+    from jarvis_prime.core.observability_bridge import get_observability_bridge
+    OBSERVABILITY_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# =============================================================================
+# CUSTOM EXCEPTIONS
+# =============================================================================
+
+
+class DeadlockError(Exception):
+    """Raised when a deadlock is detected."""
+    pass
+
+
+class RoutingCancelledException(Exception):
+    """Raised when a routing request is cancelled."""
+    pass
+
+
+class AllTiersUnavailableError(Exception):
+    """Raised when all routing tiers are unavailable."""
+    pass
+
+
+class RequestDuplicateError(Exception):
+    """Raised when a duplicate request is detected."""
+    pass
+
+
+# =============================================================================
+# CANCELLATION TOKEN - Advanced request lifecycle management
+# =============================================================================
+
+
+class CancellationToken:
+    """
+    Thread-safe cancellation token for request lifecycle management.
+
+    Supports:
+    - Cooperative cancellation checking
+    - Cascading cancellation to child tokens
+    - Timeout-based auto-cancellation
+    """
+
+    __slots__ = ('_cancelled', '_lock', '_children', '_reason', '_cancel_time')
+
+    def __init__(self):
+        self._cancelled = False
+        self._lock = asyncio.Lock()
+        self._children: List["CancellationToken"] = []
+        self._reason: Optional[str] = None
+        self._cancel_time: Optional[datetime] = None
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Check if cancellation was requested."""
+        return self._cancelled
+
+    @property
+    def cancellation_reason(self) -> Optional[str]:
+        """Get reason for cancellation."""
+        return self._reason
+
+    async def cancel(self, reason: str = "cancelled") -> None:
+        """Request cancellation."""
+        async with self._lock:
+            if not self._cancelled:
+                self._cancelled = True
+                self._reason = reason
+                self._cancel_time = datetime.now()
+                # Cascade to children
+                for child in self._children:
+                    await child.cancel(reason=f"parent:{reason}")
+
+    def create_child(self) -> "CancellationToken":
+        """Create a child token that cancels when parent cancels."""
+        child = CancellationToken()
+        self._children.append(child)
+        if self._cancelled:
+            child._cancelled = True
+            child._reason = f"parent:{self._reason}"
+        return child
+
+    def check(self) -> None:
+        """Check if cancelled and raise if so."""
+        if self._cancelled:
+            raise RoutingCancelledException(self._reason or "cancelled")
+
+    @classmethod
+    def with_timeout(cls, timeout_seconds: float) -> "CancellationToken":
+        """Create a token that auto-cancels after timeout."""
+        token = cls()
+        asyncio.create_task(token._timeout_canceller(timeout_seconds))
+        return token
+
+    async def _timeout_canceller(self, timeout: float) -> None:
+        """Background task to cancel after timeout."""
+        await asyncio.sleep(timeout)
+        await self.cancel(reason=f"timeout:{timeout}s")
+
+
+# Context variable for cancellation token
+cancellation_token_var: contextvars.ContextVar[Optional[CancellationToken]] = contextvars.ContextVar(
+    'cancellation_token', default=None
+)
+
+
+# =============================================================================
+# DEADLOCK-DETECTING LOCK - Prevents indefinite blocking
+# =============================================================================
+
+
+class DeadlockDetectingLock:
+    """
+    Async lock with deadlock detection and timeout.
+
+    Features:
+    - Configurable acquisition timeout
+    - Tracks lock holder for debugging
+    - Raises DeadlockError on timeout
+    """
+
+    __slots__ = ('_lock', '_timeout', '_acquired_by', '_acquired_at', '_acquisition_count')
+
+    def __init__(self, timeout_seconds: float = 5.0):
+        self._lock = asyncio.Lock()
+        self._timeout = timeout_seconds
+        self._acquired_by: Optional[str] = None
+        self._acquired_at: Optional[float] = None
+        self._acquisition_count = 0
+
+    async def acquire(self, caller: str = "unknown") -> bool:
+        """Acquire lock with timeout and deadlock detection."""
+        try:
+            acquired = await asyncio.wait_for(
+                self._lock.acquire(),
+                timeout=self._timeout
+            )
+            if acquired:
+                self._acquired_by = caller
+                self._acquired_at = time.time()
+                self._acquisition_count += 1
+            return acquired
+        except asyncio.TimeoutError:
+            raise DeadlockError(
+                f"Lock acquisition timeout after {self._timeout}s. "
+                f"Currently held by '{self._acquired_by}' since {self._acquired_at}"
+            )
+
+    def release(self) -> None:
+        """Release the lock."""
+        self._acquired_by = None
+        self._acquired_at = None
+        self._lock.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+        return False
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get lock statistics."""
+        return {
+            "locked": self._lock.locked(),
+            "acquired_by": self._acquired_by,
+            "acquired_at": self._acquired_at,
+            "total_acquisitions": self._acquisition_count,
+        }
+
+
+# =============================================================================
+# LRU ROUTING CACHE - Caches routing decisions for performance
+# =============================================================================
+
+
+class LRURoutingCache:
+    """
+    Thread-safe LRU cache for routing decisions.
+
+    Features:
+    - Configurable max size and TTL
+    - Automatic eviction of stale entries
+    - Hit/miss statistics
+    - Thread-safe operations
+    """
+
+    def __init__(
+        self,
+        max_size: int = 1000,
+        ttl_seconds: float = 60.0,
+    ):
+        self._cache: OrderedDict[str, Tuple[Any, datetime]] = OrderedDict()
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._lock = DeadlockDetectingLock(timeout_seconds=2.0)
+
+        # Statistics
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get item from cache if not expired."""
+        async with self._lock:
+            if key not in self._cache:
+                self._misses += 1
+                return None
+
+            value, cached_time = self._cache[key]
+
+            # Check expiration
+            if (datetime.now() - cached_time).total_seconds() > self._ttl_seconds:
+                del self._cache[key]
+                self._misses += 1
+                self._evictions += 1
+                return None
+
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return value
+
+    async def put(self, key: str, value: Any) -> None:
+        """Put item in cache."""
+        async with self._lock:
+            # Remove oldest if at capacity
+            while len(self._cache) >= self._max_size:
+                self._cache.popitem(last=False)
+                self._evictions += 1
+
+            self._cache[key] = (value, datetime.now())
+
+    async def invalidate(self, key: str) -> bool:
+        """Invalidate a cache entry."""
+        async with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
+    async def clear(self) -> int:
+        """Clear all cache entries."""
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+            return count
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total_requests = self._hits + self._misses
+        hit_rate = self._hits / total_requests if total_requests > 0 else 0.0
+        return {
+            "size": len(self._cache),
+            "max_size": self._max_size,
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+            "hit_rate": round(hit_rate, 4),
+        }
+
+
+# =============================================================================
+# REQUEST DEDUPLICATOR - Prevents duplicate request processing
+# =============================================================================
+
+
+class RequestDeduplicator:
+    """
+    Prevents processing of duplicate requests.
+
+    Uses prompt hashing to detect duplicates within a time window.
+    Pending requests share the same future for response.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = 5.0,
+        max_pending: int = 100,
+    ):
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._completed: Dict[str, Tuple[Any, datetime]] = {}
+        self._ttl_seconds = ttl_seconds
+        self._max_pending = max_pending
+        self._lock = DeadlockDetectingLock(timeout_seconds=2.0)
+
+        # Statistics
+        self._deduplicated_count = 0
+        self._processed_count = 0
+
+    @staticmethod
+    def compute_hash(prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """Compute hash for deduplication."""
+        content = prompt
+        if context:
+            # Include relevant context fields in hash
+            relevant_keys = {"session_id", "model_requested", "max_tokens"}
+            relevant_context = {k: v for k, v in context.items() if k in relevant_keys}
+            if relevant_context:
+                content += json.dumps(relevant_context, sort_keys=True)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    async def check_or_register(
+        self,
+        prompt_hash: str,
+    ) -> Tuple[bool, Optional[asyncio.Future]]:
+        """
+        Check if request is duplicate or register as new.
+
+        Returns:
+            (is_duplicate, future_to_await)
+            - If duplicate pending: (True, future_to_await)
+            - If duplicate completed: (True, None) - result in completed cache
+            - If new: (False, None)
+        """
+        async with self._lock:
+            # Check completed cache first
+            if prompt_hash in self._completed:
+                result, cached_time = self._completed[prompt_hash]
+                if (datetime.now() - cached_time).total_seconds() < self._ttl_seconds:
+                    self._deduplicated_count += 1
+                    return (True, None)
+                else:
+                    del self._completed[prompt_hash]
+
+            # Check pending requests
+            if prompt_hash in self._pending:
+                self._deduplicated_count += 1
+                return (True, self._pending[prompt_hash])
+
+            # Register new request
+            if len(self._pending) >= self._max_pending:
+                # Evict oldest pending
+                oldest_key = next(iter(self._pending))
+                del self._pending[oldest_key]
+
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future = loop.create_future()
+            self._pending[prompt_hash] = future
+            self._processed_count += 1
+            return (False, None)
+
+    async def complete(self, prompt_hash: str, result: Any) -> None:
+        """Mark request as completed."""
+        async with self._lock:
+            # Resolve pending future
+            if prompt_hash in self._pending:
+                future = self._pending.pop(prompt_hash)
+                if not future.done():
+                    future.set_result(result)
+
+            # Store in completed cache
+            self._completed[prompt_hash] = (result, datetime.now())
+
+            # Cleanup old completed entries
+            cutoff = datetime.now() - timedelta(seconds=self._ttl_seconds * 2)
+            keys_to_remove = [
+                k for k, (_, t) in self._completed.items()
+                if t < cutoff
+            ]
+            for k in keys_to_remove:
+                del self._completed[k]
+
+    async def fail(self, prompt_hash: str, error: Exception) -> None:
+        """Mark request as failed."""
+        async with self._lock:
+            if prompt_hash in self._pending:
+                future = self._pending.pop(prompt_hash)
+                if not future.done():
+                    future.set_exception(error)
+
+    async def get_completed(self, prompt_hash: str) -> Optional[Any]:
+        """Get completed result if available."""
+        async with self._lock:
+            if prompt_hash in self._completed:
+                result, cached_time = self._completed[prompt_hash]
+                if (datetime.now() - cached_time).total_seconds() < self._ttl_seconds:
+                    return result
+            return None
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get deduplication statistics."""
+        return {
+            "pending_count": len(self._pending),
+            "completed_cache_size": len(self._completed),
+            "deduplicated_total": self._deduplicated_count,
+            "processed_total": self._processed_count,
+            "dedup_rate": round(
+                self._deduplicated_count / max(self._deduplicated_count + self._processed_count, 1),
+                4
+            ),
+        }
+
+
+# =============================================================================
+# MEMORY PRESSURE TREND ANALYZER - Prevents false positive bursts
+# =============================================================================
+
+
+class MemoryPressureTrendAnalyzer:
+    """
+    Analyzes memory pressure trends to prevent false positive cloud bursts.
+
+    Requires sustained pressure before triggering action.
+    """
+
+    def __init__(
+        self,
+        window_size: int = 10,
+        sustained_threshold: int = 3,
+        sustained_duration_seconds: float = 10.0,
+    ):
+        self._history: deque = deque(maxlen=window_size)
+        self._timestamps: deque = deque(maxlen=window_size)
+        self._sustained_threshold = sustained_threshold
+        self._sustained_duration = sustained_duration_seconds
+        self._lock = asyncio.Lock()
+
+    async def record(self, level: "MemoryPressureLevel") -> None:
+        """Record a pressure reading."""
+        async with self._lock:
+            self._history.append(level)
+            self._timestamps.append(datetime.now())
+
+    async def should_trigger_burst(self) -> Tuple[bool, str]:
+        """
+        Analyze if sustained pressure warrants cloud burst.
+
+        Returns:
+            (should_burst, reason)
+        """
+        async with self._lock:
+            if len(self._history) < 3:
+                return (False, "insufficient_data")
+
+            # Count critical readings
+            from collections import Counter
+            counts = Counter(self._history)
+            critical_count = counts.get(MemoryPressureLevel.CRITICAL, 0)
+            warn_count = counts.get(MemoryPressureLevel.WARN, 0)
+
+            # Check for sustained critical
+            if critical_count >= self._sustained_threshold:
+                # Verify time span
+                if len(self._timestamps) >= self._sustained_threshold:
+                    time_span = (self._timestamps[-1] - self._timestamps[0]).total_seconds()
+                    if time_span >= self._sustained_duration:
+                        return (True, f"sustained_critical:{critical_count}/{len(self._history)}")
+
+            # Check for escalating trend
+            recent = list(self._history)[-5:]
+            if len(recent) >= 5:
+                escalating = sum(
+                    1 for i in range(1, len(recent))
+                    if recent[i].value > recent[i-1].value
+                )
+                if escalating >= 3:
+                    return (True, f"escalating_trend:{escalating}/4")
+
+            # Combined pressure
+            if critical_count + warn_count >= len(self._history) * 0.8:
+                return (True, f"high_average_pressure:{(critical_count + warn_count)}/{len(self._history)}")
+
+            return (False, "normal")
+
+    def get_trend(self) -> str:
+        """Get current trend description."""
+        if len(self._history) < 3:
+            return "insufficient_data"
+
+        recent = list(self._history)[-5:]
+        if all(p == MemoryPressureLevel.CRITICAL for p in recent):
+            return "critical_sustained"
+        elif all(p == MemoryPressureLevel.NORMAL for p in recent):
+            return "stable_normal"
+        elif recent[-1].value > recent[0].value:
+            return "increasing"
+        elif recent[-1].value < recent[0].value:
+            return "decreasing"
+        return "stable"
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get analyzer statistics."""
+        return {
+            "history_size": len(self._history),
+            "current_trend": self.get_trend(),
+            "recent_levels": [p.name for p in list(self._history)[-5:]],
+        }
+
+
+# =============================================================================
+# MODEL VERSION TRACKER - Tracks model versions for consistency
+# =============================================================================
+
+
+class ModelVersionTracker:
+    """
+    Tracks model versions to ensure routing consistency during hot-swaps.
+    """
+
+    def __init__(self):
+        self._versions: Dict[str, str] = {}  # tier_name -> version
+        self._load_times: Dict[str, datetime] = {}
+        self._lock = DeadlockDetectingLock(timeout_seconds=2.0)
+        self._version_history: Dict[str, List[Tuple[str, datetime]]] = {}
+
+    async def get_version(self, tier: "RoutingTier") -> Optional[str]:
+        """Get current model version for tier."""
+        async with self._lock:
+            return self._versions.get(tier.name)
+
+    async def update_version(
+        self,
+        tier: "RoutingTier",
+        version: str,
+        model_id: Optional[str] = None,
+    ) -> None:
+        """Update model version for tier."""
+        async with self._lock:
+            old_version = self._versions.get(tier.name)
+            self._versions[tier.name] = version
+            self._load_times[tier.name] = datetime.now()
+
+            # Track history
+            if tier.name not in self._version_history:
+                self._version_history[tier.name] = []
+            self._version_history[tier.name].append((version, datetime.now()))
+
+            # Keep last 10 versions
+            if len(self._version_history[tier.name]) > 10:
+                self._version_history[tier.name] = self._version_history[tier.name][-10:]
+
+            if old_version and old_version != version:
+                logger.info(f"Model version updated: {tier.name} {old_version} -> {version}")
+
+    async def check_version_match(
+        self,
+        tier: "RoutingTier",
+        expected_version: Optional[str],
+    ) -> bool:
+        """Check if current version matches expected."""
+        if expected_version is None:
+            return True
+        async with self._lock:
+            current = self._versions.get(tier.name)
+            return current == expected_version
+
+    async def get_all_versions(self) -> Dict[str, str]:
+        """Get all current model versions."""
+        async with self._lock:
+            return self._versions.copy()
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get version tracker statistics."""
+        return {
+            "tracked_tiers": list(self._versions.keys()),
+            "versions": self._versions.copy(),
+            "load_times": {k: v.isoformat() for k, v in self._load_times.items()},
+        }
+
+
+# =============================================================================
+# PREDICTIVE PRELOADER - Preloads models based on usage patterns
+# =============================================================================
+
+
+class PredictivePreloader:
+    """
+    Predicts and preloads models based on usage patterns.
+
+    Uses frequency analysis and time-of-day patterns to predict
+    which models will be needed next.
+    """
+
+    def __init__(
+        self,
+        history_size: int = 100,
+        prediction_threshold: float = 0.6,
+    ):
+        self._usage_history: deque = deque(maxlen=history_size)
+        self._task_transitions: Dict[str, Dict[str, int]] = {}  # from_task -> {to_task -> count}
+        self._prediction_threshold = prediction_threshold
+        self._lock = asyncio.Lock()
+        self._preload_callbacks: List[Callable[[str], Awaitable[None]]] = []
+
+    async def record_usage(
+        self,
+        task_type: "TaskCategory",
+        tier: "RoutingTier",
+    ) -> None:
+        """Record a usage event."""
+        async with self._lock:
+            event = {
+                "task_type": task_type.value,
+                "tier": tier.name,
+                "timestamp": datetime.now(),
+                "hour": datetime.now().hour,
+            }
+
+            # Track transitions
+            if self._usage_history:
+                last_event = self._usage_history[-1]
+                from_task = last_event["task_type"]
+                to_task = task_type.value
+
+                if from_task not in self._task_transitions:
+                    self._task_transitions[from_task] = {}
+
+                self._task_transitions[from_task][to_task] = (
+                    self._task_transitions[from_task].get(to_task, 0) + 1
+                )
+
+            self._usage_history.append(event)
+
+    async def predict_next_tier(
+        self,
+        current_task: "TaskCategory",
+    ) -> Optional["RoutingTier"]:
+        """Predict next tier based on patterns."""
+        async with self._lock:
+            if current_task.value not in self._task_transitions:
+                return None
+
+            transitions = self._task_transitions[current_task.value]
+            total = sum(transitions.values())
+
+            if total < 5:  # Not enough data
+                return None
+
+            # Find most likely next task
+            best_next = max(transitions.items(), key=lambda x: x[1])
+            probability = best_next[1] / total
+
+            if probability < self._prediction_threshold:
+                return None
+
+            # Map task to typical tier
+            task_to_tier = {
+                "voice": RoutingTier.TIER_0_ULTRA_FAST,
+                "greeting": RoutingTier.TIER_0_ULTRA_FAST,
+                "chat": RoutingTier.TIER_0_FAST,
+                "code": RoutingTier.TIER_05_CAPABLE,
+                "reasoning": RoutingTier.TIER_1_CLOUD,
+                "creative": RoutingTier.TIER_05_CAPABLE,
+                "math": RoutingTier.TIER_1_CLOUD,
+            }
+
+            return task_to_tier.get(best_next[0])
+
+    def register_preload_callback(
+        self,
+        callback: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Register callback for preload triggers."""
+        self._preload_callbacks.append(callback)
+
+    async def trigger_preload(self, model_id: str) -> None:
+        """Trigger preloading of a model."""
+        for callback in self._preload_callbacks:
+            try:
+                asyncio.create_task(callback(model_id))
+            except Exception as e:
+                logger.debug(f"Preload callback failed: {e}")
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get preloader statistics."""
+        return {
+            "history_size": len(self._usage_history),
+            "tracked_transitions": len(self._task_transitions),
+            "prediction_threshold": self._prediction_threshold,
+        }
+
+
+# =============================================================================
+# REQUEST BATCHER - Batches similar requests for efficiency
+# =============================================================================
+
+
+class RequestBatcher:
+    """
+    Batches similar requests for more efficient processing.
+
+    Groups requests with identical prompts within a time window.
+    """
+
+    def __init__(
+        self,
+        batch_window_ms: float = 50.0,
+        max_batch_size: int = 10,
+    ):
+        self._batch_window = batch_window_ms / 1000.0
+        self._max_batch_size = max_batch_size
+        self._batches: Dict[str, List[asyncio.Future]] = {}
+        self._batch_timers: Dict[str, asyncio.Task] = {}
+        self._lock = DeadlockDetectingLock(timeout_seconds=2.0)
+
+        # Statistics
+        self._batched_count = 0
+        self._batch_executions = 0
+
+    async def add_to_batch(
+        self,
+        prompt_hash: str,
+    ) -> asyncio.Future:
+        """Add request to batch, returns future for result."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        async with self._lock:
+            if prompt_hash not in self._batches:
+                self._batches[prompt_hash] = []
+                # Start timer for batch execution
+                self._batch_timers[prompt_hash] = asyncio.create_task(
+                    self._batch_timer(prompt_hash)
+                )
+
+            self._batches[prompt_hash].append(future)
+            self._batched_count += 1
+
+            # Execute immediately if batch is full
+            if len(self._batches[prompt_hash]) >= self._max_batch_size:
+                timer = self._batch_timers.pop(prompt_hash, None)
+                if timer:
+                    timer.cancel()
+                # Don't execute here - let caller handle
+
+        return future
+
+    async def _batch_timer(self, prompt_hash: str) -> None:
+        """Timer to trigger batch execution."""
+        await asyncio.sleep(self._batch_window)
+        # Timer expired - batch will be processed by next get_batch call
+
+    async def get_batch(self, prompt_hash: str) -> Optional[List[asyncio.Future]]:
+        """Get and clear a batch for processing."""
+        async with self._lock:
+            if prompt_hash not in self._batches:
+                return None
+
+            batch = self._batches.pop(prompt_hash)
+            timer = self._batch_timers.pop(prompt_hash, None)
+            if timer:
+                timer.cancel()
+
+            self._batch_executions += 1
+            return batch
+
+    async def resolve_batch(
+        self,
+        prompt_hash: str,
+        result: Any,
+    ) -> int:
+        """Resolve all futures in a batch with result."""
+        batch = await self.get_batch(prompt_hash)
+        if not batch:
+            return 0
+
+        resolved = 0
+        for future in batch:
+            if not future.done():
+                future.set_result(result)
+                resolved += 1
+
+        return resolved
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get batcher statistics."""
+        return {
+            "active_batches": len(self._batches),
+            "batched_total": self._batched_count,
+            "batch_executions": self._batch_executions,
+            "avg_batch_size": round(
+                self._batched_count / max(self._batch_executions, 1), 2
+            ),
+        }
+
+
+# =============================================================================
+# TIER AVAILABILITY MONITOR - Monitors and alerts on tier health
+# =============================================================================
+
+
+class TierAvailabilityMonitor:
+    """
+    Monitors tier availability and triggers alerts when all tiers down.
+    """
+
+    def __init__(
+        self,
+        circuit_manager: "CircuitBreakerManager",
+        alert_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    ):
+        self._circuit_manager = circuit_manager
+        self._alert_callback = alert_callback
+        self._all_down_since: Optional[datetime] = None
+        self._alert_sent = False
+        self._lock = asyncio.Lock()
+
+    async def check_availability(self) -> Dict["RoutingTier", bool]:
+        """Check availability of all tiers."""
+        results = {}
+        for tier in RoutingTier:
+            if tier == RoutingTier.UNKNOWN:
+                continue
+            try:
+                can_proceed = await self._circuit_manager.can_proceed(tier.name)
+                results[tier] = can_proceed
+            except Exception:
+                results[tier] = False
+        return results
+
+    async def get_available_tiers(self) -> List["RoutingTier"]:
+        """Get list of available tiers."""
+        availability = await self.check_availability()
+        return [tier for tier, available in availability.items() if available]
+
+    async def monitor_and_alert(self) -> Tuple[bool, Optional[str]]:
+        """
+        Monitor availability and alert if all down.
+
+        Returns:
+            (all_available_ok, alert_message)
+        """
+        async with self._lock:
+            available = await self.get_available_tiers()
+
+            if not available:
+                if self._all_down_since is None:
+                    self._all_down_since = datetime.now()
+
+                down_duration = (datetime.now() - self._all_down_since).total_seconds()
+
+                if not self._alert_sent and down_duration > 5.0:
+                    alert_msg = f"ALL ROUTING TIERS UNAVAILABLE for {down_duration:.1f}s"
+                    logger.critical(alert_msg)
+
+                    if self._alert_callback:
+                        try:
+                            await self._alert_callback(alert_msg)
+                        except Exception as e:
+                            logger.error(f"Alert callback failed: {e}")
+
+                    self._alert_sent = True
+                    return (False, alert_msg)
+
+                return (False, None)
+            else:
+                # Reset if tiers are back
+                if self._all_down_since:
+                    logger.info("Routing tiers recovered")
+                self._all_down_since = None
+                self._alert_sent = False
+                return (True, None)
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get monitor statistics."""
+        return {
+            "all_down_since": self._all_down_since.isoformat() if self._all_down_since else None,
+            "alert_sent": self._alert_sent,
+        }
+
+
+# =============================================================================
+# METRICS EXPORTER - Exports metrics for observability
+# =============================================================================
+
+
+class MetricsExporter:
+    """
+    Exports routing metrics for observability systems.
+
+    Supports:
+    - Counter increments
+    - Gauge updates
+    - Histogram recording
+    - Batch export
+    """
+
+    def __init__(self):
+        self._counters: Dict[str, int] = {}
+        self._gauges: Dict[str, float] = {}
+        self._histograms: Dict[str, List[float]] = {}
+        self._lock = asyncio.Lock()
+        self._export_callbacks: List[Callable[[Dict], Awaitable[None]]] = []
+
+    async def inc_counter(
+        self,
+        name: str,
+        value: int = 1,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Increment a counter."""
+        key = self._make_key(name, labels)
+        async with self._lock:
+            self._counters[key] = self._counters.get(key, 0) + value
+
+    async def set_gauge(
+        self,
+        name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Set a gauge value."""
+        key = self._make_key(name, labels)
+        async with self._lock:
+            self._gauges[key] = value
+
+    async def record_histogram(
+        self,
+        name: str,
+        value: float,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Record a histogram value."""
+        key = self._make_key(name, labels)
+        async with self._lock:
+            if key not in self._histograms:
+                self._histograms[key] = []
+            self._histograms[key].append(value)
+            # Keep last 1000 values
+            if len(self._histograms[key]) > 1000:
+                self._histograms[key] = self._histograms[key][-500:]
+
+    def _make_key(self, name: str, labels: Optional[Dict[str, str]]) -> str:
+        """Create metric key with labels."""
+        if not labels:
+            return name
+        label_str = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+        return f"{name}{{{label_str}}}"
+
+    def register_export_callback(
+        self,
+        callback: Callable[[Dict], Awaitable[None]],
+    ) -> None:
+        """Register callback for metric exports."""
+        self._export_callbacks.append(callback)
+
+    async def export(self) -> Dict[str, Any]:
+        """Export all metrics."""
+        async with self._lock:
+            metrics = {
+                "counters": self._counters.copy(),
+                "gauges": self._gauges.copy(),
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                        "min": min(v) if v else 0,
+                        "max": max(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        # Call export callbacks
+        for callback in self._export_callbacks:
+            try:
+                await callback(metrics)
+            except Exception as e:
+                logger.debug(f"Metrics export callback failed: {e}")
+
+        return metrics
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Get exporter statistics."""
+        return {
+            "counter_count": len(self._counters),
+            "gauge_count": len(self._gauges),
+            "histogram_count": len(self._histograms),
+            "export_callbacks": len(self._export_callbacks),
+        }
+
+# =============================================================================
 # CONTEXT VARIABLES FOR DISTRIBUTED TRACING
 # =============================================================================
 
@@ -353,6 +1358,37 @@ class DynamicConfig:
     cross_repo_state_dir: str = "~/.jarvis/cross_repo"
     trinity_state_dir: str = "~/.jarvis/trinity"
 
+    # v100.1: Advanced features configuration
+    # Deduplication
+    dedup_ttl_seconds: float = 5.0
+    dedup_max_pending: int = 100
+
+    # Routing cache
+    routing_cache_max_size: int = 1000
+    routing_cache_ttl_seconds: float = 60.0
+
+    # Request batching
+    batch_window_ms: float = 50.0
+    batch_max_size: int = 10
+
+    # Memory pressure trend analysis
+    memory_trend_window_size: int = 10
+    memory_sustained_threshold: int = 3
+    memory_sustained_duration_seconds: float = 10.0
+
+    # Predictive preloading
+    preload_history_size: int = 100
+    preload_prediction_threshold: float = 0.6
+
+    # Deadlock detection
+    lock_timeout_seconds: float = 5.0
+
+    # Cancellation
+    default_request_timeout_seconds: float = 60.0
+
+    # Metrics export interval
+    metrics_export_interval_seconds: float = 30.0
+
     @classmethod
     def from_env_and_yaml(cls, yaml_config: Optional[Dict[str, Any]] = None) -> "DynamicConfig":
         """Create config from environment variables and YAML with proper precedence."""
@@ -402,7 +1438,104 @@ class DynamicConfig:
             shutdown_timeout_seconds=get_value("shutdown_timeout_seconds", 30.0, float),
             cross_repo_state_dir=get_value("cross_repo_state_dir", "~/.jarvis/cross_repo", str),
             trinity_state_dir=get_value("trinity_state_dir", "~/.jarvis/trinity", str),
+            # v100.1: Advanced features configuration
+            dedup_ttl_seconds=get_value("dedup_ttl_seconds", 5.0, float),
+            dedup_max_pending=get_value("dedup_max_pending", 100, int),
+            routing_cache_max_size=get_value("routing_cache_max_size", 1000, int),
+            routing_cache_ttl_seconds=get_value("routing_cache_ttl_seconds", 60.0, float),
+            batch_window_ms=get_value("batch_window_ms", 50.0, float),
+            batch_max_size=get_value("batch_max_size", 10, int),
+            memory_trend_window_size=get_value("memory_trend_window_size", 10, int),
+            memory_sustained_threshold=get_value("memory_sustained_threshold", 3, int),
+            memory_sustained_duration_seconds=get_value("memory_sustained_duration_seconds", 10.0, float),
+            preload_history_size=get_value("preload_history_size", 100, int),
+            preload_prediction_threshold=get_value("preload_prediction_threshold", 0.6, float),
+            lock_timeout_seconds=get_value("lock_timeout_seconds", 5.0, float),
+            default_request_timeout_seconds=get_value("default_request_timeout_seconds", 60.0, float),
+            metrics_export_interval_seconds=get_value("metrics_export_interval_seconds", 30.0, float),
         )
+
+
+class ConfigHotReloader:
+    """
+    Watches config file for changes and triggers reload.
+
+    v100.1: Enables runtime configuration updates without restart.
+    """
+
+    def __init__(
+        self,
+        config_path: Optional[Path] = None,
+        orchestrator: Optional["NeuralOrchestratorCore"] = None,
+        poll_interval_seconds: float = 10.0,
+    ):
+        self._config_path = config_path or Path.home() / ".jarvis" / "neural_orchestrator_config.yaml"
+        self._orchestrator = orchestrator
+        self._poll_interval = poll_interval_seconds
+        self._last_modified: Optional[float] = None
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._reload_callbacks: List[Callable[[DynamicConfig], Awaitable[None]]] = []
+
+    def register_callback(self, callback: Callable[[DynamicConfig], Awaitable[None]]) -> None:
+        """Register callback to be called on config reload."""
+        self._reload_callbacks.append(callback)
+
+    async def start(self) -> None:
+        """Start watching for config changes."""
+        self._running = True
+        self._task = asyncio.create_task(self._watch_loop())
+        logger.info(f"ConfigHotReloader: Watching {self._config_path}")
+
+    async def stop(self) -> None:
+        """Stop watching for config changes."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+
+    async def _watch_loop(self) -> None:
+        """Main watch loop."""
+        while self._running:
+            try:
+                if self._config_path.exists():
+                    current_mtime = self._config_path.stat().st_mtime
+                    if self._last_modified and current_mtime > self._last_modified:
+                        await self._reload_config()
+                    self._last_modified = current_mtime
+            except Exception as e:
+                logger.debug(f"Config watch error: {e}")
+
+            await asyncio.sleep(self._poll_interval)
+
+    async def _reload_config(self) -> None:
+        """Reload configuration and notify listeners."""
+        try:
+            # Load YAML config if it exists
+            yaml_config = {}
+            if self._config_path.exists():
+                import yaml
+                with open(self._config_path, 'r') as f:
+                    yaml_config = yaml.safe_load(f) or {}
+
+            # Create new config
+            new_config = DynamicConfig.from_env_and_yaml(yaml_config)
+
+            # Update orchestrator if available
+            if self._orchestrator:
+                self._orchestrator._config = new_config
+
+            # Notify callbacks
+            for callback in self._reload_callbacks:
+                try:
+                    await callback(new_config)
+                except Exception as e:
+                    logger.error(f"Config reload callback error: {e}")
+
+            logger.info("Configuration reloaded successfully")
+        except Exception as e:
+            logger.error(f"Config reload failed: {e}")
 
 
 @dataclass
@@ -1816,9 +2949,35 @@ class NeuralOrchestratorCore:
         self._state_manager = CrossRepoStateManager(self._config)
         self._circuit_manager = CircuitBreakerManager(self._config)
 
+        # v100.1: Advanced components
+        self._routing_cache = LRURoutingCache(
+            max_size=self._config.routing_cache_max_size,
+            ttl_seconds=self._config.routing_cache_ttl_seconds,
+        )
+        self._deduplicator = RequestDeduplicator(
+            ttl_seconds=self._config.dedup_ttl_seconds,
+            max_pending=self._config.dedup_max_pending,
+        )
+        self._trend_analyzer = MemoryPressureTrendAnalyzer(
+            window_size=self._config.memory_trend_window_size,
+            sustained_threshold=self._config.memory_sustained_threshold,
+            sustained_duration_seconds=self._config.memory_sustained_duration_seconds,
+        )
+        self._version_tracker = ModelVersionTracker()
+        self._preloader = PredictivePreloader(
+            history_size=self._config.preload_history_size,
+            prediction_threshold=self._config.preload_prediction_threshold,
+        )
+        self._batcher = RequestBatcher(
+            batch_window_ms=self._config.batch_window_ms,
+            max_batch_size=self._config.batch_max_size,
+        )
+        self._metrics = MetricsExporter()
+        self._availability_monitor: Optional[TierAvailabilityMonitor] = None  # Init after circuit_manager
+
         # State
         self._initialized = False
-        self._init_lock = asyncio.Lock()
+        self._init_lock = DeadlockDetectingLock(timeout_seconds=10.0)
         self._shutdown_event = asyncio.Event()
 
         # Statistics
@@ -1829,6 +2988,11 @@ class NeuralOrchestratorCore:
             "circuit_opens": 0,
             "sticky_hits": 0,
             "burst_triggers": 0,
+            "cache_hits": 0,
+            "deduplicated": 0,
+            "batched": 0,
+            "cancelled": 0,
+            "all_tiers_down_events": 0,
         }
 
         # Weak reference cache for model specs
@@ -1858,24 +3022,78 @@ class NeuralOrchestratorCore:
                 cls._instance = None
 
     async def initialize(self) -> None:
-        """Initialize all components."""
-        async with self._init_lock:
+        """Initialize all components with advanced features."""
+        await self._init_lock.acquire("initialize")
+        try:
             if self._initialized:
                 return
 
-            logger.info("Initializing NeuralOrchestratorCore v100.0...")
+            logger.info("Initializing NeuralOrchestratorCore v100.1 (Advanced)...")
 
-            # Initialize components
+            # Initialize core components
             await self._memory_monitor.initialize()
             await self._state_manager.initialize()
 
-            # Start background tasks
-            self._background_tasks.append(
-                asyncio.create_task(self._memory_state_broadcaster())
+            # Initialize availability monitor
+            self._availability_monitor = TierAvailabilityMonitor(
+                circuit_manager=self._circuit_manager,
+                alert_callback=self._on_all_tiers_down,
             )
 
+            # Start background tasks
+            self._background_tasks.extend([
+                asyncio.create_task(self._memory_state_broadcaster()),
+                asyncio.create_task(self._session_cleanup_task()),
+                asyncio.create_task(self._metrics_export_task()),
+                asyncio.create_task(self._tier_availability_monitor_task()),
+            ])
+
             self._initialized = True
-            logger.info("NeuralOrchestratorCore v100.0 initialized successfully")
+            logger.info("NeuralOrchestratorCore v100.1 initialized successfully")
+            logger.info("  Advanced features: dedup, caching, batching, trend analysis, predictive preloading")
+        finally:
+            self._init_lock.release()
+
+    async def _on_all_tiers_down(self, alert_msg: str) -> None:
+        """Callback when all tiers are down."""
+        self._stats["all_tiers_down_events"] += 1
+        # Try to notify via observability if available
+        if OBSERVABILITY_AVAILABLE:
+            try:
+                obs = await get_observability_bridge()
+                await obs.send_alert(alert_msg, severity="critical")
+            except Exception:
+                pass
+
+    async def _session_cleanup_task(self) -> None:
+        """Background task to clean up expired sessions."""
+        while not self._shutdown_event.is_set():
+            try:
+                # Cleanup expired sticky sessions
+                if hasattr(self._sticky_routing, 'cleanup_expired_sessions'):
+                    await self._sticky_routing.cleanup_expired_sessions()
+            except Exception as e:
+                logger.debug(f"Session cleanup error: {e}")
+            await asyncio.sleep(60.0)
+
+    async def _metrics_export_task(self) -> None:
+        """Background task to export metrics periodically."""
+        while not self._shutdown_event.is_set():
+            try:
+                await self._metrics.export()
+            except Exception as e:
+                logger.debug(f"Metrics export error: {e}")
+            await asyncio.sleep(self._config.metrics_export_interval_seconds)
+
+    async def _tier_availability_monitor_task(self) -> None:
+        """Background task to monitor tier availability."""
+        while not self._shutdown_event.is_set():
+            try:
+                if self._availability_monitor:
+                    await self._availability_monitor.monitor_and_alert()
+            except Exception as e:
+                logger.debug(f"Availability monitor error: {e}")
+            await asyncio.sleep(10.0)
 
     async def shutdown(self) -> None:
         """Shutdown all components gracefully."""
@@ -1915,11 +3133,26 @@ class NeuralOrchestratorCore:
         self,
         prompt: str,
         context: Optional[Dict[str, Any]] = None,
+        cancellation_token: Optional[CancellationToken] = None,
     ) -> RoutingResult:
         """
-        Route a request through the unified pipeline.
+        Route a request through the unified pipeline with advanced features.
 
-        This is the main entry point for all routing decisions.
+        v100.1 Advanced Features:
+        - Request deduplication
+        - LRU routing cache
+        - Cancellation token support
+        - Memory pressure trend analysis
+        - Predictive preloading
+        - Metrics recording
+
+        Args:
+            prompt: The prompt to route
+            context: Optional request context
+            cancellation_token: Optional cancellation token for request lifecycle
+
+        Returns:
+            RoutingResult with routing decision
         """
         if not self._initialized:
             await self.initialize()
@@ -1932,12 +3165,45 @@ class NeuralOrchestratorCore:
         set_request_context(
             request_id=request_id,
             session_id=context.get("session_id"),
+            trace_id=context.get("trace_id"),
         )
+        if cancellation_token:
+            cancellation_token_var.set(cancellation_token)
 
         self._stats["total_requests"] += 1
 
+        # Compute prompt hash for dedup/cache
+        prompt_hash = self._deduplicator.compute_hash(prompt, context)
+
         try:
-            # 1. Check if buffering (hot swap in progress)
+            # 0. Check cancellation
+            if cancellation_token and cancellation_token.is_cancelled:
+                self._stats["cancelled"] += 1
+                raise RoutingCancelledException(cancellation_token.cancellation_reason)
+
+            # 1. Check deduplication - return cached if duplicate
+            is_duplicate, pending_future = await self._deduplicator.check_or_register(prompt_hash)
+            if is_duplicate:
+                self._stats["deduplicated"] += 1
+                if pending_future:
+                    # Wait for pending request
+                    return await pending_future
+                # Return from completed cache
+                cached_result = await self._deduplicator.get_completed(prompt_hash)
+                if cached_result:
+                    return cached_result
+
+            # 2. Check routing cache
+            cached_routing = await self._routing_cache.get(prompt_hash)
+            if cached_routing:
+                self._stats["cache_hits"] += 1
+                # Update latency and return
+                cached_routing.latency_ms = (time.time() - start_time) * 1000
+                cached_routing.metadata["from_cache"] = True
+                await self._deduplicator.complete(prompt_hash, cached_routing)
+                return cached_routing
+
+            # 3. Check if buffering (hot swap in progress)
             if self._request_buffer.is_buffering():
                 logger.debug(f"Request {request_id} buffered during hot swap")
                 future = await self._request_buffer.enqueue(
@@ -1945,8 +3211,7 @@ class NeuralOrchestratorCore:
                     prompt=prompt,
                     context=context,
                 )
-                # Return a pending result
-                return RoutingResult(
+                result = RoutingResult(
                     request_id=request_id,
                     tier=RoutingTier.UNKNOWN,
                     model_id=None,
@@ -1957,23 +3222,34 @@ class NeuralOrchestratorCore:
                     latency_ms=(time.time() - start_time) * 1000,
                     metadata={"buffered": True, "future": id(future)},
                 )
+                await self._deduplicator.complete(prompt_hash, result)
+                return result
 
-            # 2. Classify the task
+            # 4. Check cancellation before classification
+            if cancellation_token:
+                cancellation_token.check()
+
+            # 5. Classify the task
             classification = await self._task_classifier.classify(prompt, context)
 
-            # 3. Check memory pressure
+            # 6. Check memory pressure with trend analysis
             memory_snapshot = await self._memory_monitor.get_detailed_snapshot()
-            memory_critical = memory_snapshot.get("is_critical", False)
-            should_burst = memory_snapshot.get("should_burst", False)
+            pressure_level = MemoryPressureLevel(memory_snapshot.get("pressure_level", 0))
+            await self._trend_analyzer.record(pressure_level)
+
+            # Use trend analysis for burst decision (prevents false positives)
+            should_burst_trend, burst_reason = await self._trend_analyzer.should_trigger_burst()
+            memory_critical = pressure_level == MemoryPressureLevel.CRITICAL and should_burst_trend
 
             if memory_critical:
                 self._stats["burst_triggers"] += 1
+                logger.info(f"Cloud burst triggered: {burst_reason}")
 
-            # 4. Check sticky routing
+            # 7. Check sticky routing
             sticky_model = await self._sticky_routing.get_sticky_model(classification)
             if sticky_model and not memory_critical:
                 self._stats["sticky_hits"] += 1
-                return RoutingResult(
+                result = RoutingResult(
                     request_id=request_id,
                     tier=classification.recommended_tier,
                     model_id=sticky_model,
@@ -1984,35 +3260,57 @@ class NeuralOrchestratorCore:
                     latency_ms=(time.time() - start_time) * 1000,
                     metadata={"sticky": True},
                 )
+                await self._routing_cache.put(prompt_hash, result)
+                await self._deduplicator.complete(prompt_hash, result)
+                await self._record_metrics(result)
+                return result
 
-            # 5. Determine target tier
+            # 8. Check cancellation before tier selection
+            if cancellation_token:
+                cancellation_token.check()
+
+            # 9. Determine target tier
             target_tier = classification.recommended_tier
 
             # Override for memory pressure
-            if should_burst and target_tier.value < RoutingTier.TIER_1_CLOUD.value:
+            if should_burst_trend and target_tier.value < RoutingTier.TIER_1_CLOUD.value:
                 target_tier = RoutingTier.TIER_1_CLOUD
 
-            # 6. Check circuit breaker
+            # 10. Check circuit breaker with fallback chain
             tier_name = target_tier.name
             can_proceed = await self._circuit_manager.can_proceed(tier_name)
 
             if not can_proceed:
-                # Fallback to next tier
-                fallback_tier = self._get_fallback_tier(target_tier)
+                # Try fallback chain
+                fallback_tier = await self._find_available_tier(target_tier)
                 if fallback_tier:
                     target_tier = fallback_tier
                     self._stats["fallback_routes"] += 1
+                else:
+                    # All tiers down - critical error
+                    self._stats["all_tiers_down_events"] += 1
+                    raise AllTiersUnavailableError("All routing tiers unavailable")
 
-            # 7. Get endpoint
+            # 11. Get endpoint and model
             endpoint = self._get_endpoint_for_tier(target_tier)
             model_id = self._get_model_for_tier(target_tier)
 
-            # 8. Update sticky routing
+            # 12. Update sticky routing
             await self._sticky_routing.update_sticky(
                 model_id=model_id or "unknown",
                 tier=target_tier,
                 classification=classification,
             )
+
+            # 13. Record usage for predictive preloading
+            await self._preloader.record_usage(classification.task_type, target_tier)
+
+            # 14. Predict and trigger preload for next likely model
+            predicted_tier = await self._preloader.predict_next_tier(classification.task_type)
+            if predicted_tier and predicted_tier != target_tier:
+                predicted_model = self._get_model_for_tier(predicted_tier)
+                if predicted_model:
+                    asyncio.create_task(self._preloader.trigger_preload(predicted_model))
 
             self._stats["successful_routes"] += 1
 
@@ -2027,11 +3325,22 @@ class NeuralOrchestratorCore:
                 latency_ms=(time.time() - start_time) * 1000,
                 metadata={
                     "memory_pressure": memory_snapshot.get("pressure_level"),
-                    "should_burst": should_burst,
+                    "should_burst": should_burst_trend,
+                    "burst_reason": burst_reason if should_burst_trend else None,
+                    "memory_trend": self._trend_analyzer.get_trend(),
                 },
             )
 
-            # Async notification to cross-repo state (non-blocking)
+            # 15. Cache the routing decision
+            await self._routing_cache.put(prompt_hash, result)
+
+            # 16. Complete deduplication
+            await self._deduplicator.complete(prompt_hash, result)
+
+            # 17. Record metrics
+            await self._record_metrics(result)
+
+            # 18. Async notification to cross-repo state (non-blocking)
             asyncio.create_task(
                 self._state_manager.write_routing_state(
                     routing_stats=self._stats.copy(),
@@ -2041,8 +3350,30 @@ class NeuralOrchestratorCore:
 
             return result
 
+        except RoutingCancelledException as e:
+            self._stats["cancelled"] += 1
+            await self._deduplicator.fail(prompt_hash, e)
+            raise
+
+        except AllTiersUnavailableError as e:
+            await self._deduplicator.fail(prompt_hash, e)
+            # Try emergency fallback
+            logger.critical(f"All tiers unavailable for {request_id}")
+            return RoutingResult(
+                request_id=request_id,
+                tier=RoutingTier.TIER_0_FAST,
+                model_id=None,
+                endpoint=f"http://localhost:{self._config.jarvis_prime_port}",
+                decision_reason=RoutingDecisionReason.FALLBACK,
+                task_classification=None,
+                confidence=0.1,
+                latency_ms=(time.time() - start_time) * 1000,
+                metadata={"error": str(e), "all_tiers_down": True},
+            )
+
         except Exception as e:
             logger.error(f"Routing failed for {request_id}: {e}")
+            await self._deduplicator.fail(prompt_hash, e)
 
             # Return a fallback result
             return RoutingResult(
@@ -2056,6 +3387,49 @@ class NeuralOrchestratorCore:
                 latency_ms=(time.time() - start_time) * 1000,
                 metadata={"error": str(e)},
             )
+
+    async def _record_metrics(self, result: RoutingResult) -> None:
+        """Record routing metrics for observability."""
+        try:
+            await self._metrics.inc_counter(
+                "neural_orchestrator_routes_total",
+                labels={
+                    "tier": result.tier.name,
+                    "decision_reason": result.decision_reason.value,
+                }
+            )
+            await self._metrics.record_histogram(
+                "neural_orchestrator_routing_latency_ms",
+                result.latency_ms,
+                labels={"tier": result.tier.name}
+            )
+            await self._metrics.set_gauge(
+                "neural_orchestrator_confidence",
+                result.confidence,
+                labels={"tier": result.tier.name}
+            )
+        except Exception as e:
+            logger.debug(f"Metrics recording failed: {e}")
+
+    async def _find_available_tier(self, starting_tier: RoutingTier) -> Optional[RoutingTier]:
+        """Find an available tier starting from the given tier and trying fallbacks."""
+        current = starting_tier
+        tried: Set[RoutingTier] = set()
+
+        while current and current not in tried:
+            tried.add(current)
+            if await self._circuit_manager.can_proceed(current.name):
+                return current
+            current = self._get_fallback_tier(current)
+
+        # If all fallbacks failed, try any available tier
+        for tier in RoutingTier:
+            if tier == RoutingTier.UNKNOWN or tier in tried:
+                continue
+            if await self._circuit_manager.can_proceed(tier.name):
+                return tier
+
+        return None
 
     def _get_endpoint_for_tier(self, tier: RoutingTier) -> str:
         """Get endpoint URL for a tier."""
@@ -2137,7 +3511,7 @@ class NeuralOrchestratorCore:
     def get_comprehensive_stats(self) -> Dict[str, Any]:
         """Get comprehensive statistics from all components."""
         return {
-            "version": "100.0",
+            "version": "100.1",
             "initialized": self._initialized,
             "routing": self._stats.copy(),
             "task_classifier": self._task_classifier.get_stats(),
@@ -2146,20 +3520,64 @@ class NeuralOrchestratorCore:
             "request_buffer": self._request_buffer.get_stats(),
             "state_manager": self._state_manager.get_stats(),
             "circuit_breakers": self._circuit_manager.get_all_stats(),
+            # v100.1 Advanced components
+            "routing_cache": self._routing_cache.stats,
+            "deduplicator": self._deduplicator.stats,
+            "trend_analyzer": self._trend_analyzer.stats,
+            "version_tracker": self._version_tracker.stats,
+            "preloader": self._preloader.stats,
+            "batcher": self._batcher.stats,
+            "metrics": self._metrics.stats,
+            "availability_monitor": self._availability_monitor.stats if self._availability_monitor else None,
         }
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get health status for monitoring."""
+        # Calculate overall health
+        cache_healthy = self._routing_cache.stats.get("hit_rate", 0) > 0 or self._stats["total_requests"] < 10
+        circuit_healthy = all(
+            cb.get("state") != "open"
+            for cb in self._circuit_manager.get_all_stats().values()
+        )
+        memory_healthy = self._trend_analyzer.get_trend() != "critical_sustained"
+
+        overall_healthy = self._initialized and circuit_healthy and memory_healthy
+
         return {
-            "status": "healthy" if self._initialized else "initializing",
-            "version": "100.0",
+            "status": "healthy" if overall_healthy else "degraded",
+            "version": "100.1",
+            "initialized": self._initialized,
             "components": {
                 "task_classifier": True,
                 "memory_monitor": True,
                 "sticky_routing": True,
                 "request_buffer": True,
                 "state_manager": True,
-                "circuit_manager": True,
+                "circuit_manager": circuit_healthy,
+                "routing_cache": cache_healthy,
+                "deduplicator": True,
+                "trend_analyzer": memory_healthy,
+                "version_tracker": True,
+                "preloader": True,
+                "batcher": True,
+                "metrics": True,
+            },
+            "advanced_features": {
+                "deduplication": True,
+                "caching": True,
+                "trend_analysis": True,
+                "predictive_preloading": True,
+                "batching": True,
+                "cancellation_support": True,
+                "deadlock_detection": True,
+            },
+            "stats_summary": {
+                "total_requests": self._stats["total_requests"],
+                "cache_hit_rate": self._routing_cache.stats.get("hit_rate", 0),
+                "dedup_rate": self._deduplicator.stats.get("dedup_rate", 0),
+                "fallback_rate": (
+                    self._stats["fallback_routes"] / max(self._stats["total_requests"], 1)
+                ),
             },
         }
 
@@ -2179,10 +3597,41 @@ async def get_neural_orchestrator(
 async def neural_route(
     prompt: str,
     context: Optional[Dict[str, Any]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> RoutingResult:
     """Convenience function to route a request."""
     orchestrator = await get_neural_orchestrator()
-    return await orchestrator.route(prompt, context)
+    return await orchestrator.route(prompt, context, cancellation_token)
+
+
+@with_retry(max_attempts=3, base_delay=0.5, max_delay=5.0, jitter=True)
+async def neural_route_with_retry(
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> RoutingResult:
+    """Route a request with automatic retry on failure."""
+    orchestrator = await get_neural_orchestrator()
+    result = await orchestrator.route(prompt, context)
+    if result.decision_reason == RoutingDecisionReason.FALLBACK:
+        # Don't retry on intentional fallback
+        return result
+    if result.metadata.get("error"):
+        # Retry on errors
+        raise RuntimeError(result.metadata["error"])
+    return result
+
+
+async def neural_route_with_timeout(
+    prompt: str,
+    context: Optional[Dict[str, Any]] = None,
+    timeout_seconds: float = 30.0,
+) -> RoutingResult:
+    """Route a request with timeout."""
+    token = CancellationToken.with_timeout(timeout_seconds)
+    try:
+        return await neural_route(prompt, context, token)
+    except RoutingCancelledException:
+        raise asyncio.TimeoutError(f"Routing timeout after {timeout_seconds}s")
 
 
 async def shutdown_neural_orchestrator() -> None:
@@ -2220,7 +3669,7 @@ __all__ = [
     "CircuitBreakerProtocol",
     "ConfigProviderProtocol",
 
-    # Components
+    # Core Components
     "UnifiedTaskClassifier",
     "UnifiedMemoryMonitor",
     "UnifiedStickyRouting",
@@ -2228,6 +3677,24 @@ __all__ = [
     "CrossRepoStateManager",
     "CircuitBreakerManager",
     "CircuitBreaker",
+
+    # v100.1 Advanced Components
+    "CancellationToken",
+    "DeadlockDetectingLock",
+    "LRURoutingCache",
+    "RequestDeduplicator",
+    "MemoryPressureTrendAnalyzer",
+    "ModelVersionTracker",
+    "PredictivePreloader",
+    "RequestBatcher",
+    "TierAvailabilityMonitor",
+    "MetricsExporter",
+
+    # Custom Exceptions
+    "DeadlockError",
+    "RoutingCancelledException",
+    "AllTiersUnavailableError",
+    "RequestDuplicateError",
 
     # Decorators
     "defensive",
@@ -2242,9 +3709,12 @@ __all__ = [
     "session_id_var",
     "trace_context_var",
     "routing_context_var",
+    "cancellation_token_var",
 
     # Convenience functions
     "get_neural_orchestrator",
     "neural_route",
+    "neural_route_with_retry",
+    "neural_route_with_timeout",
     "shutdown_neural_orchestrator",
 ]
