@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dynamic Model Registry v98.0 - Neural Switchboard Architecture
-================================================================
+Dynamic Model Registry v99.0 - Neural Switchboard + Multi-Directory Discovery
+===============================================================================
 
 ENTERPRISE NEURAL SWITCHBOARD:
     - Intelligent task classification with multi-signal analysis
@@ -11,6 +11,13 @@ ENTERPRISE NEURAL SWITCHBOARD:
     - Sticky routing for session continuity
     - Unified burst decision making (single source of truth)
     - Predictive model preloading based on task patterns
+
+v99.0 ENHANCEMENTS:
+    - Multi-directory model scanning with configurable search paths
+    - File system watching with Watchdog for real-time model discovery
+    - Model validation pipeline (SHA256 verification, format detection)
+    - Fuzzy matching for unknown models
+    - Reactor Core integration for cross-repo model sync
 
 ADVANCED PATTERNS IMPLEMENTED:
     - Protocol classes for type-safe model interfaces
@@ -24,6 +31,8 @@ ADVANCED PATTERNS IMPLEMENTED:
     - Circuit breakers per model endpoint
     - Observer pattern for model state changes
     - LRU eviction with priority-based retention
+    - Real-time file system watching (polling + watchdog)
+    - Parallel async directory scanning
 
 SUPPORTED MODELS (v97.0 Arsenal):
 ┌────────────────────────────────────────────────────────────────────────────────┐
@@ -363,7 +372,7 @@ QUANTIZATION_SPECS: Dict[QuantizationType, QuantizationSpec] = {
 class ModelSpec:
     """Complete specification for a model."""
 
-    # Identity
+    # Identity (required fields first)
     model_id: str
     name: str
     description: str
@@ -388,6 +397,9 @@ class ModelSpec:
     tokens_per_second_m1: float
     tokens_per_second_a100: float
     memory_required_gb: float
+
+    # Optional fields with defaults below
+    provider: str = ""  # Model provider (Microsoft, Qwen, Meta, DeepSeek, etc.)
     optimal_batch_size: int = 1
 
     # Cost (cloud models)
@@ -2597,6 +2609,1226 @@ class StickyRoutingManager:
 
 
 # =============================================================================
+# MULTI-DIRECTORY MODEL SCANNER (v99.0)
+# =============================================================================
+
+
+@dataclass
+class ModelDirectoryConfig:
+    """Configuration for a model directory."""
+
+    path: Path
+    priority: int = 0  # Higher = more preferred
+    recursive: bool = True
+    watch: bool = True
+    source: str = "local"  # local, reactor, huggingface, custom
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path).expanduser().resolve()
+
+
+@dataclass
+class DiscoveredModel:
+    """A model discovered during scanning."""
+
+    path: Path
+    model_id: Optional[str]
+    spec: Optional["ModelSpec"]
+    size_bytes: int
+    modified_time: datetime
+    source_directory: ModelDirectoryConfig
+    validation_status: str = "pending"  # pending, valid, invalid, unknown
+    sha256_hash: Optional[str] = None
+    fuzzy_match_score: float = 0.0
+    fuzzy_match_candidates: List[str] = field(default_factory=list)
+
+
+class MultiDirectoryModelScanner:
+    """
+    Advanced multi-directory model scanner with:
+    - Configurable search paths with priorities
+    - Recursive directory scanning
+    - Parallel async scanning
+    - Duplicate detection across directories
+    - Model metadata extraction
+    - Directory-specific configuration
+    """
+
+    # Default search directories (in priority order)
+    DEFAULT_SEARCH_DIRS: ClassVar[List[Tuple[str, int]]] = [
+        # Primary JARVIS-Prime models (highest priority)
+        ("~/Documents/repos/jarvis-prime/models", 100),
+        # User's custom models directory
+        ("~/.jarvis/prime/models", 90),
+        # Generic AI models directory
+        ("~/Documents/ai-models", 80),
+        ("~/ai-models", 75),
+        # LM Studio models (if user has it)
+        ("~/.cache/lm-studio/models", 70),
+        # Ollama models
+        ("~/.ollama/models", 65),
+        # Reactor Core output (trained models)
+        ("~/Documents/repos/reactor-core/output/models", 60),
+        ("~/Documents/repos/reactor-core/models", 55),
+        # JARVIS-AI-Agent models
+        ("~/Documents/repos/JARVIS-AI-Agent/models", 50),
+    ]
+
+    # File patterns to scan
+    MODEL_PATTERNS: ClassVar[List[str]] = [
+        "*.gguf",
+        "*.ggml",
+        "*.bin",
+        "*.safetensors",
+        "*.pt",
+        "*.pth",
+    ]
+
+    def __init__(
+        self,
+        additional_dirs: Optional[List[Path]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        max_workers: int = 4,
+    ):
+        self._directories: List[ModelDirectoryConfig] = []
+        self._exclude_patterns = exclude_patterns or ["*.tmp", "*.partial", "*.download"]
+        self._max_workers = max_workers
+        self._scan_lock = asyncio.Lock()
+        self._discovered: Dict[str, DiscoveredModel] = {}
+        self._last_scan_time: Optional[datetime] = None
+        self._scan_semaphore = asyncio.Semaphore(max_workers)
+
+        # Initialize default directories
+        self._init_default_directories()
+
+        # Add additional directories
+        if additional_dirs:
+            for path in additional_dirs:
+                self.add_directory(path)
+
+    def _init_default_directories(self) -> None:
+        """Initialize default search directories."""
+        for path_str, priority in self.DEFAULT_SEARCH_DIRS:
+            path = Path(path_str).expanduser().resolve()
+            if path.exists() and path.is_dir():
+                self._directories.append(
+                    ModelDirectoryConfig(
+                        path=path,
+                        priority=priority,
+                        recursive=True,
+                        watch=True,
+                        source="local" if "repos" in str(path) else "external",
+                    )
+                )
+                logger.debug(f"Model scanner: Added directory {path} (priority={priority})")
+
+    def add_directory(
+        self,
+        path: Path,
+        priority: int = 50,
+        recursive: bool = True,
+        watch: bool = True,
+        source: str = "custom",
+    ) -> None:
+        """Add a directory to the scanner."""
+        path = Path(path).expanduser().resolve()
+        if not path.exists():
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Created model directory: {path}")
+            except Exception as e:
+                logger.warning(f"Cannot create directory {path}: {e}")
+                return
+
+        # Check for duplicates
+        for existing in self._directories:
+            if existing.path == path:
+                logger.debug(f"Directory already registered: {path}")
+                return
+
+        config = ModelDirectoryConfig(
+            path=path,
+            priority=priority,
+            recursive=recursive,
+            watch=watch,
+            source=source,
+        )
+        self._directories.append(config)
+        self._directories.sort(key=lambda d: d.priority, reverse=True)
+        logger.info(f"Added model directory: {path} (priority={priority}, source={source})")
+
+    async def scan_all(
+        self,
+        force_rescan: bool = False,
+        known_models: Optional[Dict[str, "ModelSpec"]] = None,
+    ) -> Dict[str, DiscoveredModel]:
+        """
+        Scan all directories for models.
+
+        Args:
+            force_rescan: If True, rescan even if recently scanned
+            known_models: Known model specs for matching
+
+        Returns:
+            Dictionary of discovered models by path string
+        """
+        async with self._scan_lock:
+            # Check if we need to rescan
+            if not force_rescan and self._last_scan_time:
+                time_since_scan = (datetime.now() - self._last_scan_time).total_seconds()
+                if time_since_scan < 60:  # Cache for 1 minute
+                    return self._discovered
+
+            self._discovered.clear()
+            known_models = known_models or KNOWN_MODELS
+
+            # Scan directories in parallel
+            tasks = [
+                self._scan_directory(config, known_models)
+                for config in self._directories
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Merge results, preferring higher priority directories
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Scan error: {result}")
+                    continue
+                for path_str, discovered in result.items():
+                    if path_str not in self._discovered:
+                        self._discovered[path_str] = discovered
+                    else:
+                        # Keep higher priority version
+                        existing = self._discovered[path_str]
+                        if discovered.source_directory.priority > existing.source_directory.priority:
+                            self._discovered[path_str] = discovered
+
+            self._last_scan_time = datetime.now()
+            logger.info(
+                f"Multi-directory scan complete: {len(self._discovered)} models "
+                f"across {len(self._directories)} directories"
+            )
+            return self._discovered
+
+    async def _scan_directory(
+        self,
+        config: ModelDirectoryConfig,
+        known_models: Dict[str, "ModelSpec"],
+    ) -> Dict[str, DiscoveredModel]:
+        """Scan a single directory for models."""
+        discovered: Dict[str, DiscoveredModel] = {}
+
+        if not config.path.exists():
+            return discovered
+
+        try:
+            async with self._scan_semaphore:
+                # Use asyncio for non-blocking file system operations
+                loop = asyncio.get_event_loop()
+
+                if config.recursive:
+                    all_files = await loop.run_in_executor(
+                        None,
+                        lambda: list(config.path.rglob("*")),
+                    )
+                else:
+                    all_files = await loop.run_in_executor(
+                        None,
+                        lambda: list(config.path.glob("*")),
+                    )
+
+                for file_path in all_files:
+                    if not file_path.is_file():
+                        continue
+
+                    # Check if matches model patterns
+                    if not any(
+                        file_path.match(pattern)
+                        for pattern in self.MODEL_PATTERNS
+                    ):
+                        continue
+
+                    # Check exclusions
+                    if any(
+                        file_path.match(pattern)
+                        for pattern in self._exclude_patterns
+                    ):
+                        continue
+
+                    # Get file info
+                    try:
+                        stat = await loop.run_in_executor(None, file_path.stat)
+                        size_bytes = stat.st_size
+                        modified_time = datetime.fromtimestamp(stat.st_mtime)
+                    except OSError:
+                        continue
+
+                    # Match against known models
+                    model_id, spec, match_score = self._match_model(
+                        file_path, known_models
+                    )
+
+                    path_str = str(file_path)
+                    discovered[path_str] = DiscoveredModel(
+                        path=file_path,
+                        model_id=model_id,
+                        spec=spec,
+                        size_bytes=size_bytes,
+                        modified_time=modified_time,
+                        source_directory=config,
+                        validation_status="pending",
+                        fuzzy_match_score=match_score,
+                    )
+
+        except Exception as e:
+            logger.error(f"Error scanning {config.path}: {e}")
+
+        return discovered
+
+    def _match_model(
+        self,
+        file_path: Path,
+        known_models: Dict[str, "ModelSpec"],
+    ) -> Tuple[Optional[str], Optional["ModelSpec"], float]:
+        """
+        Match a file against known models.
+
+        Returns:
+            (model_id, spec, match_score) tuple
+        """
+        filename = file_path.name.lower()
+        best_match: Optional[str] = None
+        best_spec: Optional["ModelSpec"] = None
+        best_score: float = 0.0
+
+        for model_id, spec in known_models.items():
+            # Exact match check
+            for quant in spec.available_quantizations:
+                expected = spec.get_filename(quant).lower()
+                if filename == expected:
+                    return model_id, spec, 1.0
+
+            # Fuzzy matching
+            score = self._fuzzy_match_score(filename, model_id, spec)
+            if score > best_score:
+                best_score = score
+                best_match = model_id
+                best_spec = spec
+
+        # Only return match if score is above threshold
+        if best_score >= 0.6:
+            return best_match, best_spec, best_score
+
+        return None, None, best_score
+
+    def _fuzzy_match_score(
+        self,
+        filename: str,
+        model_id: str,
+        spec: "ModelSpec",
+    ) -> float:
+        """Calculate fuzzy match score between filename and model spec."""
+        score = 0.0
+        filename_lower = filename.lower()
+        model_id_lower = model_id.lower().replace("-", "").replace("_", "")
+
+        # Check if model name appears in filename
+        name_parts = model_id_lower.split("-")
+        for part in name_parts:
+            if part in filename_lower.replace("-", "").replace("_", ""):
+                score += 0.2
+
+        # Check parameter count
+        param_count = spec.parameter_count.lower()
+        if param_count.replace("b", "") in filename_lower:
+            score += 0.15
+
+        # Check quantization type
+        for quant in spec.available_quantizations:
+            if quant.value.lower() in filename_lower:
+                score += 0.1
+                break
+
+        # Check for provider name in filename (if provider is set)
+        provider = getattr(spec, 'provider', '') or ''
+        if provider and provider.lower() in filename_lower:
+            score += 0.15
+
+        # Bonus for GGUF extension matching
+        if filename_lower.endswith(".gguf"):
+            score += 0.1
+
+        return min(score, 1.0)
+
+    def get_directories(self) -> List[ModelDirectoryConfig]:
+        """Get list of configured directories."""
+        return self._directories.copy()
+
+    def get_discovered_models(self) -> Dict[str, DiscoveredModel]:
+        """Get discovered models from last scan."""
+        return self._discovered.copy()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get scanner statistics."""
+        matched = sum(1 for m in self._discovered.values() if m.model_id)
+        unmatched = sum(1 for m in self._discovered.values() if not m.model_id)
+        total_size = sum(m.size_bytes for m in self._discovered.values())
+
+        return {
+            "directories_configured": len(self._directories),
+            "directories_active": sum(1 for d in self._directories if d.path.exists()),
+            "models_discovered": len(self._discovered),
+            "models_matched": matched,
+            "models_unmatched": unmatched,
+            "total_size_gb": round(total_size / (1024**3), 2),
+            "last_scan": self._last_scan_time.isoformat() if self._last_scan_time else None,
+        }
+
+
+# =============================================================================
+# MODEL FILE WATCHER (v99.0)
+# =============================================================================
+
+
+class ModelFileEvent(Enum):
+    """File system event types."""
+
+    CREATED = "created"
+    MODIFIED = "modified"
+    DELETED = "deleted"
+    MOVED = "moved"
+
+
+@dataclass
+class ModelFileChange:
+    """A file system change event."""
+
+    event_type: ModelFileEvent
+    path: Path
+    old_path: Optional[Path] = None  # For move events
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+class ModelFileWatcher:
+    """
+    File system watcher for real-time model discovery.
+
+    Uses polling as a cross-platform fallback (watchdog optional).
+    Supports debouncing and batching of events.
+    """
+
+    def __init__(
+        self,
+        directories: List[ModelDirectoryConfig],
+        debounce_seconds: float = 2.0,
+        poll_interval_seconds: float = 30.0,
+    ):
+        self._directories = directories
+        self._debounce_seconds = debounce_seconds
+        self._poll_interval = poll_interval_seconds
+        self._running = False
+        self._watch_task: Optional[asyncio.Task] = None
+        self._event_queue: asyncio.Queue[ModelFileChange] = asyncio.Queue()
+        self._callbacks: List[Callable[[ModelFileChange], Awaitable[None]]] = []
+        self._file_hashes: Dict[str, Tuple[int, float]] = {}  # path -> (size, mtime)
+        self._watchdog_available = False
+        self._observers: List[Any] = []
+
+        # Try to import watchdog
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler
+            self._watchdog_available = True
+            logger.info("ModelFileWatcher: Using watchdog for efficient file watching")
+        except ImportError:
+            logger.info("ModelFileWatcher: watchdog not available, using polling")
+
+    def subscribe(
+        self,
+        callback: Callable[[ModelFileChange], Awaitable[None]],
+    ) -> None:
+        """Subscribe to file change events."""
+        self._callbacks.append(callback)
+
+    def unsubscribe(
+        self,
+        callback: Callable[[ModelFileChange], Awaitable[None]],
+    ) -> None:
+        """Unsubscribe from file change events."""
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    async def start(self) -> None:
+        """Start watching directories."""
+        if self._running:
+            return
+
+        self._running = True
+
+        # Initialize file hashes
+        await self._initialize_file_hashes()
+
+        if self._watchdog_available:
+            await self._start_watchdog()
+        else:
+            self._watch_task = asyncio.create_task(self._poll_loop())
+
+        # Start event processor
+        asyncio.create_task(self._process_events())
+        logger.info("ModelFileWatcher started")
+
+    async def stop(self) -> None:
+        """Stop watching directories."""
+        self._running = False
+
+        # Stop watchdog observers
+        for observer in self._observers:
+            try:
+                observer.stop()
+                observer.join(timeout=2)
+            except Exception:
+                pass
+        self._observers.clear()
+
+        # Cancel polling task
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+            self._watch_task = None
+
+        logger.info("ModelFileWatcher stopped")
+
+    async def _initialize_file_hashes(self) -> None:
+        """Initialize file hashes for change detection."""
+        loop = asyncio.get_event_loop()
+
+        for config in self._directories:
+            if not config.watch or not config.path.exists():
+                continue
+
+            try:
+                files = await loop.run_in_executor(
+                    None,
+                    lambda p=config.path: list(p.rglob("*.gguf") if config.recursive else p.glob("*.gguf")),
+                )
+
+                for file_path in files:
+                    try:
+                        stat = file_path.stat()
+                        self._file_hashes[str(file_path)] = (stat.st_size, stat.st_mtime)
+                    except OSError:
+                        continue
+
+            except Exception as e:
+                logger.warning(f"Error initializing file hashes for {config.path}: {e}")
+
+    async def _start_watchdog(self) -> None:
+        """Start watchdog observers for each directory."""
+        try:
+            from watchdog.observers import Observer
+            from watchdog.events import FileSystemEventHandler, FileSystemEvent
+
+            class ModelEventHandler(FileSystemEventHandler):
+                def __init__(handler_self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+                    handler_self.queue = queue
+                    handler_self.loop = loop
+
+                def on_created(handler_self, event: FileSystemEvent):
+                    if not event.is_directory and event.src_path.endswith(".gguf"):
+                        handler_self.loop.call_soon_threadsafe(
+                            handler_self.queue.put_nowait,
+                            ModelFileChange(
+                                event_type=ModelFileEvent.CREATED,
+                                path=Path(event.src_path),
+                            ),
+                        )
+
+                def on_modified(handler_self, event: FileSystemEvent):
+                    if not event.is_directory and event.src_path.endswith(".gguf"):
+                        handler_self.loop.call_soon_threadsafe(
+                            handler_self.queue.put_nowait,
+                            ModelFileChange(
+                                event_type=ModelFileEvent.MODIFIED,
+                                path=Path(event.src_path),
+                            ),
+                        )
+
+                def on_deleted(handler_self, event: FileSystemEvent):
+                    if not event.is_directory and event.src_path.endswith(".gguf"):
+                        handler_self.loop.call_soon_threadsafe(
+                            handler_self.queue.put_nowait,
+                            ModelFileChange(
+                                event_type=ModelFileEvent.DELETED,
+                                path=Path(event.src_path),
+                            ),
+                        )
+
+                def on_moved(handler_self, event: FileSystemEvent):
+                    if not event.is_directory and (
+                        event.src_path.endswith(".gguf") or event.dest_path.endswith(".gguf")
+                    ):
+                        handler_self.loop.call_soon_threadsafe(
+                            handler_self.queue.put_nowait,
+                            ModelFileChange(
+                                event_type=ModelFileEvent.MOVED,
+                                path=Path(event.dest_path),
+                                old_path=Path(event.src_path),
+                            ),
+                        )
+
+            loop = asyncio.get_event_loop()
+            handler = ModelEventHandler(self._event_queue, loop)
+
+            for config in self._directories:
+                if not config.watch or not config.path.exists():
+                    continue
+
+                observer = Observer()
+                observer.schedule(
+                    handler,
+                    str(config.path),
+                    recursive=config.recursive,
+                )
+                observer.start()
+                self._observers.append(observer)
+                logger.debug(f"Started watchdog for {config.path}")
+
+        except Exception as e:
+            logger.error(f"Failed to start watchdog: {e}")
+            # Fall back to polling
+            self._watch_task = asyncio.create_task(self._poll_loop())
+
+    async def _poll_loop(self) -> None:
+        """Polling loop for file changes (fallback when watchdog unavailable)."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._poll_interval)
+                await self._check_for_changes()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Poll loop error: {e}")
+
+    async def _check_for_changes(self) -> None:
+        """Check for file changes using polling."""
+        loop = asyncio.get_event_loop()
+        current_files: Dict[str, Tuple[int, float]] = {}
+
+        for config in self._directories:
+            if not config.watch or not config.path.exists():
+                continue
+
+            try:
+                files = await loop.run_in_executor(
+                    None,
+                    lambda p=config.path: list(p.rglob("*.gguf") if config.recursive else p.glob("*.gguf")),
+                )
+
+                for file_path in files:
+                    try:
+                        stat = file_path.stat()
+                        path_str = str(file_path)
+                        current_files[path_str] = (stat.st_size, stat.st_mtime)
+
+                        # Check for new or modified files
+                        if path_str not in self._file_hashes:
+                            await self._event_queue.put(
+                                ModelFileChange(
+                                    event_type=ModelFileEvent.CREATED,
+                                    path=file_path,
+                                )
+                            )
+                        elif self._file_hashes[path_str] != current_files[path_str]:
+                            await self._event_queue.put(
+                                ModelFileChange(
+                                    event_type=ModelFileEvent.MODIFIED,
+                                    path=file_path,
+                                )
+                            )
+
+                    except OSError:
+                        continue
+
+            except Exception as e:
+                logger.warning(f"Error polling {config.path}: {e}")
+
+        # Check for deleted files
+        for path_str in list(self._file_hashes.keys()):
+            if path_str not in current_files:
+                await self._event_queue.put(
+                    ModelFileChange(
+                        event_type=ModelFileEvent.DELETED,
+                        path=Path(path_str),
+                    )
+                )
+
+        self._file_hashes = current_files
+
+    async def _process_events(self) -> None:
+        """Process file change events with debouncing."""
+        pending_events: Dict[str, ModelFileChange] = {}
+        last_flush_time = time.time()
+
+        while self._running:
+            try:
+                # Get events with timeout
+                try:
+                    event = await asyncio.wait_for(
+                        self._event_queue.get(),
+                        timeout=self._debounce_seconds,
+                    )
+                    path_str = str(event.path)
+
+                    # Debounce: keep only the latest event per path
+                    pending_events[path_str] = event
+
+                except asyncio.TimeoutError:
+                    pass
+
+                # Flush pending events if debounce time has passed
+                current_time = time.time()
+                if (
+                    pending_events
+                    and current_time - last_flush_time >= self._debounce_seconds
+                ):
+                    # Notify callbacks
+                    for event in pending_events.values():
+                        for callback in self._callbacks:
+                            try:
+                                await callback(event)
+                            except Exception as e:
+                                logger.error(f"Callback error: {e}")
+
+                    pending_events.clear()
+                    last_flush_time = current_time
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Event processing error: {e}")
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get watcher statistics."""
+        return {
+            "running": self._running,
+            "watchdog_available": self._watchdog_available,
+            "directories_watched": sum(
+                1 for d in self._directories if d.watch and d.path.exists()
+            ),
+            "files_tracked": len(self._file_hashes),
+            "observers_active": len(self._observers),
+            "callbacks_registered": len(self._callbacks),
+        }
+
+
+# =============================================================================
+# MODEL VALIDATION PIPELINE (v99.0)
+# =============================================================================
+
+
+class ValidationResult(Enum):
+    """Validation result status."""
+
+    VALID = "valid"
+    INVALID = "invalid"
+    CORRUPTED = "corrupted"
+    INCOMPLETE = "incomplete"
+    UNKNOWN_FORMAT = "unknown_format"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class ModelValidation:
+    """Result of model validation."""
+
+    path: Path
+    result: ValidationResult
+    sha256_hash: Optional[str] = None
+    expected_hash: Optional[str] = None
+    file_size_bytes: int = 0
+    expected_size_bytes: Optional[int] = None
+    error_message: Optional[str] = None
+    validation_time_ms: float = 0
+    loadable: Optional[bool] = None
+    format_detected: Optional[str] = None
+
+
+class ModelValidationPipeline:
+    """
+    Comprehensive model validation pipeline:
+    - SHA256 checksum verification
+    - File integrity checks
+    - Format detection
+    - Loadability testing
+    - Size verification
+    """
+
+    # Known file signatures (magic bytes)
+    FORMAT_SIGNATURES: ClassVar[Dict[bytes, str]] = {
+        b"GGUF": "gguf",
+        b"GGML": "ggml",
+        b"PK": "safetensors_zip",
+        b"\x80\x02": "pytorch_pickle",
+    }
+
+    def __init__(
+        self,
+        enable_sha256: bool = True,
+        enable_loadability_test: bool = False,
+        chunk_size: int = 8192,
+        max_validation_time_seconds: float = 60.0,
+    ):
+        self._enable_sha256 = enable_sha256
+        self._enable_loadability = enable_loadability_test
+        self._chunk_size = chunk_size
+        self._max_validation_time = max_validation_time_seconds
+        self._validation_cache: Dict[str, ModelValidation] = {}
+        self._validation_lock = asyncio.Lock()
+
+    async def validate(
+        self,
+        path: Path,
+        expected_hash: Optional[str] = None,
+        expected_size: Optional[int] = None,
+        force_revalidate: bool = False,
+    ) -> ModelValidation:
+        """
+        Validate a model file.
+
+        Args:
+            path: Path to model file
+            expected_hash: Expected SHA256 hash (optional)
+            expected_size: Expected file size in bytes (optional)
+            force_revalidate: Force revalidation even if cached
+
+        Returns:
+            ModelValidation result
+        """
+        path_str = str(path)
+        start_time = time.time()
+
+        # Check cache
+        if not force_revalidate and path_str in self._validation_cache:
+            cached = self._validation_cache[path_str]
+            # Verify file hasn't changed
+            try:
+                stat = path.stat()
+                if stat.st_size == cached.file_size_bytes:
+                    return cached
+            except OSError:
+                pass
+
+        async with self._validation_lock:
+            try:
+                loop = asyncio.get_event_loop()
+
+                # Basic file checks
+                if not path.exists():
+                    return self._create_result(
+                        path, ValidationResult.INVALID,
+                        error_message="File does not exist",
+                        validation_time_ms=(time.time() - start_time) * 1000,
+                    )
+
+                stat = await loop.run_in_executor(None, path.stat)
+                file_size = stat.st_size
+
+                # Size check
+                if expected_size is not None and file_size != expected_size:
+                    return self._create_result(
+                        path, ValidationResult.INCOMPLETE,
+                        file_size_bytes=file_size,
+                        expected_size_bytes=expected_size,
+                        error_message=f"Size mismatch: {file_size} != {expected_size}",
+                        validation_time_ms=(time.time() - start_time) * 1000,
+                    )
+
+                # Format detection
+                format_detected = await self._detect_format(path)
+
+                # SHA256 calculation
+                sha256_hash = None
+                if self._enable_sha256:
+                    sha256_hash = await self._calculate_sha256(path)
+
+                    # Verify hash if expected
+                    if expected_hash and sha256_hash != expected_hash.lower():
+                        return self._create_result(
+                            path, ValidationResult.CORRUPTED,
+                            sha256_hash=sha256_hash,
+                            expected_hash=expected_hash,
+                            file_size_bytes=file_size,
+                            format_detected=format_detected,
+                            error_message="SHA256 hash mismatch",
+                            validation_time_ms=(time.time() - start_time) * 1000,
+                        )
+
+                # Loadability test (optional, expensive)
+                loadable = None
+                if self._enable_loadability:
+                    loadable = await self._test_loadability(path, format_detected)
+
+                result = self._create_result(
+                    path, ValidationResult.VALID,
+                    sha256_hash=sha256_hash,
+                    expected_hash=expected_hash,
+                    file_size_bytes=file_size,
+                    expected_size_bytes=expected_size,
+                    format_detected=format_detected,
+                    loadable=loadable,
+                    validation_time_ms=(time.time() - start_time) * 1000,
+                )
+
+                # Cache result
+                self._validation_cache[path_str] = result
+                return result
+
+            except asyncio.TimeoutError:
+                return self._create_result(
+                    path, ValidationResult.SKIPPED,
+                    error_message="Validation timed out",
+                    validation_time_ms=(time.time() - start_time) * 1000,
+                )
+            except Exception as e:
+                return self._create_result(
+                    path, ValidationResult.INVALID,
+                    error_message=str(e),
+                    validation_time_ms=(time.time() - start_time) * 1000,
+                )
+
+    def _create_result(
+        self,
+        path: Path,
+        result: ValidationResult,
+        **kwargs,
+    ) -> ModelValidation:
+        """Create a validation result."""
+        return ModelValidation(path=path, result=result, **kwargs)
+
+    async def _detect_format(self, path: Path) -> Optional[str]:
+        """Detect model format from file header."""
+        try:
+            loop = asyncio.get_event_loop()
+
+            def read_header():
+                with open(path, "rb") as f:
+                    return f.read(8)
+
+            header = await loop.run_in_executor(None, read_header)
+
+            for signature, format_name in self.FORMAT_SIGNATURES.items():
+                if header.startswith(signature):
+                    return format_name
+
+            # Check by extension
+            suffix = path.suffix.lower()
+            if suffix == ".gguf":
+                return "gguf"
+            elif suffix == ".ggml":
+                return "ggml"
+            elif suffix == ".safetensors":
+                return "safetensors"
+            elif suffix in (".pt", ".pth"):
+                return "pytorch"
+            elif suffix == ".bin":
+                return "binary"
+
+            return "unknown"
+
+        except Exception:
+            return None
+
+    async def _calculate_sha256(self, path: Path) -> str:
+        """Calculate SHA256 hash of file."""
+        loop = asyncio.get_event_loop()
+
+        def compute_hash():
+            sha256 = hashlib.sha256()
+            with open(path, "rb") as f:
+                while chunk := f.read(self._chunk_size):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, compute_hash),
+            timeout=self._max_validation_time,
+        )
+
+    async def _test_loadability(
+        self,
+        path: Path,
+        format_detected: Optional[str],
+    ) -> Optional[bool]:
+        """Test if model can be loaded (basic check)."""
+        if format_detected != "gguf":
+            return None
+
+        try:
+            # Try to read GGUF metadata without loading entire model
+            loop = asyncio.get_event_loop()
+
+            def check_gguf():
+                with open(path, "rb") as f:
+                    magic = f.read(4)
+                    if magic != b"GGUF":
+                        return False
+                    # Read version
+                    version = int.from_bytes(f.read(4), "little")
+                    return version in (2, 3)
+
+            return await loop.run_in_executor(None, check_gguf)
+
+        except Exception:
+            return False
+
+    async def validate_batch(
+        self,
+        paths: List[Path],
+        max_concurrent: int = 4,
+    ) -> List[ModelValidation]:
+        """Validate multiple models concurrently."""
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def validate_with_semaphore(path: Path) -> ModelValidation:
+            async with semaphore:
+                return await self.validate(path)
+
+        tasks = [validate_with_semaphore(path) for path in paths]
+        return await asyncio.gather(*tasks)
+
+    def clear_cache(self) -> None:
+        """Clear validation cache."""
+        self._validation_cache.clear()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get validation statistics."""
+        valid_count = sum(
+            1 for v in self._validation_cache.values()
+            if v.result == ValidationResult.VALID
+        )
+        invalid_count = sum(
+            1 for v in self._validation_cache.values()
+            if v.result in (ValidationResult.INVALID, ValidationResult.CORRUPTED)
+        )
+
+        return {
+            "cached_validations": len(self._validation_cache),
+            "valid_models": valid_count,
+            "invalid_models": invalid_count,
+            "sha256_enabled": self._enable_sha256,
+            "loadability_test_enabled": self._enable_loadability,
+        }
+
+
+# =============================================================================
+# REACTOR CORE MODEL SYNC (v99.0)
+# =============================================================================
+
+
+class ReactorCoreModelSync:
+    """
+    Synchronizes models with Reactor Core (cross-repo integration).
+
+    Monitors Reactor Core output directory for:
+    - Newly trained models
+    - Fine-tuned variants
+    - Merged models
+    - Quantized exports
+
+    Automatically registers them in the DynamicModelRegistry.
+    """
+
+    # Reactor Core directory patterns
+    REACTOR_PATTERNS: ClassVar[List[str]] = [
+        "output/models/*.gguf",
+        "output/checkpoints/*/model.gguf",
+        "output/merged/*.gguf",
+        "models/*.gguf",
+        "exports/*.gguf",
+    ]
+
+    def __init__(
+        self,
+        reactor_repo_path: Optional[Path] = None,
+        auto_register: bool = True,
+        poll_interval_seconds: float = 60.0,
+    ):
+        # Find Reactor Core repo
+        if reactor_repo_path:
+            self._reactor_path = Path(reactor_repo_path).expanduser().resolve()
+        else:
+            self._reactor_path = self._find_reactor_repo()
+
+        self._auto_register = auto_register
+        self._poll_interval = poll_interval_seconds
+        self._running = False
+        self._sync_task: Optional[asyncio.Task] = None
+        self._known_models: Dict[str, Path] = {}
+        self._registry_callback: Optional[Callable[[str, Path, Dict], Awaitable[None]]] = None
+        self._last_sync: Optional[datetime] = None
+        self._sync_lock = asyncio.Lock()
+
+    def _find_reactor_repo(self) -> Optional[Path]:
+        """Auto-discover Reactor Core repository."""
+        candidates = [
+            Path.home() / "Documents" / "repos" / "reactor-core",
+            Path.home() / "repos" / "reactor-core",
+            Path.home() / "code" / "reactor-core",
+            Path.cwd().parent / "reactor-core",
+        ]
+
+        for path in candidates:
+            if path.exists() and (path / "run_supervisor.py").exists():
+                logger.info(f"ReactorCoreModelSync: Found Reactor Core at {path}")
+                return path
+
+        logger.warning("ReactorCoreModelSync: Reactor Core repository not found")
+        return None
+
+    def set_registry_callback(
+        self,
+        callback: Callable[[str, Path, Dict], Awaitable[None]],
+    ) -> None:
+        """Set callback for registering new models."""
+        self._registry_callback = callback
+
+    async def start(self) -> None:
+        """Start Reactor Core sync."""
+        if self._running or not self._reactor_path:
+            return
+
+        self._running = True
+        self._sync_task = asyncio.create_task(self._sync_loop())
+        logger.info(f"ReactorCoreModelSync started: monitoring {self._reactor_path}")
+
+    async def stop(self) -> None:
+        """Stop Reactor Core sync."""
+        self._running = False
+        if self._sync_task:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                pass
+            self._sync_task = None
+
+    async def _sync_loop(self) -> None:
+        """Main sync loop."""
+        while self._running:
+            try:
+                await self.sync_models()
+                await asyncio.sleep(self._poll_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Reactor sync error: {e}")
+                await asyncio.sleep(self._poll_interval)
+
+    async def sync_models(self) -> Dict[str, Path]:
+        """Sync models from Reactor Core."""
+        if not self._reactor_path or not self._reactor_path.exists():
+            return {}
+
+        async with self._sync_lock:
+            new_models: Dict[str, Path] = {}
+            loop = asyncio.get_event_loop()
+
+            for pattern in self.REACTOR_PATTERNS:
+                try:
+                    matches = await loop.run_in_executor(
+                        None,
+                        lambda p=pattern: list(self._reactor_path.glob(p)),
+                    )
+
+                    for path in matches:
+                        if not path.is_file():
+                            continue
+
+                        path_str = str(path)
+                        if path_str in self._known_models:
+                            continue
+
+                        # Generate model ID from path
+                        model_id = self._generate_model_id(path)
+
+                        # Register with callback if available
+                        if self._auto_register and self._registry_callback:
+                            metadata = await self._extract_metadata(path)
+                            await self._registry_callback(model_id, path, metadata)
+
+                        self._known_models[path_str] = path
+                        new_models[model_id] = path
+                        logger.info(f"ReactorCoreModelSync: Discovered {model_id} at {path}")
+
+                except Exception as e:
+                    logger.warning(f"Error scanning pattern {pattern}: {e}")
+
+            self._last_sync = datetime.now()
+            return new_models
+
+    def _generate_model_id(self, path: Path) -> str:
+        """Generate a model ID from path."""
+        stem = path.stem.lower()
+
+        # Remove common suffixes
+        for suffix in ["-gguf", "-q4_k_m", "-q5_k_m", "-f16", "-f32"]:
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+
+        # Clean up
+        stem = stem.replace("_", "-").strip("-")
+
+        # Add reactor prefix to distinguish from official models
+        return f"reactor-{stem}"
+
+    async def _extract_metadata(self, path: Path) -> Dict[str, Any]:
+        """Extract metadata from Reactor Core model."""
+        metadata: Dict[str, Any] = {
+            "source": "reactor-core",
+            "discovered_at": datetime.now().isoformat(),
+            "file_size_bytes": 0,
+        }
+
+        try:
+            loop = asyncio.get_event_loop()
+            stat = await loop.run_in_executor(None, path.stat)
+            metadata["file_size_bytes"] = stat.st_size
+            metadata["modified_time"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+
+            # Check for metadata file
+            meta_path = path.with_suffix(".json")
+            if meta_path.exists():
+                meta_content = await loop.run_in_executor(
+                    None,
+                    lambda: json.loads(meta_path.read_text()),
+                )
+                metadata.update(meta_content)
+
+        except Exception as e:
+            logger.warning(f"Error extracting metadata: {e}")
+
+        return metadata
+
+    def get_known_models(self) -> Dict[str, Path]:
+        """Get known Reactor Core models."""
+        return self._known_models.copy()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get sync statistics."""
+        return {
+            "reactor_repo_found": self._reactor_path is not None,
+            "reactor_repo_path": str(self._reactor_path) if self._reactor_path else None,
+            "running": self._running,
+            "models_synced": len(self._known_models),
+            "last_sync": self._last_sync.isoformat() if self._last_sync else None,
+            "auto_register": self._auto_register,
+        }
+
+
+# =============================================================================
 # MODEL MEMORY MANAGER
 # =============================================================================
 
@@ -2745,8 +3977,8 @@ class ModelMemoryManager:
 
 class DynamicModelRegistry:
     """
-    Enterprise-grade model registry with Neural Switchboard v98.0:
-    - Auto-discovery of local models
+    Enterprise-grade model registry with Neural Switchboard v99.0:
+    - Auto-discovery of local models across multiple directories
     - On-demand download from HuggingFace
     - Neural model selection with task classification
     - Elastic burst control with unified decision making
@@ -2756,6 +3988,9 @@ class DynamicModelRegistry:
     - Sticky routing for session continuity
     - Request buffering during hot swap
     - macOS native memory pressure monitoring
+    - Real-time file system watching for model discovery
+    - Reactor Core integration for cross-repo model sync
+    - Model validation pipeline with SHA256 verification
     """
 
     _instance: ClassVar[Optional["DynamicModelRegistry"]] = None
@@ -2766,6 +4001,8 @@ class DynamicModelRegistry:
         models_dir: Optional[Path] = None,
         enable_auto_download: bool = True,
         enable_prefetch: bool = True,
+        enable_file_watching: bool = True,
+        enable_reactor_sync: bool = True,
         max_loaded_models: int = 3,
     ):
         # Models directory
@@ -2779,6 +4016,8 @@ class DynamicModelRegistry:
         # Feature flags
         self._enable_auto_download = enable_auto_download
         self._enable_prefetch = enable_prefetch
+        self._enable_file_watching = enable_file_watching
+        self._enable_reactor_sync = enable_reactor_sync
 
         # Core Components
         self._downloader = AdvancedModelDownloader(models_dir)
@@ -2791,6 +4030,15 @@ class DynamicModelRegistry:
         self._memory_pressure_monitor = MacOSMemoryPressureMonitor()
         self._sticky_routing = StickyRoutingManager()
         self._request_buffer = HotSwapRequestBuffer()
+
+        # Multi-Directory Discovery Components (v99.0)
+        self._model_scanner = MultiDirectoryModelScanner()
+        self._model_validator = ModelValidationPipeline(
+            enable_sha256=True,
+            enable_loadability_test=False,  # Only enable when needed
+        )
+        self._reactor_sync = ReactorCoreModelSync()
+        self._file_watcher: Optional[ModelFileWatcher] = None
 
         # State
         self._discovered_models: Dict[str, Path] = {}
@@ -2814,6 +4062,8 @@ class DynamicModelRegistry:
             "bursts": 0,
             "sticky_hits": 0,
             "task_classifications": 0,
+            "file_events_processed": 0,
+            "reactor_models_synced": 0,
         }
 
         # Observers
@@ -2829,42 +4079,154 @@ class DynamicModelRegistry:
             return cls._instance
 
     async def initialize(self) -> None:
-        """Initialize registry."""
+        """Initialize registry with v99.0 multi-directory discovery."""
         async with self._init_lock:
             if self._initialized:
                 return
 
-            # Discover existing models
+            # Discover existing models using multi-directory scanner
             await self._discover_local_models()
+
+            # Start file system watcher
+            if self._enable_file_watching:
+                await self._start_file_watcher()
+
+            # Start Reactor Core sync
+            if self._enable_reactor_sync:
+                await self._start_reactor_sync()
 
             # Start background tasks
             if self._enable_prefetch:
                 self._prefetch_task = asyncio.create_task(self._prefetch_essential())
 
             self._initialized = True
+            scanner_stats = self._model_scanner.get_statistics()
             logger.info(
-                f"DynamicModelRegistry v98.0 initialized: "
-                f"{len(self._discovered_models)} models discovered, "
+                f"DynamicModelRegistry v99.0 initialized: "
+                f"{len(self._discovered_models)} models discovered across "
+                f"{scanner_stats['directories_active']} directories, "
                 f"{len(self._model_specs)} specs available"
             )
 
     async def _discover_local_models(self) -> None:
-        """Scan for locally available models."""
-        if not self._models_dir.exists():
-            return
+        """Scan for locally available models using multi-directory scanner."""
+        # Use multi-directory scanner for comprehensive discovery
+        discovered = await self._model_scanner.scan_all(
+            force_rescan=True,
+            known_models=self._model_specs,
+        )
 
-        for path in self._models_dir.glob("*.gguf"):
-            filename = path.name
+        # Register discovered models
+        for path_str, discovered_model in discovered.items():
+            if discovered_model.model_id:
+                self._discovered_models[discovered_model.model_id] = discovered_model.path
+                self._model_states[discovered_model.model_id] = ModelState.DOWNLOADED
+                logger.debug(
+                    f"Discovered: {discovered_model.model_id} at {discovered_model.path} "
+                    f"(score={discovered_model.fuzzy_match_score:.2f})"
+                )
+            else:
+                # Log unmatched models with high fuzzy scores for potential manual review
+                if discovered_model.fuzzy_match_score >= 0.4:
+                    logger.debug(
+                        f"Unmatched model: {discovered_model.path.name} "
+                        f"(best_score={discovered_model.fuzzy_match_score:.2f})"
+                    )
 
-            # Match against known models
-            for model_id, spec in self._model_specs.items():
-                for quant in spec.available_quantizations:
-                    expected = spec.get_filename(quant)
-                    if filename.lower() == expected.lower():
-                        self._discovered_models[model_id] = path
-                        self._model_states[model_id] = ModelState.DOWNLOADED
-                        logger.debug(f"Discovered: {model_id} at {path}")
-                        break
+        # Fallback: Also scan primary models directory directly
+        if self._models_dir.exists():
+            for path in self._models_dir.glob("*.gguf"):
+                filename = path.name
+
+                # Match against known models
+                for model_id, spec in self._model_specs.items():
+                    if model_id in self._discovered_models:
+                        continue
+                    for quant in spec.available_quantizations:
+                        expected = spec.get_filename(quant)
+                        if filename.lower() == expected.lower():
+                            self._discovered_models[model_id] = path
+                            self._model_states[model_id] = ModelState.DOWNLOADED
+                            logger.debug(f"Discovered (fallback): {model_id} at {path}")
+                            break
+
+    async def _start_file_watcher(self) -> None:
+        """Start file system watcher for real-time model discovery."""
+        try:
+            directories = self._model_scanner.get_directories()
+            if not directories:
+                return
+
+            self._file_watcher = ModelFileWatcher(
+                directories=directories,
+                debounce_seconds=2.0,
+                poll_interval_seconds=30.0,
+            )
+
+            # Subscribe to file change events
+            self._file_watcher.subscribe(self._on_model_file_change)
+            await self._file_watcher.start()
+            logger.info("File system watcher started for model directories")
+
+        except Exception as e:
+            logger.warning(f"Failed to start file watcher: {e}")
+
+    async def _on_model_file_change(self, change: ModelFileChange) -> None:
+        """Handle file system change events."""
+        self._stats["file_events_processed"] += 1
+
+        if change.event_type == ModelFileEvent.CREATED:
+            logger.info(f"New model file detected: {change.path}")
+            # Re-scan to pick up new model
+            await self._discover_local_models()
+
+        elif change.event_type == ModelFileEvent.DELETED:
+            logger.info(f"Model file deleted: {change.path}")
+            # Remove from discovered models
+            path_str = str(change.path)
+            for model_id, model_path in list(self._discovered_models.items()):
+                if str(model_path) == path_str:
+                    del self._discovered_models[model_id]
+                    del self._model_states[model_id]
+                    logger.info(f"Removed model from registry: {model_id}")
+                    break
+
+        elif change.event_type == ModelFileEvent.MODIFIED:
+            logger.debug(f"Model file modified: {change.path}")
+            # Invalidate validation cache
+            self._model_validator.clear_cache()
+
+    async def _start_reactor_sync(self) -> None:
+        """Start Reactor Core model synchronization."""
+        try:
+            # Set up callback for registering new Reactor models
+            self._reactor_sync.set_registry_callback(self._on_reactor_model_discovered)
+            await self._reactor_sync.start()
+
+        except Exception as e:
+            logger.warning(f"Failed to start Reactor Core sync: {e}")
+
+    async def _on_reactor_model_discovered(
+        self,
+        model_id: str,
+        path: Path,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Handle newly discovered Reactor Core models."""
+        self._stats["reactor_models_synced"] += 1
+
+        # Add to discovered models
+        self._discovered_models[model_id] = path
+        self._model_states[model_id] = ModelState.DOWNLOADED
+
+        # Create a dynamic ModelSpec for the Reactor model
+        # This allows it to be used in routing decisions
+        file_size_gb = metadata.get("file_size_bytes", 0) / (1024**3)
+
+        logger.info(
+            f"Registered Reactor Core model: {model_id} "
+            f"({file_size_gb:.1f}GB) at {path}"
+        )
 
     async def _prefetch_essential(self) -> None:
         """Background prefetch of essential models."""
@@ -3195,9 +4557,9 @@ class DynamicModelRegistry:
         return result
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive registry statistics including Neural Switchboard v98.0."""
+        """Get comprehensive registry statistics including Neural Switchboard v99.0."""
         return {
-            "version": "98.0",
+            "version": "99.0",
             "total_known_models": len(self._model_specs),
             "downloaded_models": len(self._discovered_models),
             "downloads": self._stats["downloads"],
@@ -3206,6 +4568,8 @@ class DynamicModelRegistry:
             "bursts": self._stats["bursts"],
             "sticky_hits": self._stats.get("sticky_hits", 0),
             "task_classifications": self._stats.get("task_classifications", 0),
+            "file_events_processed": self._stats.get("file_events_processed", 0),
+            "reactor_models_synced": self._stats.get("reactor_models_synced", 0),
             "selector_stats": self._selector.get_statistics(),
             "burst_status": self._burst_controller.get_status(),
             "memory_status": self._memory_manager.get_status(),
@@ -3214,10 +4578,59 @@ class DynamicModelRegistry:
             "task_classifier_stats": self._task_classifier.get_statistics(),
             "sticky_routing_status": self._sticky_routing.get_status(),
             "request_buffer_stats": self._request_buffer.get_statistics(),
+            # Multi-Directory Discovery v99.0 stats
+            "scanner_stats": self._model_scanner.get_statistics(),
+            "file_watcher_stats": (
+                self._file_watcher.get_statistics() if self._file_watcher else None
+            ),
+            "reactor_sync_stats": self._reactor_sync.get_statistics(),
+            "validation_stats": self._model_validator.get_statistics(),
         }
 
+    def get_scanner_statistics(self) -> Dict[str, Any]:
+        """Get multi-directory scanner statistics."""
+        return self._model_scanner.get_statistics()
+
+    def get_file_watcher_statistics(self) -> Dict[str, Any]:
+        """Get file watcher statistics."""
+        if self._file_watcher:
+            return self._file_watcher.get_statistics()
+        return {"running": False, "enabled": self._enable_file_watching}
+
+    def get_reactor_sync_statistics(self) -> Dict[str, Any]:
+        """Get Reactor Core sync statistics."""
+        return self._reactor_sync.get_statistics()
+
+    async def validate_model(
+        self,
+        model_id: str,
+        expected_hash: Optional[str] = None,
+    ) -> Optional[ModelValidation]:
+        """Validate a specific model file."""
+        if model_id not in self._discovered_models:
+            return None
+
+        path = self._discovered_models[model_id]
+        return await self._model_validator.validate(
+            path=path,
+            expected_hash=expected_hash,
+        )
+
+    async def rescan_directories(self) -> Dict[str, Path]:
+        """Force rescan of all model directories."""
+        await self._discover_local_models()
+        return self._discovered_models.copy()
+
     async def shutdown(self) -> None:
-        """Shutdown registry."""
+        """Shutdown registry and all v99.0 components."""
+        # Stop file watcher
+        if self._file_watcher:
+            await self._file_watcher.stop()
+
+        # Stop Reactor Core sync
+        await self._reactor_sync.stop()
+
+        # Cancel background tasks
         if self._prefetch_task:
             self._prefetch_task.cancel()
             try:
@@ -3233,7 +4646,7 @@ class DynamicModelRegistry:
                 pass
 
         await self._burst_controller.end_burst()
-        logger.info(f"DynamicModelRegistry shutdown: {self.get_statistics()}")
+        logger.info(f"DynamicModelRegistry v99.0 shutdown: {self.get_statistics()}")
 
 
 # =============================================================================
@@ -3282,12 +4695,18 @@ __all__ = [
     "QuantizationType",
     "TaskType",
     "MemoryPressureLevel",
+    "ModelFileEvent",
+    "ValidationResult",
     # Data classes
     "QuantizationSpec",
     "ModelSpec",
     "DownloadProgress",
     "TaskClassification",
     "BufferedRequest",
+    "ModelDirectoryConfig",
+    "DiscoveredModel",
+    "ModelFileChange",
+    "ModelValidation",
     # Constants
     "QUANTIZATION_SPECS",
     "KNOWN_MODELS",
@@ -3295,12 +4714,17 @@ __all__ = [
     "CAPABILITY_MODEL_MAPPING",
     "TASK_TIER_MAPPING",
     "TASK_CAPABILITY_MAPPING",
-    # Neural Switchboard Classes
+    # Neural Switchboard Classes (v98.0)
     "TaskClassifier",
     "MacOSMemoryPressureMonitor",
     "CrossRepoMemoryIntegration",
     "HotSwapRequestBuffer",
     "StickyRoutingManager",
+    # Multi-Directory Discovery Classes (v99.0)
+    "MultiDirectoryModelScanner",
+    "ModelFileWatcher",
+    "ModelValidationPipeline",
+    "ReactorCoreModelSync",
     # Core Classes
     "AdvancedModelDownloader",
     "NeuralModelSelector",

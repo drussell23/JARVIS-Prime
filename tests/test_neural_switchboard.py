@@ -351,9 +351,9 @@ async def test_neural_switchboard_routing(results: TestResults) -> None:
         else:
             results.record_fail("NeuralSwitchboard.sticky_status", "missing fields")
 
-        # Test statistics include v98.0 fields
+        # Test statistics include v99.0 fields
         stats = registry.get_statistics()
-        if stats.get("version") == "98.0":
+        if stats.get("version") == "99.0":
             results.record_pass("NeuralSwitchboard.version")
         else:
             results.record_fail("NeuralSwitchboard.version", f"got {stats.get('version')}")
