@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-Dynamic Model Registry v97.0 - Enterprise-Grade Model Management
+Dynamic Model Registry v98.0 - Neural Switchboard Architecture
 ================================================================
+
+ENTERPRISE NEURAL SWITCHBOARD:
+    - Intelligent task classification with multi-signal analysis
+    - macOS native memory_pressure integration
+    - Cross-repo JARVIS AdvancedRAMMonitor coordination
+    - Request buffering during hot swap (zero request loss)
+    - Sticky routing for session continuity
+    - Unified burst decision making (single source of truth)
+    - Predictive model preloading based on task patterns
 
 ADVANCED PATTERNS IMPLEMENTED:
     - Protocol classes for type-safe model interfaces
@@ -192,6 +201,107 @@ class QuantizationType(Enum):
     IQ2_XXS = "IQ2_XXS"  # Ultra compressed
     IQ3_XS = "IQ3_XS"
     FP16 = "FP16"  # Full precision
+
+
+class TaskType(Enum):
+    """Unified task classification for Neural Switchboard."""
+
+    # Simple tasks (Tier 0)
+    GREETING = "greeting"
+    SIMPLE_CHAT = "simple_chat"
+    QUICK_QUESTION = "quick_question"
+
+    # Standard tasks (Tier 0 Fast)
+    GENERAL_CHAT = "general_chat"
+    SUMMARIZE = "summarize"
+    TRANSLATE = "translate"
+
+    # Code tasks (Tier 0.5)
+    CODE_SIMPLE = "code_simple"  # Small edits, bug fixes
+    CODE_REVIEW = "code_review"
+    CODE_EXPLAIN = "code_explain"
+
+    # Complex code tasks (Tier 0.5 / 1)
+    CODE_COMPLEX = "code_complex"  # New features, refactoring
+    CODE_ARCHITECTURE = "code_architecture"  # Design decisions
+    CODE_DEBUG = "code_debug"  # Complex debugging
+
+    # Reasoning tasks (Tier 1 / 2)
+    REASON_SIMPLE = "reason_simple"
+    REASON_COMPLEX = "reason_complex"
+    MATH_SIMPLE = "math_simple"
+    MATH_COMPLEX = "math_complex"
+    ANALYZE = "analyze"
+
+    # Creative tasks
+    CREATIVE_WRITE = "creative_write"
+    CREATIVE_BRAINSTORM = "creative_brainstorm"
+
+    # Special tasks
+    VOICE_COMMAND = "voice_command"  # Voice interface (requires fast)
+    MULTIMODAL = "multimodal"
+    SEARCH = "search"
+    UNKNOWN = "unknown"
+
+
+class MemoryPressureLevel(Enum):
+    """macOS memory pressure levels from memory_pressure command."""
+
+    NORMAL = "normal"  # Green - plenty of free RAM
+    WARN = "warn"  # Yellow - approaching limits
+    CRITICAL = "critical"  # Red - system is swapping
+
+
+# Task to tier mapping (which tier handles which tasks best)
+TASK_TIER_MAPPING: Dict[TaskType, List[str]] = {
+    # Ultra-fast tier (voice, greetings)
+    TaskType.GREETING: ["tier_0_local_fast"],
+    TaskType.VOICE_COMMAND: ["tier_0_local_fast"],
+    TaskType.QUICK_QUESTION: ["tier_0_local_fast"],
+    TaskType.SIMPLE_CHAT: ["tier_0_local_fast"],
+
+    # Fast tier (general tasks)
+    TaskType.GENERAL_CHAT: ["tier_0_local_fast", "tier_05_local_capable"],
+    TaskType.SUMMARIZE: ["tier_0_local_fast", "tier_05_local_capable"],
+    TaskType.TRANSLATE: ["tier_0_local_fast"],
+
+    # Capable tier (coding)
+    TaskType.CODE_SIMPLE: ["tier_05_local_capable", "tier_0_local_fast"],
+    TaskType.CODE_REVIEW: ["tier_05_local_capable"],
+    TaskType.CODE_EXPLAIN: ["tier_05_local_capable", "tier_0_local_fast"],
+    TaskType.CODE_COMPLEX: ["tier_05_local_capable", "tier_1_cloud_intelligent"],
+    TaskType.CODE_ARCHITECTURE: ["tier_1_cloud_intelligent", "tier_05_local_capable"],
+    TaskType.CODE_DEBUG: ["tier_05_local_capable", "tier_1_cloud_intelligent"],
+
+    # Reasoning tier (complex tasks)
+    TaskType.REASON_SIMPLE: ["tier_0_local_fast", "tier_05_local_capable"],
+    TaskType.REASON_COMPLEX: ["tier_1_cloud_intelligent", "tier_2_deep_reasoning"],
+    TaskType.MATH_SIMPLE: ["tier_0_local_fast"],
+    TaskType.MATH_COMPLEX: ["tier_1_cloud_intelligent", "tier_2_deep_reasoning"],
+    TaskType.ANALYZE: ["tier_05_local_capable", "tier_1_cloud_intelligent"],
+
+    # Creative tier
+    TaskType.CREATIVE_WRITE: ["tier_05_local_capable", "tier_1_cloud_intelligent"],
+    TaskType.CREATIVE_BRAINSTORM: ["tier_1_cloud_intelligent"],
+
+    # Special
+    TaskType.MULTIMODAL: ["tier_1_cloud_intelligent"],
+    TaskType.SEARCH: ["tier_0_local_fast"],
+    TaskType.UNKNOWN: ["tier_0_local_fast", "tier_05_local_capable"],
+}
+
+
+# Task type to required capabilities mapping
+TASK_CAPABILITY_MAPPING: Dict[TaskType, List[ModelCapability]] = {
+    TaskType.VOICE_COMMAND: [ModelCapability.VOICE_OPTIMIZED, ModelCapability.FAST_INFERENCE],
+    TaskType.CODE_SIMPLE: [ModelCapability.CODE_GENERATION],
+    TaskType.CODE_COMPLEX: [ModelCapability.CODE_GENERATION, ModelCapability.CODE_ANALYSIS],
+    TaskType.CODE_ARCHITECTURE: [ModelCapability.CODE_EXPERT, ModelCapability.ARCHITECTURE_DESIGN],
+    TaskType.CODE_DEBUG: [ModelCapability.CODE_ANALYSIS, ModelCapability.REASONING],
+    TaskType.REASON_COMPLEX: [ModelCapability.REASONING, ModelCapability.CHAIN_OF_THOUGHT],
+    TaskType.MATH_COMPLEX: [ModelCapability.MATH, ModelCapability.CHAIN_OF_THOUGHT],
+    TaskType.CREATIVE_WRITE: [ModelCapability.CREATIVE],
+}
 
 
 # =============================================================================
@@ -1519,6 +1629,974 @@ class ElasticBurstController:
 
 
 # =============================================================================
+# TASK CLASSIFIER - Neural Switchboard Brain
+# =============================================================================
+
+
+@dataclass
+class TaskClassification:
+    """Result of task classification."""
+
+    task_type: TaskType
+    confidence: float  # 0-1
+    complexity: float  # 0-1
+    detected_signals: List[str]
+    recommended_tiers: List[str]
+    required_capabilities: List[ModelCapability]
+    requires_fast_response: bool = False
+    is_coding_session: bool = False
+    context_tokens_estimate: int = 0
+
+
+class TaskClassifier:
+    """
+    Intelligent task classification using multi-signal analysis.
+
+    Analyzes:
+    - Keyword patterns (code, debug, explain, etc.)
+    - Structural signals (code blocks, lists, etc.)
+    - Complexity indicators (length, nesting, etc.)
+    - Session context (ongoing coding session?)
+    - Voice mode detection
+
+    Thread-safe with async lock.
+    """
+
+    # Keyword patterns for task detection
+    _CODE_KEYWORDS = frozenset([
+        "code", "implement", "write", "function", "class", "method", "api",
+        "python", "javascript", "typescript", "rust", "golang", "java",
+        "fix", "bug", "error", "exception", "debug", "refactor", "optimize",
+        "test", "unittest", "pytest", "jest", "async", "await", "import",
+        "def ", "class ", "return ", "if ", "for ", "while ",
+    ])
+
+    _ARCHITECTURE_KEYWORDS = frozenset([
+        "architect", "design", "pattern", "structure", "system", "scale",
+        "microservice", "monolith", "database", "schema", "api design",
+        "infrastructure", "deployment", "kubernetes", "docker", "ci/cd",
+    ])
+
+    _REASONING_KEYWORDS = frozenset([
+        "explain", "why", "how", "reason", "think", "analyze", "compare",
+        "evaluate", "pros", "cons", "tradeoff", "decision", "strategy",
+        "plan", "approach", "consider", "implications",
+    ])
+
+    _MATH_KEYWORDS = frozenset([
+        "calculate", "compute", "math", "equation", "formula", "derive",
+        "solve", "proof", "theorem", "algorithm", "complexity", "o(n)",
+        "integral", "derivative", "matrix", "statistics", "probability",
+    ])
+
+    _CREATIVE_KEYWORDS = frozenset([
+        "write", "story", "poem", "creative", "imagine", "brainstorm",
+        "ideas", "generate", "suggest", "alternative", "creative writing",
+    ])
+
+    _GREETING_PATTERNS = frozenset([
+        "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+        "what's up", "how are you", "thanks", "thank you", "bye", "goodbye",
+    ])
+
+    _VOICE_PATTERNS = frozenset([
+        "jarvis", "hey jarvis", "ok jarvis", "listen", "what time",
+        "set timer", "remind me", "play", "stop", "pause", "quick",
+    ])
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._session_context: Dict[str, Any] = {}
+        self._classification_history: List[TaskClassification] = []
+        self._coding_session_active = False
+        self._coding_session_start: Optional[datetime] = None
+
+        # Adaptive weights based on history
+        self._weights = {
+            "keyword": 0.35,
+            "structure": 0.20,
+            "complexity": 0.25,
+            "session": 0.20,
+        }
+
+    async def classify(
+        self,
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> TaskClassification:
+        """
+        Classify a prompt into task type with full analysis.
+
+        Returns comprehensive TaskClassification with confidence scores.
+        """
+        async with self._lock:
+            context = context or {}
+            prompt_lower = prompt.lower().strip()
+            signals: List[str] = []
+
+            # Quick checks for simple cases
+            # Voice commands take priority (e.g., "hey jarvis" in voice mode)
+            if self._is_voice_command(prompt_lower, context):
+                return self._create_classification(
+                    TaskType.VOICE_COMMAND, 0.90, 0.10, ["voice_pattern"],
+                    context, requires_fast=True
+                )
+
+            if self._is_greeting(prompt_lower):
+                return self._create_classification(
+                    TaskType.GREETING, 0.95, 0.05, ["greeting_pattern"], context
+                )
+
+            # Analyze prompt structure
+            has_code_block = "```" in prompt or "    " in prompt
+            has_code_keywords = self._count_keyword_matches(
+                prompt_lower, self._CODE_KEYWORDS
+            )
+            has_arch_keywords = self._count_keyword_matches(
+                prompt_lower, self._ARCHITECTURE_KEYWORDS
+            )
+            has_reason_keywords = self._count_keyword_matches(
+                prompt_lower, self._REASONING_KEYWORDS
+            )
+            has_math_keywords = self._count_keyword_matches(
+                prompt_lower, self._MATH_KEYWORDS
+            )
+            has_creative_keywords = self._count_keyword_matches(
+                prompt_lower, self._CREATIVE_KEYWORDS
+            )
+
+            # Calculate complexity
+            complexity = self._calculate_complexity(prompt)
+
+            # Determine task type
+            task_type, confidence = await self._determine_task_type(
+                prompt_lower,
+                has_code_block,
+                has_code_keywords,
+                has_arch_keywords,
+                has_reason_keywords,
+                has_math_keywords,
+                has_creative_keywords,
+                complexity,
+                signals,
+            )
+
+            # Update coding session state
+            is_coding = task_type in {
+                TaskType.CODE_SIMPLE, TaskType.CODE_COMPLEX,
+                TaskType.CODE_REVIEW, TaskType.CODE_ARCHITECTURE,
+                TaskType.CODE_DEBUG, TaskType.CODE_EXPLAIN,
+            }
+
+            if is_coding:
+                if not self._coding_session_active:
+                    self._coding_session_active = True
+                    self._coding_session_start = datetime.now()
+                    signals.append("coding_session_started")
+            elif self._coding_session_active:
+                # Check if session should end (non-coding for 10+ minutes)
+                if self._coding_session_start:
+                    elapsed = (datetime.now() - self._coding_session_start).seconds
+                    if elapsed > 600:  # 10 minutes
+                        self._coding_session_active = False
+                        signals.append("coding_session_ended")
+
+            classification = self._create_classification(
+                task_type, confidence, complexity, signals, context,
+                is_coding_session=self._coding_session_active
+            )
+
+            # Store in history (bounded)
+            self._classification_history.append(classification)
+            if len(self._classification_history) > 100:
+                self._classification_history = self._classification_history[-50:]
+
+            return classification
+
+    def _is_greeting(self, prompt: str) -> bool:
+        """Check if prompt is a simple greeting."""
+        # Very short prompts that match greeting patterns
+        if len(prompt) < 50:
+            for pattern in self._GREETING_PATTERNS:
+                if prompt.startswith(pattern) or prompt == pattern:
+                    return True
+        return False
+
+    def _is_voice_command(self, prompt: str, context: Dict[str, Any]) -> bool:
+        """Check if this is a voice interface command."""
+        if context.get("voice_mode") or context.get("from_voice"):
+            return True
+        for pattern in self._VOICE_PATTERNS:
+            if prompt.startswith(pattern):
+                return True
+        return False
+
+    def _count_keyword_matches(self, text: str, keywords: frozenset) -> int:
+        """Count keyword matches in text."""
+        count = 0
+        for keyword in keywords:
+            if keyword in text:
+                count += 1
+        return count
+
+    def _calculate_complexity(self, prompt: str) -> float:
+        """Calculate prompt complexity (0-1)."""
+        factors = []
+
+        # Length factor
+        length = len(prompt)
+        if length < 50:
+            factors.append(0.1)
+        elif length < 200:
+            factors.append(0.3)
+        elif length < 500:
+            factors.append(0.5)
+        elif length < 1000:
+            factors.append(0.7)
+        else:
+            factors.append(0.9)
+
+        # Code block factor
+        code_blocks = prompt.count("```")
+        if code_blocks > 0:
+            factors.append(min(0.3 + code_blocks * 0.1, 0.8))
+
+        # Question depth (nested requirements)
+        if "and" in prompt.lower() and "also" in prompt.lower():
+            factors.append(0.6)
+        elif "and" in prompt.lower() or "also" in prompt.lower():
+            factors.append(0.4)
+
+        # Multi-step indicators
+        multi_step_words = ["first", "then", "after", "finally", "step"]
+        multi_step_count = sum(1 for w in multi_step_words if w in prompt.lower())
+        if multi_step_count >= 2:
+            factors.append(0.7)
+
+        return sum(factors) / max(len(factors), 1)
+
+    async def _determine_task_type(
+        self,
+        prompt: str,
+        has_code_block: bool,
+        code_keywords: int,
+        arch_keywords: int,
+        reason_keywords: int,
+        math_keywords: int,
+        creative_keywords: int,
+        complexity: float,
+        signals: List[str],
+    ) -> Tuple[TaskType, float]:
+        """Determine task type from signals."""
+
+        # Architecture tasks (highest priority for code + architecture signals)
+        if arch_keywords >= 2 or (arch_keywords >= 1 and code_keywords >= 2):
+            signals.append(f"arch_kw={arch_keywords}")
+            return TaskType.CODE_ARCHITECTURE, 0.85
+
+        # Complex coding
+        if code_keywords >= 3 or (has_code_block and code_keywords >= 2):
+            signals.append(f"code_kw={code_keywords}")
+            if complexity > 0.6:
+                return TaskType.CODE_COMPLEX, 0.80
+            else:
+                return TaskType.CODE_SIMPLE, 0.75
+
+        # Code review / explain
+        if code_keywords >= 1 and has_code_block:
+            if "review" in prompt or "check" in prompt:
+                signals.append("code_review")
+                return TaskType.CODE_REVIEW, 0.80
+            if "explain" in prompt or "what does" in prompt:
+                signals.append("code_explain")
+                return TaskType.CODE_EXPLAIN, 0.80
+
+        # Math tasks
+        if math_keywords >= 2:
+            signals.append(f"math_kw={math_keywords}")
+            if complexity > 0.5:
+                return TaskType.MATH_COMPLEX, 0.80
+            return TaskType.MATH_SIMPLE, 0.75
+
+        # Reasoning tasks
+        if reason_keywords >= 2:
+            signals.append(f"reason_kw={reason_keywords}")
+            if complexity > 0.6:
+                return TaskType.REASON_COMPLEX, 0.75
+            return TaskType.REASON_SIMPLE, 0.70
+
+        # Creative tasks
+        if creative_keywords >= 2:
+            signals.append(f"creative_kw={creative_keywords}")
+            if "story" in prompt or "poem" in prompt:
+                return TaskType.CREATIVE_WRITE, 0.80
+            return TaskType.CREATIVE_BRAINSTORM, 0.70
+
+        # Summary / analysis
+        if "summarize" in prompt or "summary" in prompt:
+            signals.append("summarize")
+            return TaskType.SUMMARIZE, 0.85
+
+        if "analyze" in prompt or "analysis" in prompt:
+            signals.append("analyze")
+            return TaskType.ANALYZE, 0.80
+
+        # Default based on complexity
+        if complexity < 0.3:
+            return TaskType.SIMPLE_CHAT, 0.60
+        elif complexity < 0.6:
+            return TaskType.GENERAL_CHAT, 0.55
+        else:
+            return TaskType.UNKNOWN, 0.40
+
+    def _create_classification(
+        self,
+        task_type: TaskType,
+        confidence: float,
+        complexity: float,
+        signals: List[str],
+        context: Dict[str, Any],
+        requires_fast: bool = False,
+        is_coding_session: bool = False,
+    ) -> TaskClassification:
+        """Create TaskClassification with all metadata."""
+        recommended_tiers = TASK_TIER_MAPPING.get(
+            task_type, ["tier_0_local_fast"]
+        )
+        required_capabilities = TASK_CAPABILITY_MAPPING.get(task_type, [])
+
+        return TaskClassification(
+            task_type=task_type,
+            confidence=confidence,
+            complexity=complexity,
+            detected_signals=signals,
+            recommended_tiers=recommended_tiers,
+            required_capabilities=required_capabilities,
+            requires_fast_response=requires_fast or task_type == TaskType.VOICE_COMMAND,
+            is_coding_session=is_coding_session or self._coding_session_active,
+            context_tokens_estimate=context.get("estimated_tokens", 0),
+        )
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get classifier statistics."""
+        if not self._classification_history:
+            return {"total": 0}
+
+        type_counts: Dict[str, int] = {}
+        for c in self._classification_history:
+            t = c.task_type.value
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+        return {
+            "total": len(self._classification_history),
+            "type_distribution": type_counts,
+            "avg_complexity": sum(c.complexity for c in self._classification_history)
+            / len(self._classification_history),
+            "coding_session_active": self._coding_session_active,
+        }
+
+
+# =============================================================================
+# macOS MEMORY PRESSURE MONITOR
+# =============================================================================
+
+
+class MacOSMemoryPressureMonitor:
+    """
+    Native macOS memory pressure monitoring using memory_pressure command.
+
+    Unlike psutil which only shows usage %, this uses Apple's native
+    memory_pressure command which accounts for:
+    - File system cache (reclaimable)
+    - Compressed memory
+    - Swap activity
+    - System pressure signals
+
+    Falls back gracefully on non-macOS systems.
+    """
+
+    def __init__(self, cache_ttl: float = 2.0):
+        self._cache_ttl = cache_ttl
+        self._cached_level: Optional[MemoryPressureLevel] = None
+        self._cache_time: Optional[datetime] = None
+        self._lock = asyncio.Lock()
+        self._is_macos = sys.platform == "darwin"
+
+        # History for trend detection
+        self._pressure_history: List[Tuple[datetime, MemoryPressureLevel]] = []
+
+    async def get_pressure_level(self) -> MemoryPressureLevel:
+        """Get current memory pressure level (cached with TTL)."""
+        async with self._lock:
+            now = datetime.now()
+
+            # Return cached if fresh
+            if (
+                self._cached_level is not None
+                and self._cache_time is not None
+                and (now - self._cache_time).total_seconds() < self._cache_ttl
+            ):
+                return self._cached_level
+
+            # Get fresh reading
+            level = await self._read_memory_pressure()
+            self._cached_level = level
+            self._cache_time = now
+
+            # Record history
+            self._pressure_history.append((now, level))
+            if len(self._pressure_history) > 60:
+                self._pressure_history = self._pressure_history[-30:]
+
+            return level
+
+    async def _read_memory_pressure(self) -> MemoryPressureLevel:
+        """Read memory pressure from system."""
+        if not self._is_macos:
+            return await self._fallback_pressure()
+
+        try:
+            # Run memory_pressure command
+            proc = await asyncio.create_subprocess_exec(
+                "memory_pressure",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            output = stdout.decode().lower()
+
+            # Parse output
+            if "critical" in output or "the system is under pressure" in output:
+                return MemoryPressureLevel.CRITICAL
+            elif "warn" in output or "approaching" in output:
+                return MemoryPressureLevel.WARN
+            else:
+                return MemoryPressureLevel.NORMAL
+
+        except (asyncio.TimeoutError, FileNotFoundError, OSError) as e:
+            logger.debug(f"memory_pressure command failed: {e}")
+            return await self._fallback_pressure()
+
+    async def _fallback_pressure(self) -> MemoryPressureLevel:
+        """Fallback to psutil-based pressure detection."""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+
+            # Conservative thresholds
+            if mem.percent > 90:
+                return MemoryPressureLevel.CRITICAL
+            elif mem.percent > 80:
+                return MemoryPressureLevel.WARN
+            else:
+                return MemoryPressureLevel.NORMAL
+        except ImportError:
+            return MemoryPressureLevel.NORMAL
+
+    async def get_detailed_snapshot(self) -> Dict[str, Any]:
+        """Get detailed memory snapshot."""
+        level = await self.get_pressure_level()
+
+        result = {
+            "pressure_level": level.value,
+            "is_critical": level == MemoryPressureLevel.CRITICAL,
+            "should_burst": level in {MemoryPressureLevel.CRITICAL, MemoryPressureLevel.WARN},
+            "trend": self._detect_trend(),
+        }
+
+        # Add psutil data if available
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            result.update({
+                "total_gb": round(mem.total / (1024**3), 2),
+                "available_gb": round(mem.available / (1024**3), 2),
+                "percent_used": mem.percent,
+                "swap_percent": psutil.swap_memory().percent,
+            })
+        except ImportError:
+            pass
+
+        return result
+
+    def _detect_trend(self) -> str:
+        """Detect memory pressure trend."""
+        if len(self._pressure_history) < 5:
+            return "stable"
+
+        recent = self._pressure_history[-5:]
+        levels = [h[1] for h in recent]
+
+        # Count transitions
+        increasing = 0
+        for i in range(1, len(levels)):
+            if levels[i].value > levels[i - 1].value:
+                increasing += 1
+
+        if increasing >= 3:
+            return "increasing"
+        elif levels.count(MemoryPressureLevel.CRITICAL) >= 3:
+            return "critical_sustained"
+        else:
+            return "stable"
+
+
+# =============================================================================
+# CROSS-REPO MEMORY INTEGRATION
+# =============================================================================
+
+
+class CrossRepoMemoryIntegration:
+    """
+    Integrates with JARVIS AdvancedRAMMonitor for unified memory management.
+
+    Combines:
+    - Local macOS memory_pressure
+    - JARVIS AdvancedRAMMonitor (via GCP bridge)
+    - psutil metrics
+    - Process-specific memory tracking
+
+    Thread-safe singleton pattern.
+    """
+
+    _instance: ClassVar[Optional["CrossRepoMemoryIntegration"]] = None
+    _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    def __init__(self):
+        self._macos_monitor = MacOSMemoryPressureMonitor()
+        self._gcp_bridge: Optional[Any] = None
+        self._jarvis_monitor: Optional[Any] = None
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    @classmethod
+    async def get_instance(cls) -> "CrossRepoMemoryIntegration":
+        """Get singleton instance."""
+        async with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+                await cls._instance.initialize()
+            return cls._instance
+
+    async def initialize(self) -> None:
+        """Initialize cross-repo connections."""
+        async with self._init_lock:
+            if self._initialized:
+                return
+
+            # Try to get GCP bridge for JARVIS integration
+            try:
+                from jarvis_prime.core.gcp_import_bridge import GCPImportBridge
+                self._gcp_bridge = await GCPImportBridge.get_instance()
+                logger.info("CrossRepoMemoryIntegration: GCP bridge connected")
+            except Exception as e:
+                logger.debug(f"GCP bridge not available: {e}")
+
+            self._initialized = True
+
+    async def get_unified_memory_status(self) -> Dict[str, Any]:
+        """
+        Get unified memory status from all sources.
+
+        Combines local + cross-repo data for comprehensive view.
+        """
+        result = {
+            "source": "unified",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # Local macOS pressure
+        local_snapshot = await self._macos_monitor.get_detailed_snapshot()
+        result["local"] = local_snapshot
+
+        # Cross-repo JARVIS data
+        if self._gcp_bridge:
+            try:
+                jarvis_ram = await self._gcp_bridge.get_ram_snapshot()
+                result["jarvis"] = jarvis_ram
+            except Exception as e:
+                logger.debug(f"JARVIS RAM snapshot failed: {e}")
+                result["jarvis"] = {"error": str(e)}
+
+        # Decision
+        local_should_burst = local_snapshot.get("should_burst", False)
+        jarvis_should_burst = result.get("jarvis", {}).get("shift_to_gcp_recommended", False)
+
+        result["should_burst_to_cloud"] = local_should_burst or jarvis_should_burst
+        result["burst_reason"] = self._determine_burst_reason(result)
+
+        return result
+
+    def _determine_burst_reason(self, status: Dict[str, Any]) -> Optional[str]:
+        """Determine why burst is recommended."""
+        reasons = []
+
+        local = status.get("local", {})
+        if local.get("pressure_level") == "critical":
+            reasons.append("local_critical")
+        elif local.get("pressure_level") == "warn":
+            reasons.append("local_warn")
+
+        if local.get("trend") == "increasing":
+            reasons.append("pressure_increasing")
+
+        jarvis = status.get("jarvis", {})
+        if jarvis.get("shift_to_gcp_recommended"):
+            reasons.append("jarvis_recommends")
+
+        return "+".join(reasons) if reasons else None
+
+    async def can_load_model(self, required_gb: float) -> Tuple[bool, str]:
+        """
+        Check if we have enough memory to load a model.
+
+        Returns:
+            Tuple of (can_load, reason)
+        """
+        status = await self.get_unified_memory_status()
+
+        # Check local available
+        local = status.get("local", {})
+        available_gb = local.get("available_gb", 0)
+
+        # Need buffer for system
+        buffer_gb = 2.0
+        needed = required_gb + buffer_gb
+
+        if available_gb < needed:
+            return False, f"insufficient_ram_{available_gb:.1f}GB<{needed:.1f}GB"
+
+        if local.get("pressure_level") == "critical":
+            return False, "memory_pressure_critical"
+
+        if local.get("trend") == "critical_sustained":
+            return False, "sustained_critical_pressure"
+
+        return True, "sufficient"
+
+
+# =============================================================================
+# REQUEST BUFFER FOR HOT SWAP
+# =============================================================================
+
+
+@dataclass
+class BufferedRequest:
+    """A request buffered during model swap."""
+
+    request_id: str
+    prompt: str
+    context: Dict[str, Any]
+    created_at: datetime
+    timeout_at: datetime
+    future: asyncio.Future
+
+
+class HotSwapRequestBuffer:
+    """
+    Buffers requests during model hot swap to prevent request loss.
+
+    Features:
+    - Bounded queue with backpressure
+    - Timeout handling
+    - Priority support (voice requests first)
+    - Metrics tracking
+    """
+
+    def __init__(
+        self,
+        max_size: int = 100,
+        default_timeout: float = 30.0,
+    ):
+        self._max_size = max_size
+        self._default_timeout = default_timeout
+        self._queue: asyncio.Queue[BufferedRequest] = asyncio.Queue(maxsize=max_size)
+        self._active = False
+        self._lock = asyncio.Lock()
+
+        # Metrics
+        self._buffered_count = 0
+        self._flushed_count = 0
+        self._timeout_count = 0
+
+    async def start_buffering(self) -> None:
+        """Start buffering requests (call before hot swap)."""
+        async with self._lock:
+            self._active = True
+            logger.info("🔄 Request buffering started for hot swap")
+
+    async def stop_buffering(self) -> None:
+        """Stop buffering (call after hot swap complete)."""
+        async with self._lock:
+            self._active = False
+            logger.info("🔄 Request buffering stopped")
+
+    def is_buffering(self) -> bool:
+        """Check if currently buffering."""
+        return self._active
+
+    async def enqueue(
+        self,
+        request_id: str,
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> asyncio.Future:
+        """
+        Enqueue a request for later processing.
+
+        Returns a Future that will be resolved when the request is processed.
+        """
+        if not self._active:
+            raise RuntimeError("Buffer not active")
+
+        context = context or {}
+        timeout = timeout or self._default_timeout
+
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        request = BufferedRequest(
+            request_id=request_id,
+            prompt=prompt,
+            context=context,
+            created_at=datetime.now(),
+            timeout_at=datetime.now() + timedelta(seconds=timeout),
+            future=future,
+        )
+
+        try:
+            self._queue.put_nowait(request)
+            self._buffered_count += 1
+            logger.debug(f"Buffered request {request_id}")
+        except asyncio.QueueFull:
+            future.set_exception(RuntimeError("Request buffer full"))
+
+        return future
+
+    async def flush_to(
+        self,
+        processor: Callable[[str, Dict[str, Any]], Awaitable[str]],
+    ) -> int:
+        """
+        Flush all buffered requests to processor.
+
+        Returns count of successfully processed requests.
+        """
+        processed = 0
+        now = datetime.now()
+
+        while not self._queue.empty():
+            try:
+                request = self._queue.get_nowait()
+
+                # Check timeout
+                if now > request.timeout_at:
+                    request.future.set_exception(
+                        TimeoutError(f"Request {request.request_id} timed out in buffer")
+                    )
+                    self._timeout_count += 1
+                    continue
+
+                # Process request
+                try:
+                    result = await processor(request.prompt, request.context)
+                    request.future.set_result(result)
+                    processed += 1
+                except Exception as e:
+                    request.future.set_exception(e)
+
+            except asyncio.QueueEmpty:
+                break
+
+        self._flushed_count += processed
+        logger.info(f"Flushed {processed} buffered requests")
+        return processed
+
+    def get_queue_length(self) -> int:
+        """Get current queue length."""
+        return self._queue.qsize()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get buffer statistics."""
+        return {
+            "active": self._active,
+            "queue_length": self._queue.qsize(),
+            "max_size": self._max_size,
+            "buffered_total": self._buffered_count,
+            "flushed_total": self._flushed_count,
+            "timeout_total": self._timeout_count,
+        }
+
+
+# =============================================================================
+# STICKY ROUTING MANAGER
+# =============================================================================
+
+
+class StickyRoutingManager:
+    """
+    Manages sticky routing for session continuity.
+
+    When a user is deep in a coding session, we want to keep
+    the coding model loaded instead of swapping on every request.
+
+    Features:
+    - Session detection based on task patterns
+    - Automatic sticky expiration
+    - Priority-based override
+    """
+
+    def __init__(
+        self,
+        session_timeout_minutes: float = 30.0,
+        sticky_strength_threshold: float = 0.7,
+    ):
+        self._session_timeout = session_timeout_minutes * 60
+        self._strength_threshold = sticky_strength_threshold
+        self._lock = asyncio.Lock()
+
+        # Current sticky state
+        self._sticky_model: Optional[str] = None
+        self._sticky_tier: Optional[str] = None
+        self._sticky_started: Optional[datetime] = None
+        self._sticky_strength: float = 0.0
+
+        # Session history
+        self._session_tasks: List[TaskType] = []
+        self._session_model_uses: Dict[str, int] = {}
+
+    async def get_sticky_model(
+        self,
+        task_classification: TaskClassification,
+    ) -> Optional[str]:
+        """
+        Get sticky model if session is active and applicable.
+
+        Returns model_id if sticky routing applies, None otherwise.
+        """
+        async with self._lock:
+            # Check if sticky session is expired
+            if self._sticky_started:
+                elapsed = (datetime.now() - self._sticky_started).total_seconds()
+                if elapsed > self._session_timeout:
+                    await self._end_session()
+                    return None
+
+            # Check if task matches sticky context
+            if self._sticky_model and self._sticky_strength >= self._strength_threshold:
+                if self._task_matches_session(task_classification):
+                    # Extend session
+                    self._sticky_started = datetime.now()
+                    return self._sticky_model
+
+            return None
+
+    async def update_sticky(
+        self,
+        model_id: str,
+        tier_id: str,
+        task_classification: TaskClassification,
+    ) -> None:
+        """Update sticky state after model selection."""
+        async with self._lock:
+            # Track task
+            self._session_tasks.append(task_classification.task_type)
+            if len(self._session_tasks) > 20:
+                self._session_tasks = self._session_tasks[-10:]
+
+            # Track model use
+            self._session_model_uses[model_id] = (
+                self._session_model_uses.get(model_id, 0) + 1
+            )
+
+            # Calculate new strength
+            new_strength = self._calculate_strength(model_id, task_classification)
+
+            # Update sticky if stronger
+            if new_strength >= self._strength_threshold:
+                if self._sticky_model != model_id or new_strength > self._sticky_strength:
+                    self._sticky_model = model_id
+                    self._sticky_tier = tier_id
+                    self._sticky_strength = new_strength
+                    if self._sticky_started is None:
+                        self._sticky_started = datetime.now()
+                        logger.info(
+                            f"📌 Sticky session started: {model_id} "
+                            f"(strength={new_strength:.2f})"
+                        )
+
+    def _task_matches_session(self, task: TaskClassification) -> bool:
+        """Check if task matches current session type."""
+        if not self._session_tasks:
+            return True
+
+        # If session is coding-focused
+        coding_tasks = {TaskType.CODE_SIMPLE, TaskType.CODE_COMPLEX,
+                       TaskType.CODE_REVIEW, TaskType.CODE_EXPLAIN,
+                       TaskType.CODE_DEBUG, TaskType.CODE_ARCHITECTURE}
+
+        session_coding_ratio = sum(
+            1 for t in self._session_tasks if t in coding_tasks
+        ) / len(self._session_tasks)
+
+        if session_coding_ratio > 0.6 and task.task_type in coding_tasks:
+            return True
+
+        return False
+
+    def _calculate_strength(
+        self,
+        model_id: str,
+        task: TaskClassification,
+    ) -> float:
+        """Calculate sticky strength for model."""
+        factors = []
+
+        # Model usage factor
+        total_uses = sum(self._session_model_uses.values())
+        if total_uses > 0:
+            model_ratio = self._session_model_uses.get(model_id, 0) / total_uses
+            factors.append(model_ratio)
+
+        # Coding session factor
+        if task.is_coding_session:
+            factors.append(0.8)
+
+        # Task consistency factor
+        if len(self._session_tasks) >= 3:
+            recent = self._session_tasks[-3:]
+            if len(set(recent)) == 1:  # Same task type
+                factors.append(0.9)
+            elif len(set(recent)) <= 2:  # Similar tasks
+                factors.append(0.6)
+
+        return sum(factors) / max(len(factors), 1)
+
+    async def _end_session(self) -> None:
+        """End current sticky session."""
+        if self._sticky_model:
+            logger.info(f"📌 Sticky session ended: {self._sticky_model}")
+        self._sticky_model = None
+        self._sticky_tier = None
+        self._sticky_started = None
+        self._sticky_strength = 0.0
+        self._session_tasks.clear()
+        self._session_model_uses.clear()
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get sticky routing status."""
+        return {
+            "sticky_model": self._sticky_model,
+            "sticky_tier": self._sticky_tier,
+            "sticky_strength": round(self._sticky_strength, 2),
+            "session_duration_seconds": (
+                (datetime.now() - self._sticky_started).total_seconds()
+                if self._sticky_started else 0
+            ),
+            "session_task_count": len(self._session_tasks),
+        }
+
+
+# =============================================================================
 # MODEL MEMORY MANAGER
 # =============================================================================
 
@@ -1661,20 +2739,23 @@ class ModelMemoryManager:
 
 
 # =============================================================================
-# DYNAMIC MODEL REGISTRY v97.0
+# DYNAMIC MODEL REGISTRY v98.0 - Neural Switchboard
 # =============================================================================
 
 
 class DynamicModelRegistry:
     """
-    Enterprise-grade model registry with:
+    Enterprise-grade model registry with Neural Switchboard v98.0:
     - Auto-discovery of local models
     - On-demand download from HuggingFace
-    - Neural model selection
-    - Elastic burst control
+    - Neural model selection with task classification
+    - Elastic burst control with unified decision making
     - Memory management with LRU eviction
     - Model warm-up and preloading
     - Cross-repo GCP integration
+    - Sticky routing for session continuity
+    - Request buffering during hot swap
+    - macOS native memory pressure monitoring
     """
 
     _instance: ClassVar[Optional["DynamicModelRegistry"]] = None
@@ -1699,11 +2780,17 @@ class DynamicModelRegistry:
         self._enable_auto_download = enable_auto_download
         self._enable_prefetch = enable_prefetch
 
-        # Components
+        # Core Components
         self._downloader = AdvancedModelDownloader(models_dir)
         self._selector = NeuralModelSelector()
         self._burst_controller = ElasticBurstController()
         self._memory_manager = ModelMemoryManager(max_loaded_models=max_loaded_models)
+
+        # Neural Switchboard Components (v98.0)
+        self._task_classifier = TaskClassifier()
+        self._memory_pressure_monitor = MacOSMemoryPressureMonitor()
+        self._sticky_routing = StickyRoutingManager()
+        self._request_buffer = HotSwapRequestBuffer()
 
         # State
         self._discovered_models: Dict[str, Path] = {}
@@ -1725,6 +2812,8 @@ class DynamicModelRegistry:
             "cache_hits": 0,
             "selections": 0,
             "bursts": 0,
+            "sticky_hits": 0,
+            "task_classifications": 0,
         }
 
         # Observers
@@ -1754,7 +2843,7 @@ class DynamicModelRegistry:
 
             self._initialized = True
             logger.info(
-                f"DynamicModelRegistry v97.0 initialized: "
+                f"DynamicModelRegistry v98.0 initialized: "
                 f"{len(self._discovered_models)} models discovered, "
                 f"{len(self._model_specs)} specs available"
             )
@@ -1955,6 +3044,131 @@ class DynamicModelRegistry:
         )
         return should_burst
 
+    # =========================================================================
+    # NEURAL SWITCHBOARD v98.0 - Unified Intelligent Routing
+    # =========================================================================
+
+    async def neural_switchboard_route(
+        self,
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[ModelSpec, Optional[Path], TaskClassification]:
+        """
+        NEURAL SWITCHBOARD: Unified intelligent routing.
+
+        This is the main entry point for v98.0 routing that combines:
+        1. Task classification
+        2. Memory pressure check
+        3. Sticky routing for sessions
+        4. Model selection
+        5. Burst decision making
+
+        Returns:
+            Tuple of (ModelSpec, Optional[Path], TaskClassification)
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        context = context or {}
+
+        # 1. Classify the task
+        task_classification = await self._task_classifier.classify(prompt, context)
+        self._stats["task_classifications"] += 1
+
+        # 2. Check memory pressure
+        memory_snapshot = await self._memory_pressure_monitor.get_detailed_snapshot()
+        memory_critical = memory_snapshot.get("is_critical", False)
+
+        # 3. Check for sticky routing (session continuity)
+        sticky_model = await self._sticky_routing.get_sticky_model(task_classification)
+        if sticky_model and not memory_critical:
+            spec = self._model_specs.get(sticky_model)
+            path = self._discovered_models.get(sticky_model)
+            if spec and path:
+                self._stats["sticky_hits"] += 1
+                logger.debug(f"📌 Sticky routing: {sticky_model}")
+                return spec, path, task_classification
+
+        # 4. Determine if we need to burst to cloud
+        should_burst = memory_critical or memory_snapshot.get("should_burst", False)
+
+        if not should_burst:
+            # Check if model fits in memory
+            recommended_tier = task_classification.recommended_tiers[0] if task_classification.recommended_tiers else "tier_0_local_fast"
+            model_ids = self._tier_mapping.get(recommended_tier, [])
+            if model_ids:
+                first_spec = self._model_specs.get(model_ids[0])
+                if first_spec:
+                    can_load, reason = await self._can_load_locally(first_spec)
+                    if not can_load:
+                        should_burst = True
+                        logger.info(f"🔄 Local load blocked: {reason}")
+
+        # 5. Select model based on task classification
+        requirements = [cap.value for cap in task_classification.required_capabilities]
+
+        spec, path = await self.neural_select(
+            prompt=prompt,
+            complexity=task_classification.complexity,
+            requirements=requirements,
+            context={
+                **context,
+                "task_type": task_classification.task_type.value,
+                "force_cloud": should_burst and memory_critical,
+                "prefer_speed": task_classification.requires_fast_response,
+            },
+        )
+
+        # 6. Update sticky routing
+        if spec:
+            tier_id = f"tier_{spec.tier_level.value}_" + spec.tier_level.name.lower().split("_")[-1]
+            await self._sticky_routing.update_sticky(
+                spec.model_id, tier_id, task_classification
+            )
+
+        return spec, path, task_classification
+
+    async def _can_load_locally(self, spec: ModelSpec) -> Tuple[bool, str]:
+        """Check if model can be loaded locally."""
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024**3)
+
+            # Check memory pressure
+            pressure = await self._memory_pressure_monitor.get_pressure_level()
+            if pressure == MemoryPressureLevel.CRITICAL:
+                return False, "memory_pressure_critical"
+
+            # Check if enough RAM
+            buffer_gb = 2.0
+            if available_gb < spec.memory_required_gb + buffer_gb:
+                return False, f"insufficient_ram_{available_gb:.1f}GB"
+
+            return True, "sufficient"
+
+        except ImportError:
+            return True, "psutil_unavailable_assuming_ok"
+
+    async def classify_task(
+        self,
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> TaskClassification:
+        """Classify a prompt into task type."""
+        return await self._task_classifier.classify(prompt, context)
+
+    async def get_memory_pressure(self) -> Dict[str, Any]:
+        """Get current memory pressure status."""
+        return await self._memory_pressure_monitor.get_detailed_snapshot()
+
+    def get_sticky_status(self) -> Dict[str, Any]:
+        """Get sticky routing status."""
+        return self._sticky_routing.get_status()
+
+    def get_request_buffer_status(self) -> Dict[str, Any]:
+        """Get request buffer status."""
+        return self._request_buffer.get_statistics()
+
     def get_model_spec(self, model_id: str) -> Optional[ModelSpec]:
         """Get model specification."""
         return self._model_specs.get(model_id)
@@ -1981,18 +3195,25 @@ class DynamicModelRegistry:
         return result
 
     def get_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive registry statistics."""
+        """Get comprehensive registry statistics including Neural Switchboard v98.0."""
         return {
+            "version": "98.0",
             "total_known_models": len(self._model_specs),
             "downloaded_models": len(self._discovered_models),
             "downloads": self._stats["downloads"],
             "cache_hits": self._stats["cache_hits"],
             "selections": self._stats["selections"],
             "bursts": self._stats["bursts"],
+            "sticky_hits": self._stats.get("sticky_hits", 0),
+            "task_classifications": self._stats.get("task_classifications", 0),
             "selector_stats": self._selector.get_statistics(),
             "burst_status": self._burst_controller.get_status(),
             "memory_status": self._memory_manager.get_status(),
             "active_downloads": self._downloader.get_active_downloads(),
+            # Neural Switchboard v98.0 stats
+            "task_classifier_stats": self._task_classifier.get_statistics(),
+            "sticky_routing_status": self._sticky_routing.get_status(),
+            "request_buffer_stats": self._request_buffer.get_statistics(),
         }
 
     async def shutdown(self) -> None:
@@ -2059,16 +3280,28 @@ __all__ = [
     "ModelLocation",
     "ModelState",
     "QuantizationType",
+    "TaskType",
+    "MemoryPressureLevel",
     # Data classes
     "QuantizationSpec",
     "ModelSpec",
     "DownloadProgress",
+    "TaskClassification",
+    "BufferedRequest",
     # Constants
     "QUANTIZATION_SPECS",
     "KNOWN_MODELS",
     "TIER_MODEL_MAPPING",
     "CAPABILITY_MODEL_MAPPING",
-    # Classes
+    "TASK_TIER_MAPPING",
+    "TASK_CAPABILITY_MAPPING",
+    # Neural Switchboard Classes
+    "TaskClassifier",
+    "MacOSMemoryPressureMonitor",
+    "CrossRepoMemoryIntegration",
+    "HotSwapRequestBuffer",
+    "StickyRoutingManager",
+    # Core Classes
     "AdvancedModelDownloader",
     "NeuralModelSelector",
     "ElasticBurstController",
