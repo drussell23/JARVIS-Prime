@@ -450,6 +450,49 @@ try:
 except ImportError:
     TRINITY_BRIDGE_ADAPTER_AVAILABLE = False
 
+# Neural Orchestrator Core v100.0 - Unified Intelligent Routing
+try:
+    from jarvis_prime.core.neural_orchestrator_core import (
+        NeuralOrchestratorCore,
+        DynamicConfig,
+        TaskClassification,
+        RoutingResult as NeuralRoutingResult,
+        CircuitBreakerState,
+        CrossRepoMemoryState,
+        MemoryPressureLevel,
+        CircuitState as NeuralCircuitState,
+        RoutingTier,
+        TaskCategory,
+        RoutingDecisionReason,
+        RouterProtocol,
+        MemoryMonitorProtocol,
+        CircuitBreakerProtocol,
+        ConfigProviderProtocol,
+        UnifiedTaskClassifier,
+        UnifiedMemoryMonitor,
+        UnifiedStickyRouting,
+        UnifiedRequestBuffer,
+        CrossRepoStateManager,
+        CircuitBreakerManager,
+        CircuitBreaker as NeuralCircuitBreaker,
+        defensive,
+        async_defensive,
+        with_timeout as neural_with_timeout,
+        with_retry as neural_with_retry,
+        set_request_context as neural_set_request_context,
+        get_request_context as neural_get_request_context,
+        request_id_var,
+        session_id_var,
+        trace_context_var,
+        routing_context_var,
+        get_neural_orchestrator,
+        neural_route,
+        shutdown_neural_orchestrator,
+    )
+    NEURAL_ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    NEURAL_ORCHESTRATOR_AVAILABLE = False
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -786,4 +829,31 @@ __all__ = [
     "start_bridge",
     "stop_bridge",
     "TRINITY_BRIDGE_ADAPTER_AVAILABLE",
+    # Neural Orchestrator Core v100.0
+    "NeuralOrchestratorCore",
+    "DynamicConfig",
+    "TaskClassification",
+    "RoutingResult",
+    "CircuitBreakerState",
+    "CrossRepoMemoryState",
+    "MemoryPressureLevel",
+    "RoutingTier",
+    "TaskCategory",
+    "RoutingDecisionReason",
+    "RouterProtocol",
+    "MemoryMonitorProtocol",
+    "CircuitBreakerProtocol",
+    "ConfigProviderProtocol",
+    "UnifiedTaskClassifier",
+    "UnifiedMemoryMonitor",
+    "UnifiedStickyRouting",
+    "UnifiedRequestBuffer",
+    "CrossRepoStateManager",
+    "CircuitBreakerManager",
+    "get_neural_orchestrator",
+    "neural_route",
+    "shutdown_neural_orchestrator",
+    "set_request_context",
+    "get_request_context",
+    "NEURAL_ORCHESTRATOR_AVAILABLE",
 ]

@@ -1790,6 +1790,42 @@ async def main_v87_unified(args):
         except Exception as e:
             logger.warning(f"  GCP Import Bridge failed: {e}")
 
+        # 5.20. Initialize Neural Orchestrator Core v100.0 (Unified Intelligent Routing)
+        logger.info("")
+        logger.info("Initializing Neural Orchestrator Core v100.0 (Unified Routing)...")
+        neural_orchestrator = None
+        neural_orchestrator_stats = {}
+        try:
+            from jarvis_prime.core.neural_orchestrator_core import (
+                NeuralOrchestratorCore,
+                DynamicConfig,
+            )
+            # Load config with env var override support
+            neural_config = DynamicConfig.from_env_and_yaml()
+            neural_orchestrator = await NeuralOrchestratorCore.get_instance(neural_config)
+            initialized.append(("neural_orchestrator", neural_orchestrator))
+            neural_orchestrator_stats = neural_orchestrator.get_comprehensive_stats()
+
+            logger.info("  Neural Orchestrator Core v100.0 initialized")
+            logger.info(f"    - Task Classifier: ACTIVE")
+            logger.info(f"    - Memory Monitor: ACTIVE")
+            logger.info(f"    - Sticky Routing: ACTIVE")
+            logger.info(f"    - Request Buffer: ACTIVE")
+            logger.info(f"    - Circuit Breakers: ACTIVE")
+            logger.info(f"    - Cross-Repo State: ACTIVE")
+
+            # Show config thresholds (no hardcoding!)
+            logger.info(f"    - Tier 0 Max Complexity: {neural_config.tier_0_fast_max_complexity}")
+            logger.info(f"    - Tier 0.5 Max Complexity: {neural_config.tier_05_capable_max_complexity}")
+            logger.info(f"    - Tier 1 Max Complexity: {neural_config.tier_1_cloud_max_complexity}")
+            logger.info(f"    - Memory Warn Threshold: {neural_config.memory_warn_threshold * 100:.0f}%")
+            logger.info(f"    - Memory Critical Threshold: {neural_config.memory_critical_threshold * 100:.0f}%")
+
+        except ImportError as e:
+            logger.warning(f"  Neural Orchestrator Core not available: {e}")
+        except Exception as e:
+            logger.warning(f"  Neural Orchestrator Core failed: {e}")
+
         # 6. Register services with mesh
         if service_mesh:
             logger.info("")
@@ -1916,6 +1952,31 @@ async def main_v87_unified(args):
             rm_snapshot = await resource_manager.get_snapshot()
             logger.info(f"│    Memory Pressure:       {rm_snapshot.memory_pressure.value.upper():>18} │")
             logger.info(f"│    Degradation Mode:      {rm_snapshot.degradation_mode.value:>18} │")
+        logger.info("└──────────────────────────────────────────────────────────────────┘")
+        logger.info("")
+        logger.info("┌──────────────────────────────────────────────────────────────────┐")
+        logger.info("│              NEURAL ORCHESTRATOR CORE (v100.0)                    │")
+        logger.info("├──────────────────────────────────────────────────────────────────┤")
+        logger.info(f"│  Neural Orchestrator:     {'✓ ACTIVE' if neural_orchestrator else '✗ INACTIVE':>18} │")
+        if neural_orchestrator:
+            no_stats = neural_orchestrator.get_comprehensive_stats()
+            routing_stats = no_stats.get('routing', {})
+            task_stats = no_stats.get('task_classifier', {})
+            memory_stats = no_stats.get('memory_monitor', {})
+            sticky_stats = no_stats.get('sticky_routing', {})
+            logger.info(f"│    Task Classifier:       {'✓ ACTIVE':>18} │")
+            logger.info(f"│    Memory Monitor:        {'✓ ACTIVE':>18} │")
+            logger.info(f"│    Sticky Routing:        {'✓ ACTIVE':>18} │")
+            logger.info(f"│    Request Buffer:        {'✓ ACTIVE':>18} │")
+            logger.info(f"│    Circuit Breakers:      {'✓ ACTIVE':>18} │")
+            logger.info(f"│    Total Requests:        {routing_stats.get('total_requests', 0):>18} │")
+            logger.info(f"│    Successful Routes:     {routing_stats.get('successful_routes', 0):>18} │")
+            logger.info(f"│    Sticky Hits:           {routing_stats.get('sticky_hits', 0):>18} │")
+            logger.info(f"│    Burst Triggers:        {routing_stats.get('burst_triggers', 0):>18} │")
+            if memory_stats.get('trend'):
+                logger.info(f"│    Memory Trend:          {memory_stats.get('trend', 'stable'):>18} │")
+            if sticky_stats.get('session_active'):
+                logger.info(f"│    Sticky Session:        {'ACTIVE':>18} │")
         logger.info("└──────────────────────────────────────────────────────────────────┘")
         logger.info("")
         logger.info("┌──────────────────────────────────────────────────────────────────┐")
@@ -2160,6 +2221,19 @@ async def main_v87_unified(args):
                     if hasattr(component, 'shutdown'):
                         await component.shutdown()
                     logger.info(f"  {name}: stopped")
+                elif name == "neural_orchestrator":
+                    # v100.0: Stop Neural Orchestrator Core
+                    from jarvis_prime.core.neural_orchestrator_core import shutdown_neural_orchestrator
+                    if hasattr(component, 'get_comprehensive_stats'):
+                        stats = component.get_comprehensive_stats()
+                        routing_stats = stats.get('routing', {})
+                        logger.info(f"    Total Requests: {routing_stats.get('total_requests', 0)}")
+                        logger.info(f"    Successful Routes: {routing_stats.get('successful_routes', 0)}")
+                        logger.info(f"    Sticky Hits: {routing_stats.get('sticky_hits', 0)}")
+                        logger.info(f"    Burst Triggers: {routing_stats.get('burst_triggers', 0)}")
+                        logger.info(f"    Fallback Routes: {routing_stats.get('fallback_routes', 0)}")
+                    await shutdown_neural_orchestrator()
+                    logger.info(f"  {name}: stopped (cross-repo state synced)")
             except Exception as e:
                 logger.debug(f"  Error stopping {name}: {e}")
 
