@@ -1025,7 +1025,62 @@ class ContinuousLearningEngine:
         self._total_updates = 0
         self._last_update_time = time.time()
 
+        # v76.1: Track initialization state for AGI integration
+        self._initialized = False
+
         logger.info(f"ContinuousLearningEngine initialized (mode={self.config.mode.value})")
+
+    async def initialize(self) -> bool:
+        """
+        v76.1: Async initialization for AGI integration compatibility.
+
+        Called by AGIIntegrationHub to ensure all components are ready.
+        This method delegates to start() but also returns success status.
+
+        Returns:
+            True on successful initialization
+        """
+        if self._initialized:
+            return True
+
+        try:
+            # Start the learning engine
+            await self.start()
+
+            # Load any persisted state if available
+            state_file = self.checkpoints_dir.parent / "learning_state.json"
+            if state_file.exists():
+                try:
+                    with open(state_file, "r") as f:
+                        state = json.load(f)
+                        self._total_experiences = state.get("total_experiences", 0)
+                        self._total_updates = state.get("total_updates", 0)
+                        self._last_update_time = state.get("last_update_time", time.time())
+                    logger.info("Loaded persisted learning state")
+                except Exception as e:
+                    logger.warning(f"Failed to load learning state: {e}")
+
+            # Load experience buffer if available
+            buffer_file = self.checkpoints_dir.parent / "experience_buffer.pkl"
+            if buffer_file.exists():
+                if self._buffer.load(buffer_file):
+                    logger.info(f"Loaded {len(self._buffer)} experiences from buffer")
+
+            self._initialized = True
+            logger.info("ContinuousLearningEngine async initialization complete")
+            return True
+
+        except Exception as e:
+            logger.error(f"ContinuousLearningEngine initialization failed: {e}")
+            return False
+
+    async def persist_state(self) -> None:
+        """
+        v76.1: Persist current state for later recovery.
+
+        Called during shutdown to save state.
+        """
+        await self._save_state()
 
     async def start(self) -> None:
         """Start the continuous learning engine."""

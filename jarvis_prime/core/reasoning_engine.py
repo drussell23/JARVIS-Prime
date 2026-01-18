@@ -2413,7 +2413,59 @@ class ReasoningEngine:
         # Start background tasks
         self._start_background_tasks()
 
+        # v92.2: Track initialization state for async initialization
+        self._initialized = False
+
         logger.info("ReasoningEngine v92.1 initialized with RAG, context management, and advanced feedback")
+
+    async def initialize(self) -> bool:
+        """
+        v92.2: Async initialization for AGI integration compatibility.
+
+        Called by AGIIntegrationHub to ensure all components are ready.
+        Returns True on successful initialization.
+        """
+        if self._initialized:
+            return True
+
+        try:
+            # Initialize RAG engine if enabled
+            if self.config.rag_enabled:
+                await self._initialize_rag()
+
+            # Initialize all strategies
+            for strategy_type, strategy_class in self.STRATEGIES.items():
+                if strategy_type not in self._strategies:
+                    self._strategies[strategy_type] = strategy_class(
+                        self.generator,
+                        self.evaluator,
+                    )
+
+            # Ensure feedback flush task is running
+            if self._feedback_flush_task is None or self._feedback_flush_task.done():
+                try:
+                    loop = asyncio.get_running_loop()
+                    async def periodic_flush():
+                        while not self._shutdown_event.is_set():
+                            try:
+                                await asyncio.sleep(300)
+                                if self._feedback_buffer:
+                                    await self._flush_feedback()
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as e:
+                                logger.warning(f"Periodic flush error: {e}")
+                    self._feedback_flush_task = asyncio.create_task(periodic_flush())
+                except RuntimeError:
+                    pass  # No event loop yet
+
+            self._initialized = True
+            logger.info("ReasoningEngine async initialization complete")
+            return True
+
+        except Exception as e:
+            logger.error(f"ReasoningEngine initialization failed: {e}")
+            return False
 
     def _start_background_tasks(self) -> None:
         """Start background tasks for periodic operations."""

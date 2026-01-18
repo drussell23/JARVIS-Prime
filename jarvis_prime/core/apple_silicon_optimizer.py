@@ -1110,6 +1110,109 @@ class AppleSiliconOptimizer:
             "initialized": self._initialized,
         }
 
+    def get_recommendations(self) -> Dict[str, Any]:
+        """
+        v76.1: Get optimization recommendations for the current platform.
+
+        Analyzes the platform capabilities and current state to provide
+        actionable recommendations for optimal performance.
+
+        Returns:
+            Dictionary with recommendations for batch_size, backend, memory,
+            and optimization settings.
+        """
+        recommendations = {
+            "batch_size": {
+                "recommended": self._platform.get_recommended_batch_size(),
+                "reason": "Based on available unified memory",
+            },
+            "backend": {
+                "recommended": self.get_optimal_backend().value,
+                "available": [b.value for b in self._platform.available_backends],
+                "reason": "Based on platform acceleration capabilities",
+            },
+            "precision": {
+                "recommended": "fp16" if self._platform.is_apple_silicon else "fp32",
+                "reason": "Apple Silicon excels at FP16 operations",
+            },
+            "memory_management": [],
+            "optimizations": [],
+        }
+
+        # Memory-based recommendations
+        memory_usage = self._uma.get_memory_usage()
+        memory_pressure = self._uma.check_memory_pressure()
+
+        if memory_pressure == "critical":
+            recommendations["memory_management"].append({
+                "action": "reduce_batch_size",
+                "urgency": "high",
+                "reason": "Critical memory pressure detected",
+            })
+            recommendations["batch_size"]["recommended"] = max(
+                1, recommendations["batch_size"]["recommended"] // 2
+            )
+        elif memory_pressure == "high":
+            recommendations["memory_management"].append({
+                "action": "monitor_closely",
+                "urgency": "medium",
+                "reason": "High memory pressure detected",
+            })
+
+        # Platform-specific recommendations
+        if self._platform.is_apple_silicon:
+            recommendations["optimizations"].append({
+                "feature": "unified_memory",
+                "status": "enabled",
+                "benefit": "Zero-copy data transfer between CPU/GPU/ANE",
+            })
+
+            if AccelerationBackend.ANE in self._platform.available_backends:
+                recommendations["optimizations"].append({
+                    "feature": "neural_engine",
+                    "status": "available",
+                    "benefit": f"{self._platform.neural_engine_cores} dedicated AI cores",
+                })
+
+            if self._platform.gpu_cores > 0:
+                recommendations["optimizations"].append({
+                    "feature": "gpu_acceleration",
+                    "status": "available",
+                    "benefit": f"{self._platform.gpu_cores} GPU cores via Metal",
+                })
+
+        # Thermal-based recommendations
+        if self._platform.thermal_state == "serious":
+            recommendations["memory_management"].append({
+                "action": "reduce_workload",
+                "urgency": "medium",
+                "reason": "Thermal throttling detected - reduce workload to prevent performance degradation",
+            })
+        elif self._platform.thermal_state == "critical":
+            recommendations["memory_management"].append({
+                "action": "pause_workload",
+                "urgency": "high",
+                "reason": "Critical thermal state - system may reduce performance significantly",
+            })
+
+        # MPS-specific recommendations
+        if self._mps.is_initialized:
+            recommendations["optimizations"].append({
+                "feature": "mps_backend",
+                "status": "active",
+                "benefit": "Metal Performance Shaders enabled for GPU compute",
+            })
+
+        # CoreML-specific recommendations
+        if self._coreml.is_initialized:
+            recommendations["optimizations"].append({
+                "feature": "coreml_backend",
+                "status": "active",
+                "benefit": "CoreML enabled for Neural Engine acceleration",
+            })
+
+        return recommendations
+
 
 # =============================================================================
 # FACTORY FUNCTIONS
