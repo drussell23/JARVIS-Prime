@@ -2437,8 +2437,9 @@ class ReasoningEngine:
             for strategy_type, strategy_class in self.STRATEGIES.items():
                 if strategy_type not in self._strategies:
                     self._strategies[strategy_type] = strategy_class(
-                        self.generator,
-                        self.evaluator,
+                        config=self.config,
+                        generator=self.generator,
+                        evaluator=self.evaluator,
                     )
 
             # Ensure feedback flush task is running
