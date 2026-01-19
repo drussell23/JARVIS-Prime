@@ -89,7 +89,8 @@ try:
     FAISS_AVAILABLE = True
 except ImportError:
     FAISS_AVAILABLE = False
-    logger.warning("FAISS not available - using mock vector store")
+    # v93.0: Changed to INFO since mock vector store is a valid fallback, not a problem
+    logger.info("FAISS not available - using in-memory vector store (install with: pip install faiss-cpu)")
 
 try:
     import chromadb

@@ -45,10 +45,19 @@ import os
 import signal
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from enum import Enum, auto
+
+# v93.0: Suppress known benign compatibility warnings from external libraries
+# These are informational warnings about version compatibility, not errors
+warnings.filterwarnings('ignore', message='.*scikit-learn version.*not supported.*')
+warnings.filterwarnings('ignore', message='.*Torch version.*has not been tested.*')
+warnings.filterwarnings('ignore', message='.*coremltools.*')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='coremltools.*')
+warnings.filterwarnings('ignore', category=FutureWarning, module='coremltools.*')
 
 # Configure logging
 logging.basicConfig(
