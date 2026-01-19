@@ -366,6 +366,13 @@ class PrimeModelManager:
         self._running = False
         self._current_version = None
 
+        # v93.0: Startup phase tracking for early health check responses
+        self._startup_phase = "initializing"  # initializing -> loading_model -> ready
+        self._startup_start_time = time.time()
+        self._model_load_start_time: Optional[float] = None
+        self._model_load_error: Optional[str] = None
+        self._background_load_task: Optional[asyncio.Task] = None
+
         # Statistics
         self._request_count = 0
         self._tier_0_count = 0
@@ -374,12 +381,20 @@ class PrimeModelManager:
 
         logger.info("PrimeModelManager initialized")
 
-    async def start(self, initial_model_path: Optional[Path] = None) -> None:
+    async def start(
+        self,
+        initial_model_path: Optional[Path] = None,
+        background_model_load: bool = True,
+    ) -> None:
         """
         Start the model manager and all components.
 
+        v93.0: Non-blocking startup - server starts immediately, model loads in background.
+        This allows health checks to succeed while model is loading.
+
         Args:
             initial_model_path: Path to initial model to load
+            background_model_load: If True, load model in background (non-blocking)
         """
         from jarvis_prime.core.model_registry import ModelRegistry
         from jarvis_prime.core.hot_swap_manager import HotSwapManager, ModelLoader
@@ -388,6 +403,7 @@ class PrimeModelManager:
 
         # Initialize components
         logger.info("Starting PrimeModelManager components...")
+        self._startup_phase = "initializing"
 
         # Registry
         self._registry = ModelRegistry(
@@ -430,63 +446,110 @@ class PrimeModelManager:
         )
         await self._telemetry.start()
 
-        # Load initial model if provided
-        model_load_start = time.time()
-        models_loaded = 0
-
-        if initial_model_path:
-            try:
-                await self._hot_swap.load_initial(
-                    model_path=initial_model_path,
-                    version_id="v1.0-initial",
-                )
-                self._current_version = "v1.0-initial"
-                models_loaded = 1
-
-                # Voice announcement: Model loaded successfully
-                try:
-                    from jarvis_prime.core.voice_integration import announce_model_loaded
-                    await announce_model_loaded(
-                        model_name="v1.0-initial",
-                        load_time_seconds=time.time() - model_load_start,
-                        success=True,
-                    )
-                except Exception as ve:
-                    logger.debug(f"Voice announcement skipped: {ve}")
-
-            except Exception as e:
-                logger.error(f"Failed to load initial model: {e}")
-                # Voice announcement: Model load failed
-                try:
-                    from jarvis_prime.core.voice_integration import announce_model_loaded
-                    await announce_model_loaded(
-                        model_name="v1.0-initial",
-                        load_time_seconds=time.time() - model_load_start,
-                        success=False,
-                        error_message=str(e),
-                    )
-                except Exception as ve:
-                    logger.debug(f"Voice announcement skipped: {ve}")
-
         # Register callbacks
         self._registry.on_new_version(self._on_new_version)
         self._registry.on_activation(self._on_activation)
         self._hot_swap.on_swap_complete(self._on_swap_complete)
 
+        # v93.0: Mark as running BEFORE model loading so health checks work
         self._running = True
 
-        # Voice announcement: Manager started
-        manager_startup_time = time.time() - model_load_start
-        try:
-            from jarvis_prime.core.voice_integration import announce_manager_started
-            await announce_manager_started(
-                models_loaded=models_loaded,
-                startup_time_seconds=manager_startup_time,
-            )
-        except Exception as ve:
-            logger.debug(f"Voice announcement skipped: {ve}")
+        # v93.0: Load model in background or blocking based on parameter
+        if initial_model_path:
+            if background_model_load:
+                # Non-blocking: Start model loading in background
+                self._startup_phase = "loading_model"
+                self._model_load_start_time = time.time()
+                self._background_load_task = asyncio.create_task(
+                    self._load_model_background(initial_model_path),
+                    name="background_model_load"
+                )
+                logger.info(
+                    f"[v93.0] Model loading started in background: {initial_model_path.name}"
+                )
+                logger.info(
+                    "[v93.0] Server will accept health checks while model loads"
+                )
+            else:
+                # Blocking: Load model synchronously (legacy behavior)
+                await self._load_model_sync(initial_model_path)
+        else:
+            # No model to load - immediately ready
+            self._startup_phase = "ready"
 
-        logger.info("PrimeModelManager started successfully")
+        logger.info("PrimeModelManager started (model loading may still be in progress)")
+
+    async def _load_model_background(self, model_path: Path) -> None:
+        """
+        v93.0: Load model in background task.
+
+        This allows the server to respond to health checks while model loads.
+        """
+        try:
+            await self._load_model_sync(model_path)
+        except Exception as e:
+            self._model_load_error = str(e)
+            self._startup_phase = "error"
+            logger.error(f"[v93.0] Background model load failed: {e}")
+
+    async def _load_model_sync(self, model_path: Path) -> None:
+        """
+        v93.0: Load model synchronously (blocking).
+
+        Extracted from original start() method for reuse.
+        """
+        model_load_start = time.time()
+        self._model_load_start_time = model_load_start
+        self._startup_phase = "loading_model"
+
+        try:
+            await self._hot_swap.load_initial(
+                model_path=model_path,
+                version_id="v1.0-initial",
+            )
+            self._current_version = "v1.0-initial"
+            self._startup_phase = "ready"
+
+            load_time = time.time() - model_load_start
+            logger.info(f"[v93.0] Model loaded successfully in {load_time:.1f}s")
+
+            # Voice announcement: Model loaded successfully
+            try:
+                from jarvis_prime.core.voice_integration import announce_model_loaded
+                await announce_model_loaded(
+                    model_name="v1.0-initial",
+                    load_time_seconds=load_time,
+                    success=True,
+                )
+            except Exception as ve:
+                logger.debug(f"Voice announcement skipped: {ve}")
+
+            # Voice announcement: Manager started
+            try:
+                from jarvis_prime.core.voice_integration import announce_manager_started
+                await announce_manager_started(
+                    models_loaded=1,
+                    startup_time_seconds=load_time,
+                )
+            except Exception as ve:
+                logger.debug(f"Voice announcement skipped: {ve}")
+
+        except Exception as e:
+            self._model_load_error = str(e)
+            self._startup_phase = "error"
+            logger.error(f"Failed to load initial model: {e}")
+
+            # Voice announcement: Model load failed
+            try:
+                from jarvis_prime.core.voice_integration import announce_model_loaded
+                await announce_model_loaded(
+                    model_name="v1.0-initial",
+                    load_time_seconds=time.time() - model_load_start,
+                    success=False,
+                    error_message=str(e),
+                )
+            except Exception as ve:
+                logger.debug(f"Voice announcement skipped: {ve}")
 
     async def stop(self) -> None:
         """Stop the model manager and all components"""
@@ -767,10 +830,24 @@ class PrimeModelManager:
             logger.error(f"Hot-swap failed: {result.error_message}")
 
     def get_status(self) -> Dict[str, Any]:
-        """Get comprehensive manager status"""
+        """
+        Get comprehensive manager status.
+
+        v93.0: Includes startup phase tracking for intelligent health checks.
+        """
+        # v93.0: Calculate model loading progress
+        model_load_elapsed = None
+        if self._model_load_start_time:
+            model_load_elapsed = time.time() - self._model_load_start_time
+
         return {
             "running": self._running,
             "current_version": self._current_version,
+            # v93.0: Startup phase tracking
+            "startup_phase": self._startup_phase,
+            "model_load_elapsed_seconds": model_load_elapsed,
+            "model_load_error": self._model_load_error,
+            "startup_elapsed_seconds": time.time() - self._startup_start_time,
             "statistics": {
                 "total_requests": self._request_count,
                 "tier_0_count": self._tier_0_count,
@@ -783,6 +860,33 @@ class PrimeModelManager:
             "router": self._router.get_statistics() if self._router else None,
             "telemetry": self._telemetry.get_statistics() if self._telemetry else None,
         }
+
+    def is_ready(self) -> bool:
+        """
+        v93.0: Check if manager is ready to serve requests.
+
+        Returns True only when model is fully loaded.
+        """
+        return self._startup_phase == "ready" and self._running
+
+    def get_health_status(self) -> str:
+        """
+        v93.0: Get health status string for health endpoint.
+
+        Returns:
+            "healthy" - Ready to serve requests
+            "starting" - Still loading, but server is up
+            "error" - Model loading failed
+            "unavailable" - Not running
+        """
+        if not self._running:
+            return "unavailable"
+        if self._startup_phase == "ready":
+            return "healthy"
+        if self._startup_phase == "error":
+            return "error"
+        # initializing or loading_model
+        return "starting"
 
 
 # ============================================================================
@@ -914,8 +1018,31 @@ def create_api_app(manager: PrimeModelManager):
 
     @app.get("/health")
     async def health():
-        """Health check endpoint"""
-        return {"status": "healthy", **manager.get_status()}
+        """
+        Health check endpoint.
+
+        v93.0: Returns proper startup status:
+        - "healthy" when model is loaded and ready
+        - "starting" when still loading (server is up but not ready)
+        - "error" if model loading failed
+        - "unavailable" if not running
+        """
+        status = manager.get_health_status()
+        full_status = manager.get_status()
+
+        # v93.0: Return 503 Service Unavailable for error state (not 200)
+        # But return 200 for "starting" state - server IS up, just not ready
+        if status == "error":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": status,
+                    "error": full_status.get("model_load_error"),
+                    **full_status
+                }
+            )
+
+        return {"status": status, **full_status}
 
     # ========================================================================
     # WebSocket Event Stream for Neural Mesh Integration (v10.3)
