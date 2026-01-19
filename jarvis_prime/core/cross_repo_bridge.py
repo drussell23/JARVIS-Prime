@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -38,6 +39,10 @@ STALE_THRESHOLD = 120  # seconds - consider stale if no heartbeat
 # PROJECT TRINITY: Unified command routing
 TRINITY_DIR = Path.home() / ".jarvis" / "trinity"
 TRINITY_COMMANDS_DIR = TRINITY_DIR / "commands"
+
+# v93.0: Predictive Memory Defense - cross-repo signaling
+MEMORY_PRESSURE_FILE = BRIDGE_STATE_DIR / "memory_pressure.json"
+MEMORY_PRESSURE_CHECK_INTERVAL = 2.0  # Check every 2 seconds when active
 
 
 # ============================================================================
@@ -105,6 +110,11 @@ class PrimeState:
     # Cross-repo coordination
     connected_to_jarvis: bool = False
     jarvis_session_id: str = ""
+
+    # v93.0: Predictive Memory Defense integration
+    memory_pressure_status: str = "normal"  # normal, elevated, critical, offload_active
+    paused_by_memory_defense: bool = False  # True if SIGSTOP'd by main JARVIS
+    last_memory_pressure_check: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -451,6 +461,151 @@ class CrossRepoBridge:
             intent="thaw_app",
             payload={"app_name": app_name},
         )
+
+    # =========================================================================
+    # v93.0: Predictive Memory Defense Integration
+    # =========================================================================
+
+    async def check_memory_pressure(self) -> Optional[Dict[str, Any]]:
+        """
+        v93.0: Check if main JARVIS has signaled memory pressure.
+
+        Reads from ~/.jarvis/cross_repo/memory_pressure.json for signals.
+        Returns pressure info if active, None otherwise.
+        """
+        try:
+            if not MEMORY_PRESSURE_FILE.exists():
+                self.state.memory_pressure_status = "normal"
+                return None
+
+            content = MEMORY_PRESSURE_FILE.read_text()
+            pressure_data = json.loads(content)
+
+            # Check if signal is still valid (not expired)
+            timestamp = pressure_data.get("timestamp", 0)
+            if time.time() - timestamp > 30:  # 30s TTL
+                self.state.memory_pressure_status = "normal"
+                return None
+
+            status = pressure_data.get("status", "normal")
+            self.state.memory_pressure_status = status
+            self.state.last_memory_pressure_check = datetime.now().isoformat()
+
+            return pressure_data
+
+        except Exception as e:
+            logger.warning(f"[v93.0] Error checking memory pressure: {e}")
+            return None
+
+    async def report_memory_defense_status(
+        self,
+        is_paused: bool,
+        reason: str = "",
+    ) -> None:
+        """
+        v93.0: Report our status back to main JARVIS.
+
+        Called when we're paused/resumed by memory defense.
+        """
+        self.state.paused_by_memory_defense = is_paused
+        await self.notify_jarvis(
+            event="memory_defense_status",
+            data={
+                "is_paused": is_paused,
+                "reason": reason,
+                "model_loaded": self.state.model_loaded,
+                "instance_id": self.instance_id,
+            },
+        )
+        await self._write_state()
+
+    async def start_memory_pressure_monitor(self) -> asyncio.Task:
+        """
+        v93.0: Start background task to monitor memory pressure signals.
+
+        Returns the task so it can be cancelled on shutdown.
+        """
+        return asyncio.create_task(self._memory_pressure_monitor_loop())
+
+    async def _memory_pressure_monitor_loop(self) -> None:
+        """
+        v93.0: Background loop to respond to memory pressure signals.
+
+        Checks for:
+        - Emergency offload requests (pause self via SIGSTOP awareness)
+        - Memory pressure elevation warnings
+        - Offload complete notifications
+        """
+        while True:
+            try:
+                pressure_data = await self.check_memory_pressure()
+
+                if pressure_data:
+                    status = pressure_data.get("status", "normal")
+                    action = pressure_data.get("action")
+
+                    if status == "offload_active" and action == "pause":
+                        # Main JARVIS is pausing local processes
+                        if not self.state.paused_by_memory_defense:
+                            logger.warning(
+                                "[v93.0] Memory pressure EMERGENCY - main JARVIS pausing processes"
+                            )
+                            await self.report_memory_defense_status(
+                                is_paused=True,
+                                reason="emergency_offload_active",
+                            )
+
+                    elif status == "offload_active" and action == "terminate":
+                        # We're being asked to terminate (GCP ready)
+                        logger.warning(
+                            "[v93.0] Memory pressure TERMINATION request - GCP VM ready"
+                        )
+                        await self.notify_jarvis(
+                            event="memory_defense_terminating",
+                            data={"instance_id": self.instance_id},
+                        )
+                        # Initiate graceful shutdown
+                        await self.shutdown()
+                        return
+
+                    elif status == "normal" and self.state.paused_by_memory_defense:
+                        # We were paused but pressure has normalized
+                        logger.info(
+                            "[v93.0] Memory pressure normalized - resuming operations"
+                        )
+                        await self.report_memory_defense_status(
+                            is_paused=False,
+                            reason="pressure_normalized",
+                        )
+
+                    elif status == "elevated":
+                        # Warning: memory getting high
+                        if self.state.memory_pressure_status != "elevated":
+                            logger.warning(
+                                f"[v93.0] Memory pressure elevated: "
+                                f"{pressure_data.get('used_percent', 0):.1f}%"
+                            )
+
+                # Check more frequently if in elevated/critical state
+                if self.state.memory_pressure_status in ("elevated", "critical", "offload_active"):
+                    await asyncio.sleep(MEMORY_PRESSURE_CHECK_INTERVAL)
+                else:
+                    await asyncio.sleep(HEARTBEAT_INTERVAL / 2)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"[v93.0] Memory pressure monitor error: {e}")
+                await asyncio.sleep(5.0)
+
+    def get_memory_defense_status(self) -> Dict[str, Any]:
+        """v93.0: Get current memory defense status."""
+        return {
+            "memory_pressure_status": self.state.memory_pressure_status,
+            "paused_by_memory_defense": self.state.paused_by_memory_defense,
+            "last_check": self.state.last_memory_pressure_check,
+            "connected_to_jarvis": self.state.connected_to_jarvis,
+        }
 
     async def create_ghost_display(self) -> Dict[str, Any]:
         """Request JARVIS to create a Ghost Display (virtual display)."""
