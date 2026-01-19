@@ -52,28 +52,21 @@ from typing import Any, Callable, Dict, Optional, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
-# Import compatibility layer
-try:
-    from jarvis_prime.core.compat import (
-        resilient_import,
-        suppress_warnings,
-        features,
-    )
-    COMPAT_AVAILABLE = True
-except ImportError:
-    COMPAT_AVAILABLE = False
-    from contextlib import contextmanager
-    @contextmanager
-    def resilient_import(name, critical=False):
-        try:
-            yield
-        except Exception:
-            pass
-    @contextmanager
-    def suppress_warnings(*cats):
-        yield
+# =============================================================================
+# v93.0: Resilient Import System - Direct imports with granular error handling
+# =============================================================================
 
-# Try to import OpenTelemetry (optional dependency) with resilience
+import warnings
+
+# Suppress deprecation warnings during imports
+def _suppress_warnings():
+    """Context-free warning suppression for imports."""
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
+    warnings.filterwarnings('ignore', category=FutureWarning)
+
+_suppress_warnings()
+
+# Initialize all OpenTelemetry variables to None
 OTEL_AVAILABLE = False
 trace = None
 metrics = None
@@ -94,31 +87,131 @@ inject = None
 set_global_textmap = None
 TraceContextTextMapPropagator = None
 
-with resilient_import('opentelemetry'):
-    with suppress_warnings(DeprecationWarning, FutureWarning):
-        try:
-            from opentelemetry import trace, metrics
-            from opentelemetry.trace import Status, StatusCode, SpanKind
-            from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.sdk.trace.export import (
-                BatchSpanProcessor,
-                ConsoleSpanExporter,
-            )
-            from opentelemetry.sdk.resources import Resource
-            from opentelemetry.sdk.metrics import MeterProvider
-            from opentelemetry.sdk.metrics.export import (
-                PeriodicExportingMetricReader,
-                ConsoleMetricExporter,
-            )
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-            from opentelemetry.propagate import extract, inject, set_global_textmap
-            from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-            OTEL_AVAILABLE = True
-        except (ImportError, AttributeError) as e:
-            logger.debug(f"OpenTelemetry import failed: {e}")
+# v93.0: Try importing OpenTelemetry with explicit, granular error handling
+# This ensures we can debug exactly which import fails
+_otel_import_errors = []
 
-if not OTEL_AVAILABLE:
+try:
+    from opentelemetry import trace as _trace, metrics as _metrics
+    trace = _trace
+    metrics = _metrics
+    logger.debug("OpenTelemetry core (trace, metrics) imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry core: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry core (unexpected): {e}")
+
+try:
+    from opentelemetry.trace import Status as _Status, StatusCode as _StatusCode, SpanKind as _SpanKind
+    Status = _Status
+    StatusCode = _StatusCode
+    SpanKind = _SpanKind
+    logger.debug("OpenTelemetry trace types imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.trace types: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.trace types (unexpected): {e}")
+
+try:
+    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    TracerProvider = _TracerProvider
+    logger.debug("OpenTelemetry TracerProvider imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.trace: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.trace (unexpected): {e}")
+
+try:
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor as _BatchSpanProcessor,
+        ConsoleSpanExporter as _ConsoleSpanExporter,
+    )
+    BatchSpanProcessor = _BatchSpanProcessor
+    ConsoleSpanExporter = _ConsoleSpanExporter
+    logger.debug("OpenTelemetry span exporters imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.trace.export: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.trace.export (unexpected): {e}")
+
+try:
+    from opentelemetry.sdk.resources import Resource as _Resource
+    Resource = _Resource
+    logger.debug("OpenTelemetry Resource imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.resources: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.resources (unexpected): {e}")
+
+try:
+    from opentelemetry.sdk.metrics import MeterProvider as _MeterProvider
+    MeterProvider = _MeterProvider
+    logger.debug("OpenTelemetry MeterProvider imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.metrics: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.metrics (unexpected): {e}")
+
+try:
+    from opentelemetry.sdk.metrics.export import (
+        PeriodicExportingMetricReader as _PeriodicExportingMetricReader,
+        ConsoleMetricExporter as _ConsoleMetricExporter,
+    )
+    PeriodicExportingMetricReader = _PeriodicExportingMetricReader
+    ConsoleMetricExporter = _ConsoleMetricExporter
+    logger.debug("OpenTelemetry metric exporters imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.metrics.export: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.sdk.metrics.export (unexpected): {e}")
+
+# OTLP exporters are optional (require grpc)
+try:
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as _OTLPSpanExporter
+    OTLPSpanExporter = _OTLPSpanExporter
+    logger.debug("OpenTelemetry OTLP span exporter imported successfully")
+except ImportError as e:
+    logger.debug(f"OTLP span exporter not available (optional): {e}")
+except Exception as e:
+    logger.debug(f"OTLP span exporter error (optional): {e}")
+
+try:
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter as _OTLPMetricExporter
+    OTLPMetricExporter = _OTLPMetricExporter
+    logger.debug("OpenTelemetry OTLP metric exporter imported successfully")
+except ImportError as e:
+    logger.debug(f"OTLP metric exporter not available (optional): {e}")
+except Exception as e:
+    logger.debug(f"OTLP metric exporter error (optional): {e}")
+
+try:
+    from opentelemetry.propagate import extract as _extract, inject as _inject, set_global_textmap as _set_global_textmap
+    extract = _extract
+    inject = _inject
+    set_global_textmap = _set_global_textmap
+    logger.debug("OpenTelemetry propagation imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.propagate: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.propagate (unexpected): {e}")
+
+try:
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator as _TraceContextTextMapPropagator
+    TraceContextTextMapPropagator = _TraceContextTextMapPropagator
+    logger.debug("OpenTelemetry TraceContextTextMapPropagator imported successfully")
+except ImportError as e:
+    _otel_import_errors.append(f"opentelemetry.trace.propagation.tracecontext: {e}")
+except Exception as e:
+    _otel_import_errors.append(f"opentelemetry.trace.propagation.tracecontext (unexpected): {e}")
+
+# Determine if OpenTelemetry is available (requires core components)
+# Core components: trace, metrics, TracerProvider, Resource, BatchSpanProcessor, ConsoleSpanExporter
+if all([trace, metrics, TracerProvider, Resource, BatchSpanProcessor, ConsoleSpanExporter]):
+    OTEL_AVAILABLE = True
+    logger.debug("OpenTelemetry fully available")
+else:
+    if _otel_import_errors:
+        logger.debug(f"OpenTelemetry import errors: {_otel_import_errors}")
     logger.info(
         "OpenTelemetry not available - tracing disabled. "
         "Install with: pip install opentelemetry-api opentelemetry-sdk"

@@ -95,22 +95,47 @@ from typing import (
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# TRY IMPORTS
+# TRY IMPORTS (v93.0: Resilient with granular error handling)
 # =============================================================================
 
+LANGFUSE_AVAILABLE = False
+Langfuse = None
+observe = None
+langfuse_context = None
+
 try:
-    from langfuse import Langfuse
-    from langfuse.decorators import observe, langfuse_context
+    from langfuse import Langfuse as _Langfuse
+    Langfuse = _Langfuse
     LANGFUSE_AVAILABLE = True
-except ImportError:
-    LANGFUSE_AVAILABLE = False
+    logger.debug("Langfuse core imported successfully")
+except ImportError as e:
+    logger.debug(f"Langfuse core import failed: {e}")
+except Exception as e:
+    logger.debug(f"Langfuse core import error: {e}")
+
+# Try importing decorators separately (optional, may not exist in all versions)
+if LANGFUSE_AVAILABLE:
+    try:
+        from langfuse.decorators import observe as _observe, langfuse_context as _langfuse_context
+        observe = _observe
+        langfuse_context = _langfuse_context
+        logger.debug("Langfuse decorators imported successfully")
+    except ImportError:
+        # Decorators not available in this version - that's OK
+        logger.debug("Langfuse decorators not available (optional)")
+    except Exception as e:
+        logger.debug(f"Langfuse decorators import error: {e}")
+
+if not LANGFUSE_AVAILABLE:
     logger.info("Langfuse not available - install with: pip install langfuse")
 
+# aiohttp import
+AIOHTTP_AVAILABLE = False
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
 except ImportError:
-    AIOHTTP_AVAILABLE = False
+    logger.debug("aiohttp not available")
 
 # =============================================================================
 # CONFIGURATION
