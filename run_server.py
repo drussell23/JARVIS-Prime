@@ -26,6 +26,27 @@ Endpoints:
     GET  /metrics              - Cost tracking & inference metrics
 """
 
+# =============================================================================
+# v93.0: Suppress non-critical warnings BEFORE any imports
+# =============================================================================
+# This MUST be at the very top to catch warnings from imported libraries
+import warnings
+
+# urllib3 v2 complains about LibreSSL on macOS - safe to ignore
+warnings.filterwarnings('ignore', message='.*urllib3.*OpenSSL.*LibreSSL.*')
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='urllib3')
+
+# coremltools hasn't tested latest PyTorch - usually works fine
+warnings.filterwarnings('ignore', message='.*Torch version.*has not been tested.*')
+warnings.filterwarnings('ignore', message='.*coremltools.*')
+
+# Suppress general deprecation warnings from dependencies
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+
+# =============================================================================
+
 import argparse
 import asyncio
 import logging
