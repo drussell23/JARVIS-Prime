@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-JARVIS-Prime Server - Quick Start Script (v2.0 with Cross-Repo Bridge)
-=======================================================================
+JARVIS-Prime Server - Quick Start Script (v93.2 with Immediate HTTP Startup)
+=============================================================================
+
+CRITICAL FIX v93.2: HTTP server starts IMMEDIATELY, heavy initialization runs
+in background. This solves the 61.9s timeout issue where ML imports blocked
+the server from responding to health checks.
 
 Runs JARVIS-Prime with llama-cpp-python backend.
 Integrates with main JARVIS infrastructure for unified cost tracking.
@@ -22,40 +26,36 @@ Usage:
 Endpoints:
     POST /v1/chat/completions  - OpenAI-compatible chat
     POST /generate             - Simple text generation
-    GET  /health               - Health check
+    GET  /health               - Health check (IMMEDIATE response)
     GET  /metrics              - Cost tracking & inference metrics
 """
 
 # =============================================================================
 # v93.0: Suppress non-critical warnings BEFORE any imports
 # =============================================================================
-# This MUST be at the very top to catch warnings from imported libraries
 import warnings
 
-# urllib3 v2 complains about LibreSSL on macOS - safe to ignore
 warnings.filterwarnings('ignore', message='.*urllib3.*OpenSSL.*LibreSSL.*')
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='urllib3')
-
-# coremltools hasn't tested latest PyTorch - usually works fine
 warnings.filterwarnings('ignore', message='.*Torch version.*has not been tested.*')
 warnings.filterwarnings('ignore', message='.*coremltools.*')
-
-# Suppress general deprecation warnings from dependencies
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
 
 # =============================================================================
-
+# MINIMAL IMPORTS ONLY - Heavy imports happen in background_initialization
+# =============================================================================
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -66,12 +66,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("jarvis-prime")
-
-# Cross-repo bridge (lazy import)
-_bridge = None
-
-# Neural Orchestrator Core v100.0 (lazy import)
-_neural_orchestrator = None
 
 
 def parse_args():
@@ -98,363 +92,111 @@ def parse_args():
     return parser.parse_args()
 
 
-async def main():
-    global _bridge
-    args = parse_args()
+class StartupState:
+    """
+    v93.2: Track server startup state for immediate health checks.
 
-    if args.debug:
+    This allows the HTTP server to start IMMEDIATELY and respond to health
+    checks while heavy initialization (ML imports, model loading) happens
+    in the background.
+    """
+    def __init__(self):
+        self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
+        self.start_time = time.time()
+        self.error: Optional[str] = None
+        self.init_elapsed: Optional[float] = None
+        self.model_load_start: Optional[float] = None
+        self.model_load_elapsed: Optional[float] = None
+        self.model_path: Optional[str] = None
+        self.model_loaded: bool = False
+        self.details: Dict[str, Any] = {}
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status for health endpoint."""
+        elapsed = time.time() - self.start_time
+        result = {
+            "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
+            "phase": self.phase,
+            "startup_elapsed_seconds": round(elapsed, 1),
+            "pid": os.getpid(),
+            "model_loaded": self.model_loaded,
+            "model_path": self.model_path,
+        }
+        if self.init_elapsed:
+            result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
+        if self.model_load_elapsed:
+            result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
+        if self.error:
+            result["error"] = self.error
+        if self.details:
+            result["details"] = self.details
+        return result
+
+
+# =============================================================================
+# GLOBAL STATE - Populated during background initialization
+# =============================================================================
+_startup_state: Optional[StartupState] = None
+_bridge = None
+_neural_orchestrator = None
+_executor = None
+_agi_hub = None
+_trinity_initialized = False
+_trinity_record_inference = None
+_neural_routing_enabled = False
+_model_path: Optional[Path] = None
+_args = None
+
+
+async def main():
+    """
+    v93.2: Main entry point with IMMEDIATE HTTP server startup.
+
+    CRITICAL FIX: The HTTP server starts FIRST before any heavy imports
+    or model loading. This ensures health checks succeed immediately while
+    initialization happens in the background.
+
+    Startup sequence:
+    1. Parse args (instant)
+    2. Create minimal FastAPI app with health endpoint (instant)
+    3. Start uvicorn server (instant - server is now LISTENING)
+    4. FastAPI startup event triggers background_initialization()
+    5. Heavy imports, model loading, bridges all run in background
+    6. Health endpoint reports "starting" -> "ready" as init completes
+    """
+    global _startup_state, _args
+
+    _args = parse_args()
+
+    if _args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Import after parsing args to show help faster
+    # Initialize startup state FIRST
+    _startup_state = StartupState()
+
+    logger.info("[v93.2] JARVIS-Prime starting with IMMEDIATE HTTP server...")
+
+    # =========================================================================
+    # STEP 1: Import FastAPI (lightweight, instant)
+    # =========================================================================
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import StreamingResponse
         from pydantic import BaseModel
         import uvicorn
-        import json
-    except ImportError:
-        logger.error("Missing dependencies. Install with:")
-        logger.error("  pip install fastapi uvicorn pydantic")
+    except ImportError as e:
+        logger.error(f"Missing dependencies: {e}")
+        logger.error("Install with: pip install fastapi uvicorn pydantic")
         sys.exit(1)
 
-    try:
-        from jarvis_prime.core.llama_cpp_executor import LlamaCppExecutor, LlamaCppConfig
-    except ImportError as e:
-        logger.error(f"Import error: {e}")
-        logger.error("Make sure llama-cpp-python is installed:")
-        logger.error("  pip install llama-cpp-python")
-        sys.exit(1)
-
-    # Initialize cross-repo bridge for JARVIS integration
-    bridge_enabled = args.bridge_enabled and not args.no_bridge
-    if bridge_enabled:
-        try:
-            from jarvis_prime.core.cross_repo_bridge import (
-                initialize_bridge,
-                shutdown_bridge,
-                record_inference,
-                update_model_status,
-                get_cost_summary,
-            )
-            _bridge = await initialize_bridge(port=args.port)
-            logger.info("Cross-repo bridge initialized - connected to JARVIS infrastructure")
-        except Exception as e:
-            logger.warning(f"Cross-repo bridge initialization failed: {e}")
-            logger.warning("Continuing without cross-repo integration")
-            _bridge = None
-    else:
-        logger.info("Cross-repo bridge disabled")
-        _bridge = None
-
-    # v72.0: Initialize PROJECT TRINITY connection for distributed architecture
-    # This enables JARVIS Body to detect J-Prime is online via heartbeat files
-    # v73.0: Added inference health tracking integration
-    trinity_initialized = False
-    trinity_record_inference = None  # v73.0: Function reference for inference health tracking
-    try:
-        from jarvis_prime.core.trinity_bridge import (
-            initialize_trinity,
-            shutdown_trinity,
-            update_model_status as trinity_update_model_status,
-            record_inference as _trinity_record_inference,  # v73.0
-            TRINITY_ENABLED,
-        )
-        trinity_record_inference = _trinity_record_inference  # Store for endpoint use
-        if TRINITY_ENABLED:
-            trinity_initialized = await initialize_trinity(port=args.port)
-            if trinity_initialized:
-                logger.info("PROJECT TRINITY: J-Prime (Mind) connected to Trinity network")
-                logger.info("PROJECT TRINITY: Inference health tracking enabled (v73.0)")
-            else:
-                logger.warning("PROJECT TRINITY: Initialization returned False")
-        else:
-            logger.info("PROJECT TRINITY: Disabled (TRINITY_ENABLED=false)")
-    except ImportError as e:
-        logger.warning(f"PROJECT TRINITY: Module not available ({e})")
-    except Exception as e:
-        logger.warning(f"PROJECT TRINITY: Initialization failed ({e})")
-
-    # v77.0: Initialize AGI Integration Hub
-    # Connects all AGI subsystems: Orchestrator, Reasoning, Learning, MultiModal, Hardware
-    agi_hub = None
-    agi_inference = None
-    try:
-        from jarvis_prime.core.agi_integration import (
-            AGIIntegrationHub,
-            AGIHubConfig,
-            get_agi_hub,
-            shutdown_agi_hub,
-            AGIEnhancedInference,
-        )
-
-        agi_config = AGIHubConfig(
-            enable_orchestrator=True,
-            enable_reasoning=True,
-            enable_learning=True,
-            enable_multimodal=True,
-            enable_hardware_optimization=True,
-            enable_auto_reasoning=True,
-            enable_experience_recording=True,
-        )
-
-        agi_hub = await get_agi_hub(agi_config)
-        logger.info("AGI v77.0: Integration Hub initialized")
-        logger.info(f"  - Orchestrator: {agi_hub._subsystem_status.get('ORCHESTRATOR', {})}")
-        logger.info(f"  - Reasoning Engine: Active")
-        logger.info(f"  - Continuous Learning: Active")
-        logger.info(f"  - MultiModal Fusion: Active")
-
-    except ImportError as e:
-        logger.warning(f"AGI Integration Hub not available: {e}")
-    except Exception as e:
-        logger.warning(f"AGI Integration Hub initialization failed: {e}")
-
-    # v100.0: Initialize Neural Orchestrator Core - Unified Intelligent Routing
-    global _neural_orchestrator
-    neural_routing_enabled = False
-    try:
-        from jarvis_prime.core.neural_orchestrator_core import (
-            NeuralOrchestratorCore,
-            DynamicConfig as NeuralConfig,
-            neural_route,
-            get_neural_orchestrator,
-            shutdown_neural_orchestrator,
-            RoutingTier,
-        )
-
-        neural_config = NeuralConfig.from_env_and_yaml()
-        _neural_orchestrator = await get_neural_orchestrator(neural_config)
-        neural_routing_enabled = True
-        logger.info("Neural Orchestrator Core v100.0: Initialized")
-        logger.info("  - Unified Routing: Active")
-        logger.info("  - Task Classification: Active")
-        logger.info("  - Memory Pressure Monitor: Active")
-        logger.info("  - Sticky Routing: Active")
-        logger.info("  - Request Buffering: Active")
-        logger.info("  - Circuit Breakers: Active")
-    except ImportError as e:
-        logger.warning(f"Neural Orchestrator not available: {e}")
-    except Exception as e:
-        logger.warning(f"Neural Orchestrator initialization failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # Check model exists
-    model_path = Path(args.model)
-    if not model_path.exists():
-        # Try relative to script
-        model_path = Path(__file__).parent / args.model
-
-    # v73.0: Auto-ensure model exists - download if missing
-    # Priority: 1. GCS (cloud deploy), 2. HuggingFace (local dev), 3. Skip (health-only mode)
-    gcs_model_uri = os.getenv("MODEL_GCS_URI")
-    auto_download_model = os.getenv("AUTO_DOWNLOAD_MODEL", "true").lower() == "true"
-
-    if not model_path.exists() and gcs_model_uri:
-        logger.info(f"Model not found locally, downloading from GCS: {gcs_model_uri}")
-        try:
-            # Use Python GCS client (more reliable than gsutil in containers)
-            from google.cloud import storage
-            import re
-
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Parse GCS URI: gs://bucket/path/to/file.gguf
-            match = re.match(r"gs://([^/]+)/(.+)", gcs_model_uri)
-            if match:
-                bucket_name, blob_path = match.groups()
-                logger.info(f"Downloading from bucket={bucket_name}, path={blob_path}")
-
-                client = storage.Client()
-                bucket = client.bucket(bucket_name)
-                blob = bucket.blob(blob_path)
-
-                # Check if blob exists and get metadata
-                if not blob.exists():
-                    logger.error(f"Model not found in GCS: {gcs_model_uri}")
-                else:
-                    # Reload to get size metadata
-                    blob.reload()
-                    size_mb = blob.size / 1024 / 1024 if blob.size else 0
-                    logger.info(f"Downloading {size_mb:.1f}MB model from GCS...")
-
-                    # Download with timeout for large models
-                    blob.download_to_filename(str(model_path))
-
-                    # Verify download
-                    if model_path.exists():
-                        actual_size_mb = model_path.stat().st_size / 1024 / 1024
-                        logger.info(f"Model downloaded successfully: {actual_size_mb:.1f}MB to {model_path}")
-                    else:
-                        logger.error(f"Download completed but model file not found at {model_path}")
-            else:
-                logger.warning(f"Invalid GCS URI format: {gcs_model_uri}")
-
-        except ImportError:
-            # Fallback to gsutil if google-cloud-storage not installed
-            logger.info("GCS Python client not available, trying gsutil...")
-            try:
-                import subprocess
-                subprocess.run(
-                    ["gsutil", "cp", gcs_model_uri, str(model_path)],
-                    check=True,
-                    capture_output=True,
-                )
-                logger.info(f"Model downloaded via gsutil to: {model_path}")
-            except Exception as e:
-                logger.warning(f"gsutil download failed: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to download model from GCS: {e}")
-
-    # v73.0: Auto-download from HuggingFace if model still missing and auto-download enabled
-    if not model_path.exists() and auto_download_model:
-        logger.info("Model not found, attempting auto-download from HuggingFace...")
-        try:
-            from jarvis_prime.docker.model_downloader import (
-                download_model,
-                recommend_model,
-                MODEL_CATALOG,
-            )
-
-            # Auto-select best model for available memory (default: TinyLlama for quick start)
-            default_model = os.getenv("DEFAULT_MODEL", "tinyllama-chat")
-
-            if default_model not in MODEL_CATALOG:
-                # Try to recommend based on memory
-                recommended = recommend_model(use_case="balanced", max_memory_gb=8.0)
-                if recommended:
-                    default_model = recommended
-                else:
-                    default_model = "tinyllama-chat"  # Fallback
-
-            logger.info(f"Auto-downloading model: {default_model}")
-            print(f"  📥 Downloading {default_model} from HuggingFace...")
-
-            # Download model (this may take a while for first run)
-            models_dir = Path(__file__).parent / "models"
-            downloaded_path = await download_model(
-                model_key=default_model,
-                models_dir=str(models_dir),
-                set_active=True,
-            )
-
-            # Update model_path to use downloaded model
-            model_path = models_dir / "current.gguf"
-            if model_path.exists():
-                logger.info(f"Model auto-downloaded: {downloaded_path}")
-                print(f"  ✅ Model downloaded successfully: {default_model}")
-            else:
-                logger.warning(f"Auto-download completed but model not at expected path")
-
-        except ImportError as e:
-            logger.warning(f"HuggingFace downloader not available: {e}")
-            logger.warning("Install with: pip install huggingface-hub tqdm")
-        except Exception as e:
-            logger.warning(f"Auto-download from HuggingFace failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # v80.0: Apply hardware optimizations with auto-detection
-    optimized_gpu_layers = args.gpu_layers
-    optimized_threads = args.threads
-    optimized_ctx_size = args.ctx_size
-
-    # Try AGI Hub hardware optimizer first (v77.0)
-    if agi_hub and agi_hub.hardware_optimizer:
-        try:
-            hw_opt = agi_hub.hardware_optimizer
-            recommendations = hw_opt.get_recommendations()
-
-            if recommendations:
-                # Use optimized settings from Apple Silicon analyzer
-                if recommendations.get("use_mps", False):
-                    optimized_gpu_layers = -1  # All layers on GPU
-                    logger.info("Apple Silicon: MPS acceleration enabled")
-
-                if "optimal_threads" in recommendations:
-                    optimized_threads = recommendations["optimal_threads"]
-                    logger.info(f"Apple Silicon: Using {optimized_threads} threads")
-
-                if "optimal_batch_size" in recommendations:
-                    # Adjust context based on memory
-                    logger.info(f"Apple Silicon: Batch size optimized for UMA")
-
-                logger.info(f"Apple Silicon: Generation {recommendations.get('generation', 'unknown')}")
-
-        except Exception as e:
-            logger.warning(f"Apple Silicon optimization failed: {e}")
-
-    # v80.0: Use new HardwareDetector as fallback
-    else:
-        try:
-            from jarvis_prime.core.llama_cpp_executor import HardwareDetector, HardwareBackend
-
-            hw = HardwareDetector.detect()
-            logger.info(f"Hardware detected: {hw.backend.name}")
-            logger.info(f"  GPU: {hw.gpu_name or 'None'}")
-            logger.info(f"  Memory: {hw.total_memory_gb:.1f} GB")
-
-            if hw.backend == HardwareBackend.METAL:
-                optimized_gpu_layers = -1  # All layers to Metal GPU
-                optimized_threads = hw.performance_cores or args.threads
-                logger.info(f"Metal GPU: Enabled (all layers offloaded)")
-                logger.info(f"Threads: {optimized_threads} (performance cores)")
-            elif hw.backend == HardwareBackend.CUDA:
-                optimized_gpu_layers = -1
-                logger.info("CUDA GPU: Enabled")
-
-        except Exception as e:
-            logger.warning(f"Hardware auto-detection failed: {e}")
-
-    # Create executor with optimized config
-    config = LlamaCppConfig(
-        n_ctx=optimized_ctx_size,
-        n_threads=optimized_threads,
-        n_gpu_layers=optimized_gpu_layers,
-        verbose=args.debug,
-        flash_attn=True,  # v80.0: Enable flash attention
-        cache_prompt=True,  # v80.0: Cache prompts for faster re-generation
-    )
-    executor = LlamaCppExecutor(config)
-
-    # Load model if available
-    if model_path.exists():
-        logger.info(f"Loading model: {model_path}")
-        start = time.time()
-        await executor.load(model_path)
-        load_time = time.time() - start
-        logger.info(f"Model loaded in {load_time:.2f}s")
-
-        # Notify bridge of model status
-        if _bridge:
-            try:
-                from jarvis_prime.core.cross_repo_bridge import update_model_status
-                update_model_status(loaded=True, model_path=str(model_path))
-                await _bridge.notify_jarvis("model_loaded", {
-                    "model_path": str(model_path),
-                    "load_time_seconds": load_time,
-                })
-            except Exception as e:
-                logger.warning(f"Failed to notify bridge of model status: {e}")
-    else:
-        logger.warning(f"Model not found: {args.model}")
-        logger.warning("Server will start without a model (health checks only)")
-        logger.warning("Set MODEL_GCS_URI env var or mount a model to enable inference")
-
-        # Notify bridge of no model
-        if _bridge:
-            try:
-                from jarvis_prime.core.cross_repo_bridge import update_model_status
-                update_model_status(loaded=False, model_path="")
-            except Exception as e:
-                pass  # Silent fail for missing model notification
-
-    # Create FastAPI app
+    # =========================================================================
+    # STEP 2: Create MINIMAL FastAPI app that responds to health IMMEDIATELY
+    # =========================================================================
     app = FastAPI(
         title="JARVIS-Prime",
-        description="Tier-0 Muscle Memory Brain - OpenAI-compatible API",
-        version="1.0.0",
+        description="Tier-0 Muscle Memory Brain - OpenAI-compatible API (v93.2 Immediate Start)",
+        version="93.2.0",
     )
 
     app.add_middleware(
@@ -465,7 +207,41 @@ async def main():
         allow_headers=["*"],
     )
 
-    # Pydantic models
+    # =========================================================================
+    # IMMEDIATE HEALTH ENDPOINT - Responds BEFORE initialization completes
+    # =========================================================================
+    @app.get("/health")
+    async def health_check():
+        """
+        v93.2: Immediate health endpoint.
+
+        Returns status IMMEDIATELY - even during heavy initialization.
+        This is the key fix for the 61.9s timeout issue.
+
+        Status meanings:
+        - "starting": Server is up, initialization in progress
+        - "healthy": Fully initialized and ready for inference
+        - "error": Initialization failed
+        """
+        if _startup_state:
+            status = _startup_state.get_status()
+
+            # Add runtime component status once initialized
+            if _startup_state.phase == "ready":
+                status["bridge_enabled"] = _bridge is not None
+                status["trinity_enabled"] = _trinity_initialized
+                status["agi_enabled"] = _agi_hub is not None
+                status["neural_routing_enabled"] = _neural_routing_enabled
+                status["ready_for_inference"] = _executor is not None and _executor.is_loaded() if hasattr(_executor, 'is_loaded') else False
+
+            return status
+
+        return {"status": "starting", "phase": "pre-init"}
+
+    # =========================================================================
+    # PLACEHOLDER ENDPOINTS - Return 503 until initialization completes
+    # =========================================================================
+
     class Message(BaseModel):
         role: str
         content: str
@@ -482,20 +258,37 @@ async def main():
         max_tokens: int = 512
         temperature: float = 0.7
 
-    # Endpoints
+    def _check_ready():
+        """Check if server is ready for inference requests."""
+        if _startup_state and _startup_state.phase != "ready":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Server still initializing",
+                    "phase": _startup_state.phase if _startup_state else "unknown",
+                    "status": _startup_state.get_status() if _startup_state else {}
+                }
+            )
+        if _executor is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "Executor not initialized"}
+            )
+        if hasattr(_executor, 'is_loaded') and not _executor.is_loaded():
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "Model not loaded"}
+            )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         """OpenAI-compatible chat completions with unified intelligent routing (v100.0)."""
-        if not executor.is_loaded():
-            raise HTTPException(
-                status_code=503,
-                detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
-            )
+        _check_ready()
 
         # Format messages
         from jarvis_prime.core.model_manager import ChatMessage
         messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
-        prompt = executor.format_messages(messages)
+        prompt = _executor.format_messages(messages)
         prompt_tokens = len(prompt.split())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created = int(time.time())
@@ -503,13 +296,11 @@ async def main():
         # v100.0: Neural Orchestrator Routing Decision
         routing_result = None
         routing_metadata = {}
-        if _neural_orchestrator and neural_routing_enabled:
+        if _neural_orchestrator and _neural_routing_enabled:
             try:
-                # Extract last user message for classification
                 user_messages = [m.content for m in request.messages if m.role == "user"]
                 classification_prompt = user_messages[-1] if user_messages else prompt
 
-                # Get routing decision
                 routing_result = await _neural_orchestrator.route(
                     prompt=classification_prompt,
                     context={
@@ -528,7 +319,6 @@ async def main():
                     "routing_latency_ms": routing_result.latency_ms if routing_result else 0.0,
                 }
 
-                # Log routing decision
                 logger.debug(
                     f"Neural Routing: {completion_id} -> {routing_metadata['tier']} "
                     f"(confidence={routing_metadata['confidence']:.2f}, "
@@ -540,12 +330,11 @@ async def main():
         # v74.0: Streaming Response (SSE format)
         if request.stream:
             async def stream_generator():
-                """Generate SSE stream in OpenAI-compatible format."""
                 start = time.time()
                 token_count = 0
 
                 try:
-                    async for token in executor.generate_stream(
+                    async for token in _executor.generate_stream(
                         prompt=prompt,
                         max_tokens=request.max_tokens,
                         temperature=request.temperature,
@@ -564,7 +353,6 @@ async def main():
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
 
-                    # Final chunk with finish_reason
                     final_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -579,33 +367,12 @@ async def main():
                     yield f"data: {json.dumps(final_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
 
-                    # Record metrics after streaming completes
                     latency_ms = (time.time() - start) * 1000
-
-                    if _bridge:
-                        try:
-                            from jarvis_prime.core.cross_repo_bridge import record_inference
-                            record_inference(
-                                tokens_in=prompt_tokens,
-                                tokens_out=token_count,
-                                latency_ms=latency_ms,
-                            )
-                        except Exception:
-                            pass
-
-                    if trinity_record_inference:
-                        try:
-                            trinity_record_inference(latency_ms=latency_ms, success=True)
-                        except Exception:
-                            pass
+                    _record_inference_metrics(prompt_tokens, token_count, latency_ms, True)
 
                 except Exception as e:
                     logger.error(f"Streaming error: {e}")
-                    if trinity_record_inference:
-                        try:
-                            trinity_record_inference(latency_ms=0, success=False)
-                        except Exception:
-                            pass
+                    _record_inference_metrics(0, 0, 0, False)
                     error_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -626,48 +393,25 @@ async def main():
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # Disable nginx buffering
+                    "X-Accel-Buffering": "no",
                 },
             )
 
-        # Non-streaming response (original behavior)
+        # Non-streaming response
         try:
             start = time.time()
 
-            # Generate
-            response = await executor.generate(
+            response = await _executor.generate(
                 prompt=prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
             )
 
-            latency = time.time() - start
-            latency_ms = latency * 1000
-
-            # Estimate tokens
+            latency_ms = (time.time() - start) * 1000
             completion_tokens = len(response.split())
 
-            # Record inference metrics for cost tracking
-            if _bridge:
-                try:
-                    from jarvis_prime.core.cross_repo_bridge import record_inference
-                    record_inference(
-                        tokens_in=prompt_tokens,
-                        tokens_out=completion_tokens,
-                        latency_ms=latency_ms,
-                    )
-                except Exception:
-                    pass  # Don't fail inference for metrics
+            _record_inference_metrics(prompt_tokens, completion_tokens, latency_ms, True)
 
-            # v73.0: Record inference health for Trinity heartbeat
-            # This enables JARVIS Body to detect "Silent Brain Freeze"
-            if trinity_record_inference:
-                try:
-                    trinity_record_inference(latency_ms=latency_ms, success=True)
-                except Exception:
-                    pass  # Don't fail inference for metrics
-
-            # v100.0: Record circuit breaker success
             if _neural_orchestrator and routing_result:
                 try:
                     await _neural_orchestrator.record_circuit_success(routing_result.tier.name)
@@ -690,17 +434,11 @@ async def main():
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
                 "x_latency_ms": latency_ms,
-                "x_routing": routing_metadata,  # v100.0: Include routing decision
+                "x_routing": routing_metadata,
             }
         except Exception as e:
             logger.error(f"Chat error: {e}")
-            # v73.0: Record failed inference
-            if trinity_record_inference:
-                try:
-                    trinity_record_inference(latency_ms=0, success=False)
-                except Exception:
-                    pass
-            # v100.0: Record circuit breaker failure
+            _record_inference_metrics(0, 0, 0, False)
             if _neural_orchestrator and routing_result:
                 try:
                     await _neural_orchestrator.record_circuit_failure(routing_result.tier.name)
@@ -711,17 +449,13 @@ async def main():
     @app.post("/generate")
     async def generate(request: GenerateRequest):
         """Simple text generation with unified intelligent routing (v100.0)."""
-        if not executor.is_loaded():
-            raise HTTPException(
-                status_code=503,
-                detail="Model not loaded. Set MODEL_GCS_URI or mount model to /app/models/current.gguf"
-            )
+        _check_ready()
 
-        # v100.0: Neural Orchestrator Routing Decision
         generate_id = f"gen-{uuid.uuid4().hex[:8]}"
         routing_result = None
         routing_metadata = {}
-        if _neural_orchestrator and neural_routing_enabled:
+
+        if _neural_orchestrator and _neural_routing_enabled:
             try:
                 routing_result = await _neural_orchestrator.route(
                     prompt=request.prompt,
@@ -739,38 +473,18 @@ async def main():
         try:
             start = time.time()
 
-            response = await executor.generate(
+            response = await _executor.generate(
                 prompt=request.prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
             )
 
             latency_ms = (time.time() - start) * 1000
-
-            # Estimate tokens
             prompt_tokens = len(request.prompt.split())
             completion_tokens = len(response.split())
 
-            # Record inference metrics
-            if _bridge:
-                try:
-                    from jarvis_prime.core.cross_repo_bridge import record_inference
-                    record_inference(
-                        tokens_in=prompt_tokens,
-                        tokens_out=completion_tokens,
-                        latency_ms=latency_ms,
-                    )
-                except Exception:
-                    pass  # Don't fail inference for metrics
+            _record_inference_metrics(prompt_tokens, completion_tokens, latency_ms, True)
 
-            # v73.0: Record inference health for Trinity heartbeat
-            if trinity_record_inference:
-                try:
-                    trinity_record_inference(latency_ms=latency_ms, success=True)
-                except Exception:
-                    pass
-
-            # v100.0: Record circuit breaker success
             if _neural_orchestrator and routing_result:
                 try:
                     await _neural_orchestrator.record_circuit_success(routing_result.tier.name)
@@ -780,57 +494,17 @@ async def main():
             return {
                 "text": response,
                 "latency_ms": latency_ms,
-                "x_routing": routing_metadata,  # v100.0: Include routing decision
+                "x_routing": routing_metadata,
             }
         except Exception as e:
             logger.error(f"Generate error: {e}")
-            # v73.0: Record failed inference
-            if trinity_record_inference:
-                try:
-                    trinity_record_inference(latency_ms=0, success=False)
-                except Exception:
-                    pass
-            # v100.0: Record circuit breaker failure
+            _record_inference_metrics(0, 0, 0, False)
             if _neural_orchestrator and routing_result:
                 try:
                     await _neural_orchestrator.record_circuit_failure(routing_result.tier.name)
                 except Exception:
                     pass
             raise HTTPException(status_code=500, detail=str(e))
-
-    @app.get("/health")
-    async def health():
-        """Health check - always returns healthy for Cloud Run."""
-        stats = executor.get_statistics() if executor.is_loaded() else {}
-
-        # Include bridge connection status
-        bridge_info = {}
-        if _bridge:
-            bridge_info = {
-                "jarvis_connected": _bridge.state.connected_to_jarvis,
-                "jarvis_session_id": _bridge.state.jarvis_session_id or None,
-            }
-
-        # v73.0: Include inference health from Trinity bridge
-        inference_health = {}
-        if trinity_initialized:
-            try:
-                from jarvis_prime.core.trinity_bridge import get_inference_health
-                inference_health = get_inference_health()
-            except Exception:
-                pass
-
-        return {
-            "status": "healthy",
-            "model_loaded": executor.is_loaded(),
-            "model_path": str(model_path) if model_path.exists() else None,
-            "ready_for_inference": executor.is_loaded(),
-            "bridge_enabled": _bridge is not None,
-            "trinity_enabled": trinity_initialized,
-            "inference_health": inference_health,  # v73.0
-            **bridge_info,
-            **stats,
-        }
 
     @app.get("/metrics")
     async def metrics():
@@ -847,99 +521,84 @@ async def main():
                     "connected_to_jarvis": _bridge.state.connected_to_jarvis,
                 }
             except Exception as e:
-                return {
-                    "status": "error",
-                    "error": str(e),
-                }
+                return {"status": "error", "error": str(e)}
         else:
-            return {
-                "status": "disabled",
-                "message": "Cross-repo bridge not enabled",
-            }
+            return {"status": "disabled", "message": "Cross-repo bridge not enabled"}
 
     @app.get("/v1/models")
     async def list_models():
         """List available models."""
+        model_status = "loading"
+        if _startup_state and _startup_state.phase == "ready":
+            model_status = "ready" if (_executor and hasattr(_executor, 'is_loaded') and _executor.is_loaded()) else "not_loaded"
+
         return {
             "object": "list",
             "data": [{
                 "id": "jarvis-prime",
                 "object": "model",
                 "owned_by": "jarvis",
+                "status": model_status,
             }],
         }
 
-    # ==========================================================================
+    # =========================================================================
     # MODEL HOT-RELOAD ENDPOINT - Reactor-Core Integration
-    # ==========================================================================
-    # Called by Reactor-Core after training to hot-swap the model without restart.
-
+    # =========================================================================
     class ModelReloadRequest(BaseModel):
-        """Request to reload model from Reactor-Core."""
         model_path: str
         model_version: str = "unknown"
         model_id: str = ""
 
     @app.post("/api/v1/models/reload")
     async def reload_model(request: ModelReloadRequest):
-        """
-        Hot-reload model from Reactor-Core.
+        """Hot-reload model from Reactor-Core."""
+        global _model_path
 
-        This endpoint is called after Reactor-Core completes training and
-        deploys a new model. It allows JARVIS-Prime to reload without restart.
-        """
-        nonlocal model_path
-
+        _check_ready()
         logger.info(f"Model reload requested: {request.model_path} (v{request.model_version})")
 
         try:
             new_model_path = Path(request.model_path)
 
             if not new_model_path.exists():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Model file not found: {request.model_path}"
-                )
+                raise HTTPException(status_code=404, detail=f"Model file not found: {request.model_path}")
 
-            # Unload current model
-            if executor.is_loaded():
+            if _executor.is_loaded():
                 logger.info("Unloading current model...")
-                await executor.close()
+                await _executor.close()
 
-            # Load new model
             logger.info(f"Loading new model: {new_model_path}")
             start = time.time()
-            await executor.load(new_model_path)
+            await _executor.load(new_model_path)
             load_time = time.time() - start
 
-            # Update model_path reference
-            model_path = new_model_path
+            _model_path = new_model_path
 
-            # Notify bridges
             if _bridge:
                 try:
                     from jarvis_prime.core.cross_repo_bridge import update_model_status
-                    update_model_status(loaded=True, model_path=str(model_path))
+                    update_model_status(loaded=True, model_path=str(_model_path))
                     await _bridge.notify_jarvis("model_reloaded", {
-                        "model_path": str(model_path),
+                        "model_path": str(_model_path),
                         "model_version": request.model_version,
                         "load_time_seconds": load_time,
                     })
                 except Exception as e:
                     logger.warning(f"Failed to notify bridge: {e}")
 
-            if trinity_initialized:
+            if _trinity_initialized:
                 try:
                     from jarvis_prime.core.trinity_bridge import update_model_status as trinity_update
-                    trinity_update(loaded=True, model_path=str(model_path))
+                    trinity_update(loaded=True, model_path=str(_model_path))
                 except Exception as e:
                     logger.warning(f"Failed to notify Trinity: {e}")
 
-            logger.info(f"Model reloaded in {load_time:.2f}s: {model_path}")
+            logger.info(f"Model reloaded in {load_time:.2f}s: {_model_path}")
 
             return {
                 "status": "success",
-                "model_path": str(model_path),
+                "model_path": str(_model_path),
                 "model_version": request.model_version,
                 "load_time_seconds": load_time,
             }
@@ -950,30 +609,25 @@ async def main():
             logger.error(f"Model reload failed: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # ==========================================================================
-    # AGI v77.0 ENDPOINTS - Advanced Cognitive Capabilities
-    # ==========================================================================
-
+    # =========================================================================
+    # AGI v77.0 ENDPOINTS
+    # =========================================================================
     class AGIReasonRequest(BaseModel):
-        """Request for AGI reasoning."""
         query: str
-        strategy: str = "chain_of_thought"  # chain_of_thought, tree_of_thoughts, self_reflection
+        strategy: str = "chain_of_thought"
         context: dict = {}
 
     class AGIPlanRequest(BaseModel):
-        """Request for AGI action planning."""
         goal: str
         context: dict = {}
         constraints: List[str] = []
 
     class AGIFeedbackRequest(BaseModel):
-        """Request to record learning feedback."""
         experience_id: str
-        score: float  # -1.0 to 1.0
+        score: float
         comment: Optional[str] = None
 
     class AGIProcessRequest(BaseModel):
-        """Request for full AGI processing pipeline."""
         content: str
         modalities: List[str] = ["text"]
         context: dict = {}
@@ -982,21 +636,12 @@ async def main():
 
     @app.post("/agi/reason")
     async def agi_reason(request: AGIReasonRequest):
-        """
-        Execute advanced reasoning on a query.
-
-        Strategies:
-        - chain_of_thought: Sequential step-by-step reasoning
-        - tree_of_thoughts: Parallel exploration of multiple paths
-        - self_reflection: Meta-cognitive analysis and correction
-        - hypothesis_test: Evidence-based hypothesis testing
-        """
-        if not agi_hub:
+        if not _agi_hub:
             raise HTTPException(status_code=503, detail="AGI Hub not initialized")
 
         try:
             start = time.time()
-            result = await agi_hub.reason(
+            result = await _agi_hub.reason(
                 query=request.query,
                 strategy=request.strategy,
                 context=request.context,
@@ -1018,21 +663,12 @@ async def main():
 
     @app.post("/agi/plan")
     async def agi_plan(request: AGIPlanRequest):
-        """
-        Generate an action plan for a goal.
-
-        Uses ActionModel and GoalInference from AGI Orchestrator
-        to create executable action sequences.
-        """
-        if not agi_hub:
+        if not _agi_hub:
             raise HTTPException(status_code=503, detail="AGI Hub not initialized")
 
         try:
             start = time.time()
-            result = await agi_hub.plan(
-                goal=request.goal,
-                context=request.context,
-            )
+            result = await _agi_hub.plan(goal=request.goal, context=request.context)
             latency_ms = (time.time() - start) * 1000
 
             return {
@@ -1047,29 +683,16 @@ async def main():
 
     @app.post("/agi/process")
     async def agi_process(request: AGIProcessRequest):
-        """
-        Full AGI processing pipeline.
-
-        1. Analyzes request complexity
-        2. Applies appropriate reasoning strategy
-        3. Coordinates multiple AGI models
-        4. Records experience for learning
-        """
-        if not agi_hub:
+        if not _agi_hub:
             raise HTTPException(status_code=503, detail="AGI Hub not initialized")
 
         try:
-            # Create inference function wrapper
             async def inference_fn(prompt: str, **kwargs):
-                if executor.is_loaded():
-                    return await executor.generate(
-                        prompt=prompt,
-                        max_tokens=512,
-                        temperature=0.7,
-                    )
-                return prompt  # Passthrough if no model
+                if _executor and hasattr(_executor, 'is_loaded') and _executor.is_loaded():
+                    return await _executor.generate(prompt=prompt, max_tokens=512, temperature=0.7)
+                return prompt
 
-            result = await agi_hub.process(
+            result = await _agi_hub.process(
                 content=request.content,
                 modalities=request.modalities,
                 context=request.context,
@@ -1092,65 +715,40 @@ async def main():
 
     @app.post("/agi/feedback")
     async def agi_feedback(request: AGIFeedbackRequest):
-        """
-        Record feedback for continuous learning.
-
-        Feedback is used to improve future responses through
-        experience replay and online fine-tuning.
-        """
-        if not agi_hub:
+        if not _agi_hub:
             raise HTTPException(status_code=503, detail="AGI Hub not initialized")
 
         try:
-            success = await agi_hub.record_feedback(
+            success = await _agi_hub.record_feedback(
                 experience_id=request.experience_id,
                 score=request.score,
                 comment=request.comment,
             )
-
-            return {
-                "status": "success" if success else "failed",
-                "experience_id": request.experience_id,
-                "score": request.score,
-            }
+            return {"status": "success" if success else "failed", "experience_id": request.experience_id, "score": request.score}
         except Exception as e:
             logger.error(f"AGI feedback error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post("/agi/learning/trigger")
     async def agi_learning_trigger(force: bool = False):
-        """
-        Trigger a learning update.
-
-        Processes accumulated experiences to update model weights
-        using EWC (Elastic Weight Consolidation) to prevent forgetting.
-        """
-        if not agi_hub:
+        if not _agi_hub:
             raise HTTPException(status_code=503, detail="AGI Hub not initialized")
 
         try:
-            result = await agi_hub.trigger_learning_update(force=force)
-            return {
-                "status": "success",
-                "result": result,
-            }
+            result = await _agi_hub.trigger_learning_update(force=force)
+            return {"status": "success", "result": result}
         except Exception as e:
             logger.error(f"AGI learning trigger error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/agi/status")
     async def agi_status():
-        """Get AGI subsystem status and metrics."""
-        if not agi_hub:
-            return {
-                "status": "not_initialized",
-                "message": "AGI Hub not available",
-            }
+        if not _agi_hub:
+            return {"status": "not_initialized", "message": "AGI Hub not available"}
 
         try:
-            status = agi_hub.get_status()
-            health = await agi_hub.health_check()
-
+            status = _agi_hub.get_status()
+            health = await _agi_hub.health_check()
             return {
                 "status": "ok",
                 "initialized": status["initialized"],
@@ -1160,100 +758,58 @@ async def main():
             }
         except Exception as e:
             logger.error(f"AGI status error: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
     @app.get("/agi/learning/stats")
     async def agi_learning_stats():
-        """Get continuous learning statistics."""
-        if not agi_hub or not agi_hub.learning_engine:
-            return {
-                "status": "not_available",
-                "message": "Learning engine not initialized",
-            }
+        if not _agi_hub or not _agi_hub.learning_engine:
+            return {"status": "not_available", "message": "Learning engine not initialized"}
 
         try:
-            stats = agi_hub.learning_engine.get_statistics()
-            return {
-                "status": "ok",
-                "statistics": stats,
-            }
+            stats = _agi_hub.learning_engine.get_statistics()
+            return {"status": "ok", "statistics": stats}
         except Exception as e:
             logger.error(f"AGI learning stats error: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
-    # ==========================================================================
-    # NEURAL ORCHESTRATOR v100.0 ENDPOINTS - Unified Intelligent Routing
-    # ==========================================================================
-
+    # =========================================================================
+    # NEURAL ORCHESTRATOR v100.0 ENDPOINTS
+    # =========================================================================
     class NeuralRouteRequest(BaseModel):
-        """Request for neural routing decision."""
         prompt: str
         context: dict = {}
 
     @app.get("/neural-orchestrator/health")
     async def neural_orchestrator_health():
-        """Get Neural Orchestrator health status."""
-        if not _neural_orchestrator or not neural_routing_enabled:
-            return {
-                "status": "not_initialized",
-                "message": "Neural Orchestrator not available",
-            }
+        if not _neural_orchestrator or not _neural_routing_enabled:
+            return {"status": "not_initialized", "message": "Neural Orchestrator not available"}
 
         try:
             health = _neural_orchestrator.get_health_status()
-            return {
-                "status": "ok",
-                **health,
-            }
+            return {"status": "ok", **health}
         except Exception as e:
             logger.error(f"Neural Orchestrator health error: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
     @app.get("/neural-orchestrator/stats")
     async def neural_orchestrator_stats():
-        """Get comprehensive Neural Orchestrator statistics."""
-        if not _neural_orchestrator or not neural_routing_enabled:
-            return {
-                "status": "not_initialized",
-                "message": "Neural Orchestrator not available",
-            }
+        if not _neural_orchestrator or not _neural_routing_enabled:
+            return {"status": "not_initialized", "message": "Neural Orchestrator not available"}
 
         try:
             stats = _neural_orchestrator.get_comprehensive_stats()
-            return {
-                "status": "ok",
-                **stats,
-            }
+            return {"status": "ok", **stats}
         except Exception as e:
             logger.error(f"Neural Orchestrator stats error: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
     @app.post("/neural-orchestrator/route")
     async def neural_orchestrator_route(request: NeuralRouteRequest):
-        """Get routing decision without executing inference."""
-        if not _neural_orchestrator or not neural_routing_enabled:
-            raise HTTPException(
-                status_code=503,
-                detail="Neural Orchestrator not available"
-            )
+        if not _neural_orchestrator or not _neural_routing_enabled:
+            raise HTTPException(status_code=503, detail="Neural Orchestrator not available")
 
         try:
-            result = await _neural_orchestrator.route(
-                prompt=request.prompt,
-                context=request.context,
-            )
+            result = await _neural_orchestrator.route(prompt=request.prompt, context=request.context)
             return {
                 "status": "ok",
                 "routing": result.to_dict() if result else None,
@@ -1270,42 +826,24 @@ async def main():
 
     @app.get("/neural-orchestrator/memory")
     async def neural_orchestrator_memory():
-        """Get current memory pressure status."""
-        if not _neural_orchestrator or not neural_routing_enabled:
-            return {
-                "status": "not_initialized",
-                "message": "Neural Orchestrator not available",
-            }
+        if not _neural_orchestrator or not _neural_routing_enabled:
+            return {"status": "not_initialized", "message": "Neural Orchestrator not available"}
 
         try:
             memory = await _neural_orchestrator.get_memory_status()
             should_burst = await _neural_orchestrator.should_burst_to_cloud()
-            return {
-                "status": "ok",
-                "memory": memory,
-                "should_burst_to_cloud": should_burst,
-            }
+            return {"status": "ok", "memory": memory, "should_burst_to_cloud": should_burst}
         except Exception as e:
             logger.error(f"Neural Orchestrator memory error: {e}")
-            return {
-                "status": "error",
-                "error": str(e),
-            }
+            return {"status": "error", "error": str(e)}
 
     @app.post("/neural-orchestrator/classify")
     async def neural_orchestrator_classify(request: NeuralRouteRequest):
-        """Classify a task without routing."""
-        if not _neural_orchestrator or not neural_routing_enabled:
-            raise HTTPException(
-                status_code=503,
-                detail="Neural Orchestrator not available"
-            )
+        if not _neural_orchestrator or not _neural_routing_enabled:
+            raise HTTPException(status_code=503, detail="Neural Orchestrator not available")
 
         try:
-            classification = await _neural_orchestrator.classify_task(
-                prompt=request.prompt,
-                context=request.context,
-            )
+            classification = await _neural_orchestrator.classify_task(prompt=request.prompt, context=request.context)
             return {
                 "status": "ok",
                 "task_type": classification.task_type.value,
@@ -1320,13 +858,391 @@ async def main():
             logger.error(f"Neural classification error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    # =========================================================================
+    # HELPER FUNCTIONS
+    # =========================================================================
+    def _record_inference_metrics(tokens_in: int, tokens_out: int, latency_ms: float, success: bool):
+        """Record inference metrics to all tracking systems."""
+        if _bridge:
+            try:
+                from jarvis_prime.core.cross_repo_bridge import record_inference
+                record_inference(tokens_in=tokens_in, tokens_out=tokens_out, latency_ms=latency_ms)
+            except Exception:
+                pass
+
+        if _trinity_record_inference:
+            try:
+                _trinity_record_inference(latency_ms=latency_ms, success=success)
+            except Exception:
+                pass
+
+    # =========================================================================
+    # BACKGROUND INITIALIZATION - Runs AFTER server starts listening
+    # =========================================================================
+    async def background_initialization():
+        """
+        v93.2: Run ALL heavy initialization in background.
+
+        This function is triggered by FastAPI's startup event, which means
+        the HTTP server is ALREADY listening when this runs.
+
+        Initialization order:
+        1. Import ML libraries (torch, sklearn - triggers warnings)
+        2. Initialize cross-repo bridge
+        3. Initialize Trinity bridge
+        4. Initialize AGI Hub
+        5. Initialize Neural Orchestrator
+        6. Download model if needed
+        7. Load model
+        8. Mark ready
+        """
+        global _bridge, _executor, _agi_hub, _neural_orchestrator, _model_path
+        global _trinity_initialized, _trinity_record_inference, _neural_routing_enabled
+
+        try:
+            _startup_state.phase = "initializing"
+            init_start = time.time()
+            logger.info("[Background] Starting heavy initialization...")
+
+            # -----------------------------------------------------------------
+            # STEP 1: Import ML libraries (this triggers the warnings)
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "importing_ml_libraries"
+            logger.info("[Background] Importing ML libraries...")
+
+            try:
+                from jarvis_prime.core.llama_cpp_executor import LlamaCppExecutor, LlamaCppConfig
+            except ImportError as e:
+                logger.error(f"[Background] Import error: {e}")
+                _startup_state.phase = "error"
+                _startup_state.error = f"Missing llama-cpp-python: {e}"
+                return
+
+            # -----------------------------------------------------------------
+            # STEP 2: Initialize cross-repo bridge
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "initializing_bridge"
+            bridge_enabled = _args.bridge_enabled and not _args.no_bridge
+            if bridge_enabled:
+                try:
+                    from jarvis_prime.core.cross_repo_bridge import (
+                        initialize_bridge,
+                        shutdown_bridge,
+                        record_inference,
+                        update_model_status,
+                        get_cost_summary,
+                    )
+                    _bridge = await initialize_bridge(port=_args.port)
+                    logger.info("[Background] Cross-repo bridge initialized")
+                except Exception as e:
+                    logger.warning(f"[Background] Cross-repo bridge failed: {e}")
+                    _bridge = None
+            else:
+                logger.info("[Background] Cross-repo bridge disabled")
+                _bridge = None
+
+            # -----------------------------------------------------------------
+            # STEP 3: Initialize Trinity bridge
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "initializing_trinity"
+            try:
+                from jarvis_prime.core.trinity_bridge import (
+                    initialize_trinity,
+                    shutdown_trinity,
+                    update_model_status as trinity_update_model_status,
+                    record_inference as _trinity_rec_inf,
+                    TRINITY_ENABLED,
+                )
+                _trinity_record_inference = _trinity_rec_inf
+                if TRINITY_ENABLED:
+                    _trinity_initialized = await initialize_trinity(port=_args.port)
+                    if _trinity_initialized:
+                        logger.info("[Background] PROJECT TRINITY: J-Prime connected")
+                    else:
+                        logger.warning("[Background] PROJECT TRINITY: Init returned False")
+                else:
+                    logger.info("[Background] PROJECT TRINITY: Disabled")
+            except ImportError as e:
+                logger.warning(f"[Background] PROJECT TRINITY: Module not available ({e})")
+            except Exception as e:
+                logger.warning(f"[Background] PROJECT TRINITY: Init failed ({e})")
+
+            # -----------------------------------------------------------------
+            # STEP 4: Initialize AGI Hub
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "initializing_agi_hub"
+            try:
+                from jarvis_prime.core.agi_integration import (
+                    AGIIntegrationHub,
+                    AGIHubConfig,
+                    get_agi_hub,
+                    shutdown_agi_hub,
+                    AGIEnhancedInference,
+                )
+
+                agi_config = AGIHubConfig(
+                    enable_orchestrator=True,
+                    enable_reasoning=True,
+                    enable_learning=True,
+                    enable_multimodal=True,
+                    enable_hardware_optimization=True,
+                    enable_auto_reasoning=True,
+                    enable_experience_recording=True,
+                )
+
+                _agi_hub = await get_agi_hub(agi_config)
+                logger.info("[Background] AGI v77.0: Integration Hub initialized")
+            except ImportError as e:
+                logger.warning(f"[Background] AGI Integration Hub not available: {e}")
+            except Exception as e:
+                logger.warning(f"[Background] AGI Integration Hub init failed: {e}")
+
+            # -----------------------------------------------------------------
+            # STEP 5: Initialize Neural Orchestrator
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "initializing_neural_orchestrator"
+            try:
+                from jarvis_prime.core.neural_orchestrator_core import (
+                    NeuralOrchestratorCore,
+                    DynamicConfig as NeuralConfig,
+                    neural_route,
+                    get_neural_orchestrator,
+                    shutdown_neural_orchestrator,
+                    RoutingTier,
+                )
+
+                neural_config = NeuralConfig.from_env_and_yaml()
+                _neural_orchestrator = await get_neural_orchestrator(neural_config)
+                _neural_routing_enabled = True
+                logger.info("[Background] Neural Orchestrator Core v100.0: Initialized")
+            except ImportError as e:
+                logger.warning(f"[Background] Neural Orchestrator not available: {e}")
+            except Exception as e:
+                logger.warning(f"[Background] Neural Orchestrator init failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # -----------------------------------------------------------------
+            # STEP 6: Resolve model path and download if needed
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "resolving_model"
+            _startup_state.phase = "loading_model"
+
+            model_path = Path(_args.model)
+            if not model_path.exists():
+                model_path = Path(__file__).parent / _args.model
+
+            # Try GCS download
+            gcs_model_uri = os.getenv("MODEL_GCS_URI")
+            auto_download_model = os.getenv("AUTO_DOWNLOAD_MODEL", "true").lower() == "true"
+
+            if not model_path.exists() and gcs_model_uri:
+                logger.info(f"[Background] Downloading model from GCS: {gcs_model_uri}")
+                try:
+                    from google.cloud import storage
+                    import re
+
+                    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    match = re.match(r"gs://([^/]+)/(.+)", gcs_model_uri)
+                    if match:
+                        bucket_name, blob_path = match.groups()
+                        client = storage.Client()
+                        bucket = client.bucket(bucket_name)
+                        blob = bucket.blob(blob_path)
+
+                        if blob.exists():
+                            blob.reload()
+                            size_mb = blob.size / 1024 / 1024 if blob.size else 0
+                            logger.info(f"[Background] Downloading {size_mb:.1f}MB model...")
+                            blob.download_to_filename(str(model_path))
+                            if model_path.exists():
+                                logger.info(f"[Background] Model downloaded: {model_path}")
+                except ImportError:
+                    logger.info("[Background] GCS client not available, trying gsutil...")
+                    try:
+                        import subprocess
+                        subprocess.run(["gsutil", "cp", gcs_model_uri, str(model_path)], check=True, capture_output=True)
+                        logger.info(f"[Background] Model downloaded via gsutil")
+                    except Exception as e:
+                        logger.warning(f"[Background] gsutil download failed: {e}")
+                except Exception as e:
+                    logger.warning(f"[Background] GCS download failed: {e}")
+
+            # Try HuggingFace download
+            if not model_path.exists() and auto_download_model:
+                logger.info("[Background] Attempting HuggingFace download...")
+                try:
+                    from jarvis_prime.docker.model_downloader import download_model, recommend_model, MODEL_CATALOG
+
+                    default_model = os.getenv("DEFAULT_MODEL", "tinyllama-chat")
+                    if default_model not in MODEL_CATALOG:
+                        recommended = recommend_model(use_case="balanced", max_memory_gb=8.0)
+                        default_model = recommended if recommended else "tinyllama-chat"
+
+                    logger.info(f"[Background] Auto-downloading: {default_model}")
+                    models_dir = Path(__file__).parent / "models"
+                    downloaded_path = await download_model(
+                        model_key=default_model,
+                        models_dir=str(models_dir),
+                        set_active=True,
+                    )
+                    model_path = models_dir / "current.gguf"
+                    if model_path.exists():
+                        logger.info(f"[Background] Model auto-downloaded: {downloaded_path}")
+                except ImportError as e:
+                    logger.warning(f"[Background] HuggingFace downloader not available: {e}")
+                except Exception as e:
+                    logger.warning(f"[Background] HuggingFace download failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            _model_path = model_path
+
+            # -----------------------------------------------------------------
+            # STEP 7: Hardware optimization and executor creation
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "configuring_hardware"
+            optimized_gpu_layers = _args.gpu_layers
+            optimized_threads = _args.threads
+            optimized_ctx_size = _args.ctx_size
+
+            if _agi_hub and _agi_hub.hardware_optimizer:
+                try:
+                    hw_opt = _agi_hub.hardware_optimizer
+                    recommendations = hw_opt.get_recommendations()
+                    if recommendations:
+                        if recommendations.get("use_mps", False):
+                            optimized_gpu_layers = -1
+                            logger.info("[Background] Apple Silicon: MPS enabled")
+                        if "optimal_threads" in recommendations:
+                            optimized_threads = recommendations["optimal_threads"]
+                            logger.info(f"[Background] Apple Silicon: {optimized_threads} threads")
+                except Exception as e:
+                    logger.warning(f"[Background] Apple Silicon optimization failed: {e}")
+            else:
+                try:
+                    from jarvis_prime.core.llama_cpp_executor import HardwareDetector, HardwareBackend
+                    hw = HardwareDetector.detect()
+                    logger.info(f"[Background] Hardware: {hw.backend.name}")
+                    if hw.backend == HardwareBackend.METAL:
+                        optimized_gpu_layers = -1
+                        optimized_threads = hw.performance_cores or _args.threads
+                        logger.info(f"[Background] Metal GPU enabled")
+                    elif hw.backend == HardwareBackend.CUDA:
+                        optimized_gpu_layers = -1
+                        logger.info("[Background] CUDA GPU enabled")
+                except Exception as e:
+                    logger.warning(f"[Background] Hardware detection failed: {e}")
+
+            config = LlamaCppConfig(
+                n_ctx=optimized_ctx_size,
+                n_threads=optimized_threads,
+                n_gpu_layers=optimized_gpu_layers,
+                verbose=_args.debug,
+                flash_attn=True,
+                cache_prompt=True,
+            )
+            _executor = LlamaCppExecutor(config)
+
+            # -----------------------------------------------------------------
+            # STEP 8: Load model
+            # -----------------------------------------------------------------
+            _startup_state.details["step"] = "loading_model"
+            _startup_state.model_load_start = time.time()
+
+            if model_path.exists():
+                logger.info(f"[Background] Loading model: {model_path}")
+                start = time.time()
+                await _executor.load(model_path)
+                load_time = time.time() - start
+                _startup_state.model_load_elapsed = load_time
+                _startup_state.model_loaded = True
+                _startup_state.model_path = str(model_path)
+                logger.info(f"[Background] Model loaded in {load_time:.2f}s")
+
+                if _bridge:
+                    try:
+                        from jarvis_prime.core.cross_repo_bridge import update_model_status
+                        update_model_status(loaded=True, model_path=str(model_path))
+                        await _bridge.notify_jarvis("model_loaded", {
+                            "model_path": str(model_path),
+                            "load_time_seconds": load_time,
+                        })
+                    except Exception as e:
+                        logger.warning(f"[Background] Failed to notify bridge: {e}")
+            else:
+                logger.warning(f"[Background] Model not found: {_args.model}")
+                logger.warning("[Background] Server will run in health-check-only mode")
+                _startup_state.model_path = None
+
+                if _bridge:
+                    try:
+                        from jarvis_prime.core.cross_repo_bridge import update_model_status
+                        update_model_status(loaded=False, model_path="")
+                    except Exception:
+                        pass
+
+            # -----------------------------------------------------------------
+            # STEP 9: Mark ready
+            # -----------------------------------------------------------------
+            _startup_state.phase = "ready"
+            _startup_state.init_elapsed = time.time() - init_start
+            _startup_state.details = {}  # Clear step details
+
+            logger.info("=" * 60)
+            logger.info("JARVIS-Prime Tier-0 Brain Server (v93.2)")
+            logger.info("=" * 60)
+            logger.info(f"Initialization completed in {_startup_state.init_elapsed:.2f}s")
+            logger.info(f"Model: {model_path.name if model_path.exists() else 'Not loaded'}")
+            logger.info(f"Context: {_args.ctx_size} tokens")
+            logger.info(f"GPU layers: {optimized_gpu_layers}")
+            logger.info(f"Listening: http://{_args.host}:{_args.port}")
+
+            if _bridge:
+                logger.info(f"JARVIS Bridge: {'Connected' if _bridge.state.connected_to_jarvis else 'Enabled (standalone)'}")
+            if _trinity_initialized:
+                logger.info("PROJECT TRINITY: Connected (Mind component online)")
+            if _agi_hub:
+                logger.info("AGI Integration Hub: Active")
+            if _neural_routing_enabled:
+                logger.info("Neural Orchestrator v100.0: Active")
+
+            logger.info("=" * 60)
+            logger.info("[Background] Server ready for inference!")
+
+        except Exception as e:
+            logger.error(f"[Background] Initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            _startup_state.phase = "error"
+            _startup_state.error = str(e)
+
+    # =========================================================================
+    # STARTUP EVENT - Triggers background initialization AFTER server starts
+    # =========================================================================
+    @app.on_event("startup")
+    async def on_startup():
+        """
+        v93.2: FastAPI startup event.
+
+        This runs AFTER uvicorn binds to the port and starts listening.
+        This is the key to solving the 61.9s timeout - the health endpoint
+        is already responding when this function starts.
+        """
+        logger.info("[v93.2] Server is now LISTENING - starting background initialization")
+        asyncio.create_task(background_initialization())
+
+    # =========================================================================
+    # SHUTDOWN EVENT - Clean up all components
+    # =========================================================================
     @app.on_event("shutdown")
-    async def shutdown():
+    async def on_shutdown():
         logger.info("Shutting down...")
 
-        # v100.0: Shutdown Neural Orchestrator
         if _neural_orchestrator:
             try:
+                from jarvis_prime.core.neural_orchestrator_core import shutdown_neural_orchestrator
                 stats = _neural_orchestrator.get_comprehensive_stats()
                 routing_stats = stats.get("routing", {})
                 logger.info("=" * 50)
@@ -1335,33 +1251,28 @@ async def main():
                 logger.info(f"  Total Requests Routed: {routing_stats.get('total_requests', 0)}")
                 logger.info(f"  Successful Routes: {routing_stats.get('successful_routes', 0)}")
                 logger.info(f"  Fallback Routes: {routing_stats.get('fallback_routes', 0)}")
-                logger.info(f"  Sticky Session Hits: {routing_stats.get('sticky_hits', 0)}")
-                logger.info(f"  Cloud Burst Triggers: {routing_stats.get('burst_triggers', 0)}")
                 logger.info("=" * 50)
-
                 await shutdown_neural_orchestrator()
-                logger.info("Neural Orchestrator v100.0 shutdown complete")
+                logger.info("Neural Orchestrator shutdown complete")
             except Exception as e:
                 logger.warning(f"Neural Orchestrator shutdown error: {e}")
 
-        # v77.0: Shutdown AGI Integration Hub
-        if agi_hub:
+        if _agi_hub:
             try:
+                from jarvis_prime.core.agi_integration import shutdown_agi_hub
                 await shutdown_agi_hub()
                 logger.info("AGI Integration Hub shutdown complete")
             except Exception as e:
                 logger.warning(f"AGI Hub shutdown error: {e}")
 
-        # v72.0: Shutdown PROJECT TRINITY connection
-        if trinity_initialized:
+        if _trinity_initialized:
             try:
                 from jarvis_prime.core.trinity_bridge import shutdown_trinity
                 await shutdown_trinity()
-                logger.info("PROJECT TRINITY: J-Prime disconnected from Trinity network")
+                logger.info("PROJECT TRINITY: J-Prime disconnected")
             except Exception as e:
                 logger.warning(f"Trinity shutdown error: {e}")
 
-        # Log final cost summary
         if _bridge:
             try:
                 from jarvis_prime.core.cross_repo_bridge import get_cost_summary, shutdown_bridge
@@ -1374,88 +1285,32 @@ async def main():
                     logger.info(f"  Total Requests: {cost_summary.get('total_requests', 0)}")
                     logger.info(f"  Total Tokens: {cost_summary.get('total_tokens', 0)}")
                     logger.info(f"  Local Cost: ${cost_summary.get('local_cost_usd', 0):.4f}")
-                    logger.info(f"  Cloud Equivalent: ${cost_summary.get('cloud_equivalent_cost_usd', 0):.4f}")
-                    logger.info(f"  Savings: ${cost_summary.get('savings_usd', 0):.4f} ({cost_summary.get('savings_percent', 0):.1f}%)")
+                    logger.info(f"  Savings: ${cost_summary.get('savings_usd', 0):.4f}")
                     logger.info("=" * 50)
 
-                # Notify JARVIS of shutdown
                 await _bridge.notify_jarvis("shutdown", cost_summary)
-
-                # Shutdown bridge
                 await shutdown_bridge()
                 logger.info("Cross-repo bridge shutdown complete")
             except Exception as e:
                 logger.warning(f"Bridge shutdown error: {e}")
 
-        await executor.close()
+        if _executor:
+            try:
+                await _executor.close()
+            except Exception as e:
+                logger.warning(f"Executor close error: {e}")
 
-    # Print startup info
-    logger.info("=" * 60)
-    logger.info("JARVIS-Prime Tier-0 Brain Server (v2.0)")
-    logger.info("=" * 60)
-    logger.info(f"Model: {model_path.name if model_path.exists() else 'Not loaded'}")
-    logger.info(f"Context: {args.ctx_size} tokens")
-    logger.info(f"GPU layers: {args.gpu_layers}")
-    logger.info(f"Listening: http://{args.host}:{args.port}")
+    # =========================================================================
+    # START SERVER - This is IMMEDIATE, background init happens via startup event
+    # =========================================================================
+    logger.info(f"[v93.2] Starting uvicorn server on {_args.host}:{_args.port}...")
 
-    # Bridge status
-    if _bridge:
-        if _bridge.state.connected_to_jarvis:
-            logger.info(f"JARVIS Bridge: Connected (session: {_bridge.state.jarvis_session_id[:8]}...)")
-        else:
-            logger.info("JARVIS Bridge: Enabled (standalone mode)")
-    else:
-        logger.info("JARVIS Bridge: Disabled")
-
-    # v72.0: Trinity status
-    if trinity_initialized:
-        logger.info("PROJECT TRINITY: Connected (Mind component online)")
-    else:
-        logger.info("PROJECT TRINITY: Not connected")
-
-    # v77.0: AGI status
-    if agi_hub:
-        logger.info("AGI Integration Hub: Active")
-        logger.info("  - Reasoning Engine: Chain-of-Thought, Tree-of-Thoughts, Self-Reflection")
-        logger.info("  - Continuous Learning: EWC, Synaptic Intelligence")
-        logger.info("  - MultiModal Fusion: Screen, Audio, Gesture")
-    else:
-        logger.info("AGI Integration Hub: Not connected")
-
-    logger.info("")
-    logger.info("Endpoints:")
-    logger.info(f"  POST http://localhost:{args.port}/v1/chat/completions")
-    logger.info(f"  POST http://localhost:{args.port}/generate")
-    logger.info(f"  GET  http://localhost:{args.port}/health")
-    logger.info(f"  GET  http://localhost:{args.port}/metrics")
-    if agi_hub:
-        logger.info("")
-        logger.info("AGI Endpoints (v77.0):")
-        logger.info(f"  POST http://localhost:{args.port}/agi/reason")
-        logger.info(f"  POST http://localhost:{args.port}/agi/plan")
-        logger.info(f"  POST http://localhost:{args.port}/agi/process")
-        logger.info(f"  POST http://localhost:{args.port}/agi/feedback")
-        logger.info(f"  POST http://localhost:{args.port}/agi/learning/trigger")
-        logger.info(f"  GET  http://localhost:{args.port}/agi/status")
-        logger.info(f"  GET  http://localhost:{args.port}/agi/learning/stats")
-
-    if neural_routing_enabled:
-        logger.info("")
-        logger.info("Neural Orchestrator Endpoints (v100.0):")
-        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/health")
-        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/stats")
-        logger.info(f"  GET  http://localhost:{args.port}/neural-orchestrator/memory")
-        logger.info(f"  POST http://localhost:{args.port}/neural-orchestrator/route")
-        logger.info(f"  POST http://localhost:{args.port}/neural-orchestrator/classify")
-    logger.info("=" * 60)
-
-    # Run server
     config = uvicorn.Config(
         app,
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level="debug" if args.debug else "info",
+        host=_args.host,
+        port=_args.port,
+        reload=_args.reload,
+        log_level="debug" if _args.debug else "info",
     )
     server = uvicorn.Server(config)
     await server.serve()

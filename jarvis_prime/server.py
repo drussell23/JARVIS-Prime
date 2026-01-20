@@ -572,6 +572,14 @@ async def main():
         # =====================================================================
         # STEP 1: Create minimal FastAPI app that responds to health checks
         # =====================================================================
+        # v93.2: Extra warning suppression to ensure no ML warnings during startup
+        import warnings
+        warnings.filterwarnings('ignore', message='.*scikit-learn.*')
+        warnings.filterwarnings('ignore', message='.*Torch.*')
+        warnings.filterwarnings('ignore', message='.*coremltools.*')
+        warnings.filterwarnings('ignore', category=DeprecationWarning)
+        warnings.filterwarnings('ignore', category=FutureWarning)
+
         from fastapi import FastAPI, HTTPException
 
         app = FastAPI(
@@ -631,42 +639,12 @@ async def main():
             return {"error": "Not implemented"}
 
         # =====================================================================
-        # STEP 2: Start uvicorn server IMMEDIATELY
+        # STEP 2: Define background initialization (runs AFTER server starts)
         # =====================================================================
-        import uvicorn
-
-        config = uvicorn.Config(
-            app,
-            host=args.host,
-            port=args.port,
-            workers=1,  # Single worker for startup
-            log_level="debug" if args.debug else "info",
-        )
-
-        server = uvicorn.Server(config)
-
         # Handle shutdown
         shutdown_event = asyncio.Event()
+        init_task: Optional[asyncio.Task] = None
 
-        async def handle_shutdown():
-            """Handle graceful shutdown."""
-            logger.info("Shutdown signal received")
-            shutdown_event.set()
-            server.should_exit = True
-
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(handle_shutdown()))
-
-        logger.info("=" * 70)
-        logger.info("[v93.1] HTTP server starting IMMEDIATELY")
-        logger.info(f"Health endpoint: http://{args.host}:{args.port}/health")
-        logger.info("Heavy initialization will run in background...")
-        logger.info("=" * 70)
-
-        # =====================================================================
-        # STEP 3: Run heavy initialization in background
-        # =====================================================================
         async def background_initialization():
             """
             v93.1: Run all heavy initialization in background.
@@ -876,23 +854,85 @@ async def main():
             asyncio.create_task(writer())
             logger.info(f"[Heartbeat] Writer started (file={heartbeat_file})")
 
-        # Start background initialization
-        init_task = asyncio.create_task(background_initialization())
+        # =====================================================================
+        # STEP 3: Use FastAPI startup event to trigger background initialization
+        # =====================================================================
+        # CRITICAL: This ensures heavy initialization ONLY starts AFTER
+        # uvicorn has bound to the port and is accepting connections.
+        # This is the key fix for the 61.9s timeout issue.
+        @app.on_event("startup")
+        async def on_startup():
+            """
+            v93.2: Trigger background initialization AFTER server is listening.
+
+            This is the critical fix - the startup event fires AFTER uvicorn
+            has successfully bound to the port and is ready to accept connections.
+            Health checks will succeed immediately while heavy init runs.
+            """
+            nonlocal init_task
+            logger.info("=" * 70)
+            logger.info("[v93.2] Server is now LISTENING - starting background initialization")
+            logger.info(f"Health endpoint ready: http://{args.host}:{args.port}/health")
+            logger.info("=" * 70)
+            init_task = asyncio.create_task(background_initialization())
+
+        @app.on_event("shutdown")
+        async def on_shutdown():
+            """Clean up on server shutdown."""
+            nonlocal init_task
+            if init_task and not init_task.done():
+                init_task.cancel()
+                try:
+                    await init_task
+                except asyncio.CancelledError:
+                    pass
+
+            if _startup_state and _startup_state.manager:
+                try:
+                    await _startup_state.manager.stop()
+                except Exception as e:
+                    logger.debug(f"Manager cleanup error: {e}")
+
+            if _trinity_integration:
+                try:
+                    await _trinity_integration.shutdown()
+                except Exception as e:
+                    logger.debug(f"Trinity cleanup error: {e}")
+
+            logger.info("Server shutdown complete")
+
+        # =====================================================================
+        # STEP 4: Start uvicorn server
+        # =====================================================================
+        import uvicorn
+
+        config = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            workers=1,  # Single worker for startup
+            log_level="debug" if args.debug else "info",
+        )
+
+        server = uvicorn.Server(config)
+
+        async def handle_shutdown():
+            """Handle graceful shutdown."""
+            logger.info("Shutdown signal received")
+            shutdown_event.set()
+            server.should_exit = True
+
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(handle_shutdown()))
+
+        logger.info("=" * 70)
+        logger.info("[v93.2] Starting uvicorn - server will listen IMMEDIATELY")
+        logger.info("Heavy initialization will start AFTER server is ready")
+        logger.info("=" * 70)
 
         # Run server (this blocks until shutdown)
         await server.serve()
-
-        # Cleanup
-        init_task.cancel()
-        try:
-            await init_task
-        except asyncio.CancelledError:
-            pass
-
-        if _startup_state and _startup_state.manager:
-            await _startup_state.manager.stop()
-        if _trinity_integration:
-            await _trinity_integration.shutdown()
 
     except ImportError as e:
         logger.error(f"Missing dependency: {e}")
