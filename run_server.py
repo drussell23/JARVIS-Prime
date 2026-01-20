@@ -112,7 +112,12 @@ class StartupState:
         self.details: Dict[str, Any] = {}
 
     def get_status(self) -> Dict[str, Any]:
-        """Get current status for health endpoint."""
+        """
+        Get current status for health endpoint.
+
+        v93.5: Reports model_load_elapsed_seconds DURING loading (not just after)
+        to enable intelligent progress-based timeout extension.
+        """
         elapsed = time.time() - self.start_time
         result = {
             "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
@@ -124,8 +129,17 @@ class StartupState:
         }
         if self.init_elapsed:
             result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
+
+        # v93.5: Report model load elapsed DURING loading (not just after)
+        # This enables the orchestrator's intelligent timeout extension
         if self.model_load_elapsed:
             result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
+        elif self.model_load_start:
+            # Model is currently loading - report elapsed time so far
+            current_elapsed = time.time() - self.model_load_start
+            result["model_load_elapsed_seconds"] = round(current_elapsed, 1)
+            result["model_loading_in_progress"] = True
+
         if self.error:
             result["error"] = self.error
         if self.details:
