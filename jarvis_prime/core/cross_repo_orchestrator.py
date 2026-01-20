@@ -393,13 +393,39 @@ class ComponentHealth:
 
     @property
     def status(self) -> str:
-        """Get human-readable status."""
+        """
+        v93.3: Get human-readable status with startup awareness.
+
+        Status thresholds are configurable via environment variables
+        and account for startup grace period.
+        """
         if not self.online:
             return "OFFLINE"
-        if self.heartbeat_age > 60:
+
+        # v93.3: Configurable thresholds from environment
+        stale_threshold = float(os.environ.get("TRINITY_STATUS_STALE_THRESHOLD", "60.0"))
+        degraded_threshold = float(os.environ.get("TRINITY_STATUS_DEGRADED_THRESHOLD", "30.0"))
+        startup_grace = float(os.environ.get("TRINITY_STARTUP_GRACE_PERIOD", "120.0"))
+
+        # v93.3: Check if component is in startup phase (registered recently)
+        # If so, use extended thresholds
+        startup_multiplier = float(os.environ.get("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0"))
+
+        # Determine if in startup phase (heartbeat_age < startup_grace means recently started)
+        # and the timestamp is fresh enough to suggest active startup
+        is_startup_phase = self.heartbeat_age < startup_grace and self.timestamp > (time.time() - startup_grace)
+
+        if is_startup_phase:
+            # During startup, use extended thresholds
+            stale_threshold *= startup_multiplier
+            degraded_threshold *= startup_multiplier
+
+        if self.heartbeat_age > stale_threshold:
             return "STALE"
-        if self.heartbeat_age > 30:
+        if self.heartbeat_age > degraded_threshold:
             return "DEGRADED"
+        if is_startup_phase and not self.http_healthy:
+            return "STARTING"  # v93.3: New status for startup phase
         return "HEALTHY"
 
 
@@ -419,21 +445,40 @@ class TrinityHealthChecker:
     def __init__(
         self,
         trinity_dir: Optional[Path] = None,
-        stale_threshold: float = 30.0,
-        http_timeout: float = 5.0,
+        stale_threshold: float = None,
+        http_timeout: float = None,
+        startup_grace_period: float = None,
+        startup_stale_multiplier: float = None,
     ):
         """
-        Initialize health checker.
+        v93.3: Initialize health checker with startup-aware configuration.
 
         Args:
             trinity_dir: Trinity IPC directory
-            stale_threshold: Seconds before heartbeat is stale
-            http_timeout: HTTP request timeout
+            stale_threshold: Seconds before heartbeat is stale (default from env)
+            http_timeout: HTTP request timeout (default from env)
+            startup_grace_period: Seconds after registration to consider startup
+            startup_stale_multiplier: Multiply stale threshold during startup
         """
         self.trinity_dir = trinity_dir or Path.home() / ".jarvis" / "trinity"
         self.components_dir = self.trinity_dir / "components"
-        self.stale_threshold = stale_threshold
-        self.http_timeout = http_timeout
+
+        # v93.3: Environment-configurable thresholds with startup awareness
+        self.stale_threshold = stale_threshold or float(
+            os.environ.get("TRINITY_HEALTH_STALE_THRESHOLD", "60.0")  # Increased from 30s
+        )
+        self.http_timeout = http_timeout or float(
+            os.environ.get("TRINITY_HEALTH_HTTP_TIMEOUT", "10.0")  # Increased from 5s
+        )
+        self.startup_grace_period = startup_grace_period or float(
+            os.environ.get("TRINITY_STARTUP_GRACE_PERIOD", "120.0")
+        )
+        self.startup_stale_multiplier = startup_stale_multiplier or float(
+            os.environ.get("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0")
+        )
+
+        # v93.3: Track component registration times for startup detection
+        self._component_start_times: Dict[str, float] = {}
 
         # Component configuration
         self._component_configs: Dict[str, Dict[str, Any]] = {
@@ -501,7 +546,12 @@ class TrinityHealthChecker:
         return health_map
 
     async def check_component(self, name: str) -> ComponentHealth:
-        """Check health of a single component."""
+        """
+        v93.3: Check health of a single component with startup awareness.
+
+        During startup grace period, uses extended thresholds to allow
+        components time to fully initialize.
+        """
         config = self._component_configs.get(name)
         if not config:
             return ComponentHealth(
@@ -518,31 +568,54 @@ class TrinityHealthChecker:
             timestamp = heartbeat_data.get("timestamp", 0)
             heartbeat_age = time.time() - timestamp
 
-            # Check HTTP if heartbeat is fresh
+            # v93.3: Track component start time for startup detection
+            registered_at = heartbeat_data.get("registered_at", 0)
+            if registered_at <= 0:
+                # Fallback: use first seen time
+                if name not in self._component_start_times:
+                    self._component_start_times[name] = time.time()
+                registered_at = self._component_start_times[name]
+
+            # v93.3: Determine if in startup phase
+            component_age = time.time() - registered_at
+            is_startup_phase = component_age < self.startup_grace_period
+
+            # v93.3: Calculate effective stale threshold
+            effective_stale_threshold = self.stale_threshold
+            if is_startup_phase:
+                effective_stale_threshold = self.stale_threshold * self.startup_stale_multiplier
+
+            # v93.3: Check HTTP with extended timeout during startup
             http_healthy = False
-            if heartbeat_age < self.stale_threshold:
+            if heartbeat_age < effective_stale_threshold:
                 http_healthy = await self._check_http(name, port)
 
             return ComponentHealth(
                 component=name,
-                online=heartbeat_age < self.stale_threshold,
+                online=heartbeat_age < effective_stale_threshold,
                 heartbeat_age=heartbeat_age,
                 http_healthy=http_healthy,
                 pid=heartbeat_data.get("pid"),
                 port=port,
                 model_loaded=heartbeat_data.get("model_loaded", False),
                 last_inference_time=heartbeat_data.get("last_inference_time", 0),
+                timestamp=timestamp,  # v93.3: Include for status property
             )
         else:
-            # No heartbeat - try HTTP anyway
+            # No heartbeat - try HTTP anyway (component might be starting)
             port = config["default_port"]
             http_healthy = await self._check_http(name, port)
+
+            # v93.3: Track first attempt time for startup grace
+            if name not in self._component_start_times:
+                self._component_start_times[name] = time.time()
 
             return ComponentHealth(
                 component=name,
                 online=http_healthy,
                 http_healthy=http_healthy,
                 port=port if http_healthy else None,
+                timestamp=time.time(),  # v93.3: Fresh timestamp for status
             )
 
     def _read_heartbeat(

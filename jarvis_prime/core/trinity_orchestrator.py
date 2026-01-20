@@ -142,7 +142,11 @@ class ComponentType(Enum):
 
 @dataclass
 class ComponentConfig:
-    """Configuration for a Trinity component."""
+    """
+    Configuration for a Trinity component.
+
+    v93.4: Lifecycle timeouts are now environment-configurable.
+    """
     name: str
     component_type: ComponentType
     description: str
@@ -157,13 +161,21 @@ class ComponentConfig:
     path_candidates: List[str] = field(default_factory=list)
     python_path: str = ""
 
-    # Lifecycle
+    # Lifecycle (v93.4: environment-configurable defaults)
     enabled: bool = True
     auto_restart: bool = True
-    max_restarts: int = 5
-    restart_delay_seconds: float = 5.0
-    startup_timeout_seconds: float = 60.0
-    shutdown_timeout_seconds: float = 30.0
+    max_restarts: int = field(default_factory=lambda:
+        int(os.getenv("TRINITY_MAX_RESTARTS", "5"))
+    )
+    restart_delay_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_RESTART_DELAY", "5.0"))
+    )
+    startup_timeout_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_COMPONENT_STARTUP_TIMEOUT", "120.0"))
+    )
+    shutdown_timeout_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_COMPONENT_SHUTDOWN_TIMEOUT", "30.0"))
+    )
 
     # Dependencies
     dependencies: List[str] = field(default_factory=list)
@@ -175,6 +187,7 @@ class ComponentConfig:
     _restart_count: int = field(default=0, repr=False)
     _last_health_check: float = field(default=0.0, repr=False)
     _last_error: Optional[str] = field(default=None, repr=False)
+    _started_at: float = field(default=0.0, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -190,31 +203,99 @@ class ComponentConfig:
 
 @dataclass
 class OrchestratorConfig:
-    """Configuration for the Trinity Orchestrator."""
+    """
+    Configuration for the Trinity Orchestrator.
+
+    v93.4: All timeouts and thresholds are now environment-configurable
+    with startup-aware defaults.
+    """
     # IPC
-    trinity_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity")
-    cross_repo_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "cross_repo")
+    trinity_dir: Path = field(default_factory=lambda: Path(
+        os.getenv("TRINITY_IPC_DIR", str(Path.home() / ".jarvis" / "trinity"))
+    ))
+    cross_repo_dir: Path = field(default_factory=lambda: Path(
+        os.getenv("JARVIS_CROSS_REPO_DIR", str(Path.home() / ".jarvis" / "cross_repo"))
+    ))
 
-    # Health checking
-    health_check_interval_seconds: float = 10.0
-    health_check_timeout_seconds: float = 5.0
-    unhealthy_threshold: int = 3  # Failures before marking unhealthy
+    # Health checking (v93.4: environment-configurable)
+    health_check_interval_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_HEALTH_CHECK_INTERVAL", "10.0"))
+    )
+    health_check_timeout_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_HEALTH_CHECK_TIMEOUT", "5.0"))
+    )
+    unhealthy_threshold: int = field(default_factory=lambda:
+        int(os.getenv("TRINITY_UNHEALTHY_THRESHOLD", "3"))
+    )
 
-    # Process management
-    parallel_startup: bool = False  # Start components in parallel
-    graceful_shutdown_timeout: float = 30.0
+    # Startup-aware configuration (v93.4)
+    startup_grace_period_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_STARTUP_GRACE_PERIOD", "120.0"))
+    )
+    startup_unhealthy_multiplier: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_STARTUP_THRESHOLD_MULTIPLIER", "5.0"))
+    )
+    startup_health_check_interval_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_STARTUP_HEALTH_INTERVAL", "5.0"))
+    )
 
-    # Self-healing
-    self_healing_enabled: bool = True
-    restart_backoff_seconds: float = 5.0
-    max_restart_backoff_seconds: float = 300.0
+    # Process management (v93.4: environment-configurable)
+    parallel_startup: bool = field(default_factory=lambda:
+        os.getenv("TRINITY_PARALLEL_STARTUP", "false").lower() == "true"
+    )
+    graceful_shutdown_timeout: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_SHUTDOWN_TIMEOUT", "30.0"))
+    )
+    component_startup_timeout_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_COMPONENT_STARTUP_TIMEOUT", "120.0"))
+    )
 
-    # Resource protection
-    oom_protection_enabled: bool = True
-    max_ram_percent_per_component: float = 40.0
+    # Self-healing (v93.4: environment-configurable)
+    self_healing_enabled: bool = field(default_factory=lambda:
+        os.getenv("TRINITY_SELF_HEALING", "true").lower() == "true"
+    )
+    restart_backoff_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_RESTART_BACKOFF", "5.0"))
+    )
+    max_restart_backoff_seconds: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_MAX_RESTART_BACKOFF", "300.0"))
+    )
+
+    # Resource protection (v93.4: environment-configurable)
+    oom_protection_enabled: bool = field(default_factory=lambda:
+        os.getenv("TRINITY_OOM_PROTECTION", "true").lower() == "true"
+    )
+    max_ram_percent_per_component: float = field(default_factory=lambda:
+        float(os.getenv("TRINITY_MAX_RAM_PERCENT", "40.0"))
+    )
 
     # Logging
-    log_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "logs")
+    log_dir: Path = field(default_factory=lambda: Path(
+        os.getenv("TRINITY_LOG_DIR", str(Path.home() / ".jarvis" / "logs"))
+    ))
+
+    # Runtime state (not config)
+    _start_time: float = field(default_factory=time.time, repr=False)
+
+    def is_in_startup_phase(self) -> bool:
+        """Check if we're still in the startup grace period."""
+        return (time.time() - self._start_time) < self.startup_grace_period_seconds
+
+    def get_effective_unhealthy_threshold(self) -> int:
+        """Get threshold, more lenient during startup."""
+        if self.is_in_startup_phase():
+            return int(self.unhealthy_threshold * self.startup_unhealthy_multiplier)
+        return self.unhealthy_threshold
+
+    def get_effective_health_check_interval(self) -> float:
+        """Get check interval, faster during startup for quicker recovery detection."""
+        if self.is_in_startup_phase():
+            return self.startup_health_check_interval_seconds
+        return self.health_check_interval_seconds
+
+    def reset_start_time(self):
+        """Reset the start time (called when orchestrator starts)."""
+        self._start_time = time.time()
 
     @classmethod
     def from_yaml(cls, config_path: Path) -> "OrchestratorConfig":
@@ -528,6 +609,8 @@ class HealthMonitor:
     - Failure tracking
     - Auto-recovery triggering
     - Metrics collection
+
+    v93.4: Startup-aware health monitoring with dynamic thresholds.
     """
 
     def __init__(
@@ -545,16 +628,22 @@ class HealthMonitor:
         self._last_check: Dict[str, float] = {name: 0.0 for name in components}
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._start_time = time.time()
 
         # Session for health checks
         self._session: Optional[aiohttp.ClientSession] = None
 
+    def is_in_startup_phase(self) -> bool:
+        """Check if we're still in the startup grace period."""
+        return (time.time() - self._start_time) < self._config.startup_grace_period_seconds
+
     async def start(self):
-        """Start health monitoring."""
+        """Start health monitoring (v93.4: startup-aware)."""
         if self._running:
             return
 
         self._running = True
+        self._start_time = time.time()
 
         if AIOHTTP_AVAILABLE:
             self._session = aiohttp.ClientSession(
@@ -562,7 +651,10 @@ class HealthMonitor:
             )
 
         self._task = asyncio.create_task(self._monitor_loop())
-        logger.info("Health monitor started")
+        logger.info(
+            f"Health monitor started (startup_grace={self._config.startup_grace_period_seconds}s, "
+            f"startup_interval={self._config.startup_health_check_interval_seconds}s)"
+        )
 
     async def stop(self):
         """Stop health monitoring."""
@@ -582,11 +674,24 @@ class HealthMonitor:
         logger.info("Health monitor stopped")
 
     async def _monitor_loop(self):
-        """Main monitoring loop."""
+        """Main monitoring loop (v93.4: startup-aware dynamic intervals)."""
+        last_interval_log = 0
+
         while self._running:
             try:
                 await self._check_all()
-                await asyncio.sleep(self._config.health_check_interval_seconds)
+
+                # Use faster interval during startup for quicker recovery detection
+                interval = self._config.get_effective_health_check_interval()
+
+                # Log interval changes (at most once per minute)
+                now = time.time()
+                if now - last_interval_log > 60:
+                    startup_status = "startup" if self.is_in_startup_phase() else "normal"
+                    logger.debug(f"Health check interval: {interval}s ({startup_status} mode)")
+                    last_interval_log = now
+
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -628,28 +733,53 @@ class HealthMonitor:
             await self._handle_failure(name, component, str(e))
 
     async def _handle_failure(self, name: str, component: ComponentConfig, reason: str):
-        """Handle a health check failure."""
+        """Handle a health check failure (v93.4: startup-aware thresholds)."""
         self._failure_counts[name] += 1
         component._last_error = reason
 
-        if self._failure_counts[name] >= self._config.unhealthy_threshold:
+        # Use startup-aware threshold - more lenient during startup
+        threshold = self._config.get_effective_unhealthy_threshold()
+
+        if self._failure_counts[name] >= threshold:
             if component._state != ComponentState.UNHEALTHY:
                 component._state = ComponentState.UNHEALTHY
-                logger.warning(f"{name} is UNHEALTHY: {reason}")
+                logger.warning(
+                    f"{name} is UNHEALTHY: {reason} "
+                    f"(failures={self._failure_counts[name]}/{threshold}, "
+                    f"startup_phase={self.is_in_startup_phase()})"
+                )
 
                 if self._on_unhealthy:
                     self._on_unhealthy(name)
+        elif self.is_in_startup_phase():
+            # During startup, log degraded state but don't trigger recovery
+            logger.debug(
+                f"{name} startup degraded: {reason} "
+                f"(failures={self._failure_counts[name]}/{threshold})"
+            )
 
     def get_status(self) -> Dict[str, Any]:
-        """Get health status of all components."""
+        """Get health status of all components (v93.4: includes startup phase info)."""
+        uptime = time.time() - self._start_time
+        in_startup = self.is_in_startup_phase()
+
         return {
-            name: {
-                "state": comp._state.value,
-                "failures": self._failure_counts.get(name, 0),
-                "last_check": self._last_check.get(name, 0),
-                "last_error": comp._last_error,
-            }
-            for name, comp in self._components.items()
+            "_meta": {
+                "startup_phase": in_startup,
+                "startup_remaining_seconds": max(0, self._config.startup_grace_period_seconds - uptime) if in_startup else 0,
+                "effective_threshold": self._config.get_effective_unhealthy_threshold(),
+                "effective_interval": self._config.get_effective_health_check_interval(),
+            },
+            "components": {
+                name: {
+                    "state": comp._state.value,
+                    "failures": self._failure_counts.get(name, 0),
+                    "threshold": self._config.get_effective_unhealthy_threshold(),
+                    "last_check": self._last_check.get(name, 0),
+                    "last_error": comp._last_error,
+                }
+                for name, comp in self._components.items()
+            },
         }
 
 

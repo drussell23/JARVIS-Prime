@@ -125,21 +125,37 @@ class SafetyContextSnapshot:
 
 class SafetyContextReader:
     """
-    Reader for JARVIS safety context shared state.
+    v93.3: Reader for JARVIS safety context shared state with startup awareness.
 
     Reads from the shared file written by ActionSafetyManager
     to enable safety-aware routing in Prime.
     """
 
-    def __init__(self, stale_threshold_seconds: float = 60.0):
-        self.stale_threshold_seconds = stale_threshold_seconds
+    def __init__(self, stale_threshold_seconds: float = None):
+        # v93.3: Configurable from environment with startup awareness
+        self.stale_threshold_seconds = stale_threshold_seconds or float(
+            os.environ.get("TRINITY_SAFETY_CONTEXT_STALE_THRESHOLD", "60.0")
+        )
+        self.startup_grace_period = float(
+            os.environ.get("TRINITY_STARTUP_GRACE_PERIOD", "120.0")
+        )
+        self.startup_stale_multiplier = float(
+            os.environ.get("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0")
+        )
         self._cache: Optional[SafetyContextSnapshot] = None
         self._cache_time: float = 0.0
         self._cache_ttl: float = 1.0  # Re-read file every second
+        self._first_read_time: float = 0.0  # v93.3: Track startup
 
     def read_context(self) -> SafetyContextSnapshot:
-        """Read current safety context from shared file."""
+        """
+        v93.3: Read current safety context with startup-aware staleness.
+        """
         now = time.time()
+
+        # v93.3: Track first read time for startup detection
+        if self._first_read_time == 0.0:
+            self._first_read_time = now
 
         # Return cached if fresh
         if self._cache and (now - self._cache_time) < self._cache_ttl:
@@ -152,14 +168,20 @@ class SafetyContextReader:
 
             data = json.loads(SAFETY_CONTEXT_FILE.read_text())
 
-            # Check staleness
+            # v93.3: Determine if in startup phase
+            is_startup_phase = (now - self._first_read_time) < self.startup_grace_period
+            effective_stale_threshold = self.stale_threshold_seconds
+            if is_startup_phase:
+                effective_stale_threshold *= self.startup_stale_multiplier
+
+            # Check staleness with startup awareness
             last_update = data.get("last_update", "")
             is_stale = False
             if last_update:
                 try:
                     update_time = datetime.fromisoformat(last_update)
                     age = (datetime.now() - update_time).total_seconds()
-                    is_stale = age > self.stale_threshold_seconds
+                    is_stale = age > effective_stale_threshold
                 except Exception:
                     is_stale = True
 

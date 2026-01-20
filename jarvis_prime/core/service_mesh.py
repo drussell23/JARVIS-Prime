@@ -216,10 +216,29 @@ class ServiceEndpoint:
 
     @property
     def is_stale(self) -> bool:
-        """Check if endpoint is stale (no heartbeat)."""
+        """
+        v93.3: Check if endpoint is stale with startup awareness.
+
+        Configurable via environment variable TRINITY_SERVICE_MESH_STALE_THRESHOLD.
+        During startup phase, uses extended threshold.
+        """
         if not self.last_seen:
             return True
-        stale_threshold = timedelta(seconds=30)
+
+        # v93.3: Configurable stale threshold from environment
+        base_stale_seconds = float(os.environ.get("TRINITY_SERVICE_MESH_STALE_THRESHOLD", "60.0"))
+        startup_grace = float(os.environ.get("TRINITY_STARTUP_GRACE_PERIOD", "120.0"))
+        startup_multiplier = float(os.environ.get("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0"))
+
+        # v93.3: Check if in startup phase based on last_seen recency
+        age_seconds = (datetime.now() - self.last_seen).total_seconds()
+        is_startup_phase = age_seconds < startup_grace
+
+        effective_stale = base_stale_seconds
+        if is_startup_phase:
+            effective_stale = base_stale_seconds * startup_multiplier
+
+        stale_threshold = timedelta(seconds=effective_stale)
         return datetime.now() - self.last_seen > stale_threshold
 
     def to_dict(self) -> Dict[str, Any]:
@@ -258,16 +277,36 @@ class ServiceEndpoint:
 
 @dataclass
 class ServiceMeshConfig:
-    """Configuration for service mesh."""
+    """
+    v93.3: Configuration for service mesh with startup awareness.
+
+    All thresholds are configurable via environment variables.
+    """
     # Registry
     registry_type: str = "file"  # file, memory
     registry_path: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity" / "service_registry.json")
-    refresh_interval_seconds: float = 5.0
-    stale_threshold_seconds: float = 30.0
+    refresh_interval_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_MESH_REFRESH_INTERVAL", "5.0")
+    ))
+    stale_threshold_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_SERVICE_MESH_STALE_THRESHOLD", "60.0")  # v93.3: Increased from 30s
+    ))
+
+    # v93.3: Startup awareness configuration
+    startup_grace_period_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_STARTUP_GRACE_PERIOD", "120.0")
+    ))
+    startup_stale_multiplier: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_STARTUP_STALE_MULTIPLIER", "5.0")
+    ))
 
     # Health checking
-    health_check_interval_seconds: float = 10.0
-    health_check_timeout_seconds: float = 5.0
+    health_check_interval_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_MESH_HEALTH_INTERVAL", "10.0")
+    ))
+    health_check_timeout_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("TRINITY_MESH_HEALTH_TIMEOUT", "10.0")  # v93.3: Increased from 5s
+    ))
     failure_threshold: int = 3
     success_threshold: int = 2
 
