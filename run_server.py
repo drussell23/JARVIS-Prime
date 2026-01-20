@@ -923,18 +923,43 @@ async def main():
         try:
             _startup_state.phase = "initializing"
             init_start = time.time()
-            logger.info("[Background] Starting heavy initialization...")
+
+            # v93.7: Enhanced step logging with timing
+            def log_step(step_name: str, step_num: int, total_steps: int = 9):
+                """Log step with progress indicator."""
+                _startup_state.details["step"] = step_name
+                _startup_state.details["step_num"] = step_num
+                _startup_state.details["total_steps"] = total_steps
+                elapsed = time.time() - init_start
+                logger.info("")
+                logger.info(f"{'='*60}")
+                logger.info(f"📍 STEP {step_num}/{total_steps}: {step_name.upper()}")
+                logger.info(f"   Elapsed: {elapsed:.1f}s")
+                logger.info(f"{'='*60}")
+
+            def log_step_complete(step_name: str, duration: float):
+                """Log step completion."""
+                logger.info(f"✅ {step_name} complete ({duration:.2f}s)")
+
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("🚀 JARVIS-PRIME BACKGROUND INITIALIZATION STARTING")
+            logger.info("=" * 70)
+            logger.info(f"   PID: {os.getpid()}")
+            logger.info(f"   Python: {sys.version.split()[0]}")
+            logger.info("")
 
             # -----------------------------------------------------------------
             # STEP 1: Import ML libraries (this triggers the warnings)
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "importing_ml_libraries"
-            logger.info("[Background] Importing ML libraries...")
+            step_start = time.time()
+            log_step("importing_ml_libraries", 1)
 
             try:
                 from jarvis_prime.core.llama_cpp_executor import LlamaCppExecutor, LlamaCppConfig
+                log_step_complete("ML libraries import", time.time() - step_start)
             except ImportError as e:
-                logger.error(f"[Background] Import error: {e}")
+                logger.error(f"❌ Import error: {e}")
                 _startup_state.phase = "error"
                 _startup_state.error = f"Missing llama-cpp-python: {e}"
                 return
@@ -942,7 +967,8 @@ async def main():
             # -----------------------------------------------------------------
             # STEP 2: Initialize cross-repo bridge
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "initializing_bridge"
+            step_start = time.time()
+            log_step("initializing_bridge", 2)
             bridge_enabled = _args.bridge_enabled and not _args.no_bridge
             if bridge_enabled:
                 try:
@@ -954,18 +980,19 @@ async def main():
                         get_cost_summary,
                     )
                     _bridge = await initialize_bridge(port=_args.port)
-                    logger.info("[Background] Cross-repo bridge initialized")
+                    log_step_complete("Cross-repo bridge", time.time() - step_start)
                 except Exception as e:
-                    logger.warning(f"[Background] Cross-repo bridge failed: {e}")
+                    logger.warning(f"⚠️ Cross-repo bridge failed: {e}")
                     _bridge = None
             else:
-                logger.info("[Background] Cross-repo bridge disabled")
+                logger.info("   ℹ️ Cross-repo bridge disabled (--no-bridge)")
                 _bridge = None
 
             # -----------------------------------------------------------------
             # STEP 3: Initialize Trinity bridge
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "initializing_trinity"
+            step_start = time.time()
+            log_step("initializing_trinity", 3)
             try:
                 from jarvis_prime.core.trinity_bridge import (
                     initialize_trinity,
@@ -978,20 +1005,21 @@ async def main():
                 if TRINITY_ENABLED:
                     _trinity_initialized = await initialize_trinity(port=_args.port)
                     if _trinity_initialized:
-                        logger.info("[Background] PROJECT TRINITY: J-Prime connected")
+                        log_step_complete("Trinity bridge", time.time() - step_start)
                     else:
-                        logger.warning("[Background] PROJECT TRINITY: Init returned False")
+                        logger.warning("   ⚠️ Trinity init returned False")
                 else:
-                    logger.info("[Background] PROJECT TRINITY: Disabled")
+                    logger.info("   ℹ️ Trinity disabled")
             except ImportError as e:
-                logger.warning(f"[Background] PROJECT TRINITY: Module not available ({e})")
+                logger.warning(f"   ⚠️ Trinity module not available ({e})")
             except Exception as e:
-                logger.warning(f"[Background] PROJECT TRINITY: Init failed ({e})")
+                logger.warning(f"   ⚠️ Trinity init failed ({e})")
 
             # -----------------------------------------------------------------
             # STEP 4: Initialize AGI Hub
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "initializing_agi_hub"
+            step_start = time.time()
+            log_step("initializing_agi_hub", 4)
             try:
                 from jarvis_prime.core.agi_integration import (
                     AGIIntegrationHub,
@@ -1012,16 +1040,17 @@ async def main():
                 )
 
                 _agi_hub = await get_agi_hub(agi_config)
-                logger.info("[Background] AGI v77.0: Integration Hub initialized")
+                log_step_complete("AGI Integration Hub", time.time() - step_start)
             except ImportError as e:
-                logger.warning(f"[Background] AGI Integration Hub not available: {e}")
+                logger.warning(f"   ⚠️ AGI Hub not available: {e}")
             except Exception as e:
-                logger.warning(f"[Background] AGI Integration Hub init failed: {e}")
+                logger.warning(f"   ⚠️ AGI Hub init failed: {e}")
 
             # -----------------------------------------------------------------
             # STEP 5: Initialize Neural Orchestrator
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "initializing_neural_orchestrator"
+            step_start = time.time()
+            log_step("initializing_neural_orchestrator", 5)
             try:
                 from jarvis_prime.core.neural_orchestrator_core import (
                     NeuralOrchestratorCore,
@@ -1035,18 +1064,19 @@ async def main():
                 neural_config = NeuralConfig.from_env_and_yaml()
                 _neural_orchestrator = await get_neural_orchestrator(neural_config)
                 _neural_routing_enabled = True
-                logger.info("[Background] Neural Orchestrator Core v100.0: Initialized")
+                log_step_complete("Neural Orchestrator", time.time() - step_start)
             except ImportError as e:
-                logger.warning(f"[Background] Neural Orchestrator not available: {e}")
+                logger.warning(f"   ⚠️ Neural Orchestrator not available: {e}")
             except Exception as e:
-                logger.warning(f"[Background] Neural Orchestrator init failed: {e}")
+                logger.warning(f"   ⚠️ Neural Orchestrator init failed: {e}")
                 import traceback
                 traceback.print_exc()
 
             # -----------------------------------------------------------------
             # STEP 6: Resolve model path and download if needed
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "resolving_model"
+            step_start = time.time()
+            log_step("resolving_model", 6)
             _startup_state.phase = "loading_model"
 
             model_path = Path(_args.model)
@@ -1119,11 +1149,18 @@ async def main():
                     traceback.print_exc()
 
             _model_path = model_path
+            logger.info(f"   Model path: {model_path}")
+            logger.info(f"   Exists: {model_path.exists()}")
+            if model_path.exists():
+                size_gb = model_path.stat().st_size / (1024**3)
+                logger.info(f"   Size: {size_gb:.2f} GB")
+            log_step_complete("Model resolution", time.time() - step_start)
 
             # -----------------------------------------------------------------
             # STEP 7: Hardware optimization and executor creation
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "configuring_hardware"
+            step_start = time.time()
+            log_step("configuring_hardware", 7)
             optimized_gpu_layers = _args.gpu_layers
             optimized_threads = _args.threads
             optimized_ctx_size = _args.ctx_size
@@ -1165,11 +1202,16 @@ async def main():
                 cache_prompt=True,
             )
             _executor = LlamaCppExecutor(config)
+            logger.info(f"   GPU Layers: {optimized_gpu_layers}")
+            logger.info(f"   Threads: {optimized_threads}")
+            logger.info(f"   Context: {optimized_ctx_size}")
+            log_step_complete("Hardware configuration", time.time() - step_start)
 
             # -----------------------------------------------------------------
             # STEP 8: Load model (v93.7: with timeout and progress reporting)
             # -----------------------------------------------------------------
-            _startup_state.details["step"] = "loading_model"
+            step_start = time.time()
+            log_step("loading_model", 8)
             _startup_state.model_load_start = time.time()
 
             # v93.7: Configurable model loading timeout
@@ -1210,6 +1252,9 @@ async def main():
                     _startup_state.model_loaded = True
                     _startup_state.model_path = str(model_path)
                     logger.info(f"[Background] Model loaded in {load_time:.2f}s")
+
+                    # v93.7: Log step completion with timing
+                    log_step_complete("Model loading", load_time)
 
                 except asyncio.TimeoutError:
                     load_time = time.time() - start
@@ -1253,32 +1298,66 @@ async def main():
                         pass
 
             # -----------------------------------------------------------------
-            # STEP 9: Mark ready
+            # STEP 9: Mark ready (v93.7: with enhanced logging)
             # -----------------------------------------------------------------
+            step_start = time.time()
+            log_step("marking_ready", 9)
+
             _startup_state.phase = "ready"
             _startup_state.init_elapsed = time.time() - init_start
             _startup_state.details = {}  # Clear step details
 
-            logger.info("=" * 60)
-            logger.info("JARVIS-Prime Tier-0 Brain Server (v93.2)")
-            logger.info("=" * 60)
-            logger.info(f"Initialization completed in {_startup_state.init_elapsed:.2f}s")
-            logger.info(f"Model: {model_path.name if model_path.exists() else 'Not loaded'}")
-            logger.info(f"Context: {_args.ctx_size} tokens")
-            logger.info(f"GPU layers: {optimized_gpu_layers}")
-            logger.info(f"Listening: http://{_args.host}:{_args.port}")
+            # v93.7: Calculate detailed timing breakdown
+            total_time = _startup_state.init_elapsed
+            model_load_time = _startup_state.model_load_elapsed or 0
+            init_overhead = total_time - model_load_time
+
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("🎉 JARVIS-PRIME INITIALIZATION COMPLETE")
+            logger.info("=" * 70)
+            logger.info("")
+            logger.info("📊 TIMING BREAKDOWN:")
+            logger.info(f"   Total initialization: {total_time:.2f}s")
+            logger.info(f"   ├─ Model loading:     {model_load_time:.2f}s ({model_load_time/total_time*100:.1f}%)" if total_time > 0 else f"   ├─ Model loading:     {model_load_time:.2f}s")
+            logger.info(f"   └─ Other init:        {init_overhead:.2f}s ({init_overhead/total_time*100:.1f}%)" if total_time > 0 else f"   └─ Other init:        {init_overhead:.2f}s")
+            logger.info("")
+            logger.info("🖥️  SERVER CONFIGURATION:")
+            logger.info(f"   Model: {model_path.name if model_path.exists() else 'Not loaded'}")
+            if model_path.exists():
+                model_size_gb = model_path.stat().st_size / (1024**3)
+                logger.info(f"   Size:  {model_size_gb:.2f} GB")
+            logger.info(f"   Context: {_args.ctx_size} tokens")
+            logger.info(f"   GPU layers: {optimized_gpu_layers}")
+            logger.info(f"   Threads: {optimized_threads}")
+            logger.info(f"   Listening: http://{_args.host}:{_args.port}")
+            logger.info("")
+            logger.info("🔌 INTEGRATIONS:")
 
             if _bridge:
-                logger.info(f"JARVIS Bridge: {'Connected' if _bridge.state.connected_to_jarvis else 'Enabled (standalone)'}")
+                logger.info(f"   ├─ JARVIS Bridge: {'Connected' if _bridge.state.connected_to_jarvis else 'Enabled (standalone)'}")
+            else:
+                logger.info("   ├─ JARVIS Bridge: Disabled")
             if _trinity_initialized:
-                logger.info("PROJECT TRINITY: Connected (Mind component online)")
+                logger.info("   ├─ PROJECT TRINITY: Connected (Mind component)")
+            else:
+                logger.info("   ├─ PROJECT TRINITY: Not initialized")
             if _agi_hub:
-                logger.info("AGI Integration Hub: Active")
+                logger.info("   ├─ AGI Integration Hub: Active")
+            else:
+                logger.info("   ├─ AGI Integration Hub: Not initialized")
             if _neural_routing_enabled:
-                logger.info("Neural Orchestrator v100.0: Active")
+                logger.info("   └─ Neural Orchestrator v100.0: Active")
+            else:
+                logger.info("   └─ Neural Orchestrator: Not initialized")
 
-            logger.info("=" * 60)
-            logger.info("[Background] Server ready for inference!")
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("✅ READY FOR INFERENCE")
+            logger.info("=" * 70)
+            logger.info("")
+
+            log_step_complete("Marking ready", time.time() - step_start)
 
         except Exception as e:
             logger.error(f"[Background] Initialization failed: {e}")

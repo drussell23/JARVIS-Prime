@@ -916,14 +916,42 @@ class LlamaCppExecutor:
             except Exception as e:
                 logger.debug(f"Advanced options not supported: {e}")
 
-            # Load model
+            # v93.7: Enhanced model loading with detailed logging and memory monitoring
             load_start = time.time()
+            model_size_gb = model_path.stat().st_size / (1024**3)
+
+            # Estimate load time based on model size (rough heuristic: ~30s per GB on SSD)
+            estimated_load_time = model_size_gb * 30
+            logger.info(f"")
+            logger.info(f"🔄 LOADING MODEL: {model_path.name}")
+            logger.info(f"   Size: {model_size_gb:.2f} GB")
+            logger.info(f"   Estimated load time: {estimated_load_time:.0f}s (varies by hardware)")
+            logger.info(f"")
+
+            # v93.7: Get memory before loading
+            try:
+                import psutil
+                process = psutil.Process()
+                mem_before = process.memory_info().rss / (1024**3)
+                system_mem = psutil.virtual_memory()
+                logger.info(f"📊 Memory before load:")
+                logger.info(f"   Process RSS: {mem_before:.2f} GB")
+                logger.info(f"   System Available: {system_mem.available / (1024**3):.2f} GB")
+                logger.info(f"   System Used: {system_mem.percent:.1f}%")
+            except ImportError:
+                mem_before = None
+                logger.debug("psutil not available for memory monitoring")
+
+            # v93.7: Log loading phases
+            logger.info(f"")
+            logger.info(f"⏳ Phase 1/3: Parsing model metadata...")
 
             try:
                 self._model = Llama(**llama_kwargs)
             except Exception as e:
                 # Retry without advanced options
                 logger.warning(f"Failed with advanced options, retrying basic: {e}")
+                logger.info(f"⏳ Retrying with basic options...")
                 basic_kwargs = {
                     "model_path": str(model_path),
                     "n_ctx": n_ctx,
@@ -940,11 +968,30 @@ class LlamaCppExecutor:
             self._model_name = model_name
             self._loaded_at = time.time()
 
-            # Log success
+            # v93.7: Get memory after loading
+            try:
+                import psutil
+                process = psutil.Process()
+                mem_after = process.memory_info().rss / (1024**3)
+                mem_used = mem_after - mem_before if mem_before else 0
+                system_mem = psutil.virtual_memory()
+                logger.info(f"")
+                logger.info(f"📊 Memory after load:")
+                logger.info(f"   Process RSS: {mem_after:.2f} GB (+{mem_used:.2f} GB)")
+                logger.info(f"   System Available: {system_mem.available / (1024**3):.2f} GB")
+                logger.info(f"   System Used: {system_mem.percent:.1f}%")
+            except ImportError:
+                pass
+
+            # Log success with detailed metrics
+            logger.info("")
             logger.info("=" * 60)
-            logger.info(f"Model loaded successfully in {load_time:.2f}s")
-            logger.info(f"  Model: {model_path.name}")
-            logger.info(f"  Size: {model_path.stat().st_size / (1024**3):.2f} GB")
+            logger.info(f"✅ MODEL LOADED SUCCESSFULLY")
+            logger.info("=" * 60)
+            logger.info(f"   Model: {model_path.name}")
+            logger.info(f"   Size: {model_size_gb:.2f} GB")
+            logger.info(f"   Load time: {load_time:.2f}s")
+            logger.info(f"   Throughput: {model_size_gb / load_time:.2f} GB/s")
 
             # Check if Metal is being used
             if self._hardware.backend == HardwareBackend.METAL and n_gpu_layers != 0:
