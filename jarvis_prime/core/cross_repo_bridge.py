@@ -36,6 +36,14 @@ PRIME_STATE_FILE = BRIDGE_STATE_DIR / "jarvis_prime_state.json"
 HEARTBEAT_INTERVAL = 30  # seconds
 STALE_THRESHOLD = 120  # seconds - consider stale if no heartbeat
 
+# v93.3: Intelligent Cross-Repo Connection Constants
+STARTUP_GRACE_PERIOD = float(os.environ.get("JARVIS_STARTUP_GRACE_PERIOD", "120.0"))  # 2 min grace
+INITIAL_RETRY_DELAY = float(os.environ.get("JARVIS_INITIAL_RETRY_DELAY", "2.0"))  # Start with 2s
+MAX_RETRY_DELAY = float(os.environ.get("JARVIS_MAX_RETRY_DELAY", "30.0"))  # Cap at 30s
+RETRY_BACKOFF_MULTIPLIER = float(os.environ.get("JARVIS_RETRY_BACKOFF", "1.5"))  # 1.5x each retry
+MAX_STARTUP_RETRIES = int(os.environ.get("JARVIS_MAX_STARTUP_RETRIES", "10"))  # 10 retries during startup
+AGGRESSIVE_RETRY_INTERVAL = float(os.environ.get("JARVIS_AGGRESSIVE_RETRY", "5.0"))  # 5s during startup
+
 # PROJECT TRINITY: Unified command routing
 TRINITY_DIR = Path.home() / ".jarvis" / "trinity"
 TRINITY_COMMANDS_DIR = TRINITY_DIR / "commands"
@@ -111,6 +119,13 @@ class PrimeState:
     connected_to_jarvis: bool = False
     jarvis_session_id: str = ""
 
+    # v93.3: Enhanced Connection State Tracking
+    connection_state: str = "initializing"  # initializing, connecting, connected, standalone, reconnecting
+    connection_attempts: int = 0
+    last_connection_attempt: str = ""
+    connection_error: str = ""
+    startup_phase: bool = True  # True during initial startup grace period
+
     # v93.0: Predictive Memory Defense integration
     memory_pressure_status: str = "normal"  # normal, elevated, critical, offload_active
     paused_by_memory_defense: bool = False  # True if SIGSTOP'd by main JARVIS
@@ -169,50 +184,239 @@ class CrossRepoBridge:
             last_heartbeat=datetime.now().isoformat(),
             port=port,
             endpoint=f"http://localhost:{port}",
+            connection_state="initializing",
+            startup_phase=True,
         )
 
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._connection_retry_task: Optional[asyncio.Task] = None
+        self._startup_grace_task: Optional[asyncio.Task] = None
         self._shutdown_callbacks: List[Callable] = []
         self._initialized = False
+
+        # v93.3: Intelligent Retry State
+        self._startup_time = time.time()
+        self._retry_delay = INITIAL_RETRY_DELAY
+        self._connection_lock = asyncio.Lock()
 
         # Ensure state directory exists
         BRIDGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     async def initialize(self) -> None:
-        """Initialize the bridge and connect to main JARVIS."""
+        """
+        v93.3: Initialize the bridge with intelligent retry logic.
+
+        CRITICAL FIX: Uses startup-aware connection with:
+        1. Immediate state write (even before JARVIS connection)
+        2. Parallel startup grace period monitoring
+        3. Intelligent exponential backoff retry
+        4. Graceful degradation to standalone mode
+        """
         if self._initialized:
             return
 
-        logger.info(f"Initializing cross-repo bridge (instance={self.instance_id})")
+        logger.info(f"[v93.3] Initializing cross-repo bridge (instance={self.instance_id})")
 
-        # Check for main JARVIS instance
-        await self._check_jarvis_connection()
-
-        # Write initial state
+        # Write initial state FIRST - ensures we're discoverable immediately
+        self.state.connection_state = "connecting"
         await self._write_state()
 
-        # Start heartbeat loop
+        # Start startup grace period monitor (runs in background)
+        self._startup_grace_task = asyncio.create_task(self._startup_grace_monitor())
+
+        # Attempt initial JARVIS connection with retry
+        connected = await self._connect_with_retry()
+
+        if not connected:
+            # Not connected yet - startup grace period will continue retrying
+            logger.info(
+                f"[v93.3] JARVIS not available yet, entering startup grace period "
+                f"({STARTUP_GRACE_PERIOD}s) - will continue retrying in background"
+            )
+            self.state.connection_state = "standalone"
+            await self._write_state()
+
+        # Start heartbeat loop (this will also retry connection periodically)
         if self.auto_heartbeat:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         self._initialized = True
-        logger.info("Cross-repo bridge initialized successfully")
+        logger.info(
+            f"[v93.3] Cross-repo bridge initialized "
+            f"(connected={self.state.connected_to_jarvis}, "
+            f"state={self.state.connection_state})"
+        )
+
+    async def _connect_with_retry(self, max_retries: Optional[int] = None) -> bool:
+        """
+        v93.3: Attempt JARVIS connection with intelligent exponential backoff.
+
+        Args:
+            max_retries: Max retry attempts (None = use MAX_STARTUP_RETRIES during startup)
+
+        Returns:
+            True if connected, False if all retries exhausted
+        """
+        max_retries = max_retries or MAX_STARTUP_RETRIES
+        retry_delay = INITIAL_RETRY_DELAY
+
+        for attempt in range(1, max_retries + 1):
+            async with self._connection_lock:
+                self.state.connection_attempts += 1
+                self.state.last_connection_attempt = datetime.now().isoformat()
+
+                try:
+                    connected = await self._try_jarvis_connection()
+                    if connected:
+                        self.state.connection_state = "connected"
+                        self.state.connection_error = ""
+                        await self._write_state()
+                        logger.info(
+                            f"[v93.3] Connected to JARVIS on attempt {attempt} "
+                            f"(session={self.state.jarvis_session_id[:8] if self.state.jarvis_session_id else 'N/A'}...)"
+                        )
+                        return True
+
+                except Exception as e:
+                    self.state.connection_error = str(e)
+                    logger.debug(f"[v93.3] Connection attempt {attempt} failed: {e}")
+
+                # Not connected - wait before retry with exponential backoff
+                if attempt < max_retries:
+                    logger.debug(
+                        f"[v93.3] JARVIS not found, retry {attempt}/{max_retries} "
+                        f"in {retry_delay:.1f}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * RETRY_BACKOFF_MULTIPLIER, MAX_RETRY_DELAY)
+
+        return False
+
+    async def _try_jarvis_connection(self) -> bool:
+        """
+        v93.3: Single attempt to connect to JARVIS.
+
+        Returns:
+            True if JARVIS state exists and is fresh, False otherwise
+        """
+        jarvis_state = await self.get_jarvis_state()
+
+        if not jarvis_state:
+            return False
+
+        # Check if JARVIS state is recent (not stale)
+        last_update = jarvis_state.get("last_update", "")
+        if not last_update:
+            return False
+
+        try:
+            update_time = datetime.fromisoformat(last_update)
+            age_seconds = (datetime.now() - update_time).total_seconds()
+
+            # During startup grace period, be more lenient with stale threshold
+            effective_threshold = STALE_THRESHOLD
+            if self.state.startup_phase:
+                # Allow 5x longer stale threshold during startup
+                effective_threshold = STALE_THRESHOLD * 5
+
+            if age_seconds < effective_threshold:
+                self.state.connected_to_jarvis = True
+                self.state.jarvis_session_id = jarvis_state.get("session_id", "")
+                await self.notify_jarvis("connected", {
+                    "port": self.port,
+                    "model_loaded": self.state.model_loaded,
+                    "connection_attempt": self.state.connection_attempts,
+                })
+                return True
+
+        except (ValueError, TypeError) as e:
+            logger.debug(f"[v93.3] Failed to parse JARVIS state timestamp: {e}")
+
+        return False
+
+    async def _startup_grace_monitor(self) -> None:
+        """
+        v93.3: Monitor startup grace period and transition to normal mode.
+
+        During startup grace period:
+        - More aggressive retry interval (AGGRESSIVE_RETRY_INTERVAL)
+        - Continues attempting connection in background
+        - After grace period, transitions to normal retry interval
+        """
+        grace_end_time = self._startup_time + STARTUP_GRACE_PERIOD
+        aggressive_retries = 0
+
+        while True:
+            try:
+                current_time = time.time()
+                remaining_grace = grace_end_time - current_time
+
+                if remaining_grace <= 0:
+                    # Grace period ended
+                    self.state.startup_phase = False
+                    await self._write_state()
+                    logger.info(
+                        f"[v93.3] Startup grace period ended - "
+                        f"connected={self.state.connected_to_jarvis}, "
+                        f"total_attempts={self.state.connection_attempts}"
+                    )
+                    break
+
+                # During grace period, aggressively retry if not connected
+                if not self.state.connected_to_jarvis:
+                    aggressive_retries += 1
+                    logger.debug(
+                        f"[v93.3] Startup grace retry {aggressive_retries} "
+                        f"(remaining={remaining_grace:.1f}s)"
+                    )
+                    connected = await self._try_jarvis_connection()
+                    if connected:
+                        self.state.connection_state = "connected"
+                        await self._write_state()
+                        logger.info(
+                            f"[v93.3] Connected to JARVIS during startup grace "
+                            f"(after {aggressive_retries} aggressive retries)"
+                        )
+                        # Continue monitoring in case we need to reconnect
+                    else:
+                        self.state.connection_state = "standalone"
+                        await self._write_state()
+
+                await asyncio.sleep(AGGRESSIVE_RETRY_INTERVAL)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"[v93.3] Startup grace monitor error: {e}")
+                await asyncio.sleep(AGGRESSIVE_RETRY_INTERVAL)
 
     async def shutdown(self) -> None:
-        """Gracefully shutdown the bridge."""
-        logger.info("Shutting down cross-repo bridge...")
+        """
+        v93.3: Gracefully shutdown the bridge with proper task cleanup.
+        """
+        logger.info("[v93.3] Shutting down cross-repo bridge...")
 
         # Update state
         self.state.status = "shutting_down"
+        self.state.connection_state = "disconnecting"
         await self._write_state()
 
-        # Stop heartbeat
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
+        # v93.3: Cancel all background tasks
+        tasks_to_cancel = [
+            ("heartbeat", self._heartbeat_task),
+            ("startup_grace", self._startup_grace_task),
+            ("connection_retry", self._connection_retry_task),
+        ]
+
+        for task_name, task in tasks_to_cancel:
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception as e:
+                    logger.debug(f"[v93.3] Error cancelling {task_name} task: {e}")
 
         # Run shutdown callbacks
         for callback in self._shutdown_callbacks:
@@ -224,11 +428,22 @@ class CrossRepoBridge:
             except Exception as e:
                 logger.warning(f"Shutdown callback error: {e}")
 
+        # Notify JARVIS of shutdown if connected
+        if self.state.connected_to_jarvis:
+            try:
+                await self.notify_jarvis("disconnected", {
+                    "reason": "shutdown",
+                    "uptime_seconds": time.time() - self._startup_time,
+                })
+            except Exception as e:
+                logger.debug(f"[v93.3] Failed to notify JARVIS of shutdown: {e}")
+
         # Mark as stopped
         self.state.status = "stopped"
+        self.state.connection_state = "disconnected"
         await self._write_state()
 
-        logger.info("Cross-repo bridge shutdown complete")
+        logger.info("[v93.3] Cross-repo bridge shutdown complete")
 
     def on_shutdown(self, callback: Callable) -> None:
         """Register a callback to run on shutdown."""
@@ -637,57 +852,109 @@ class CrossRepoBridge:
         )
 
     async def _check_jarvis_connection(self) -> None:
-        """Check if main JARVIS is running and get session info."""
-        jarvis_state = await self.get_jarvis_state()
-
-        if jarvis_state:
-            # Check if JARVIS state is recent (not stale)
-            last_update = jarvis_state.get("last_update", "")
-            if last_update:
-                try:
-                    update_time = datetime.fromisoformat(last_update)
-                    age_seconds = (datetime.now() - update_time).total_seconds()
-
-                    if age_seconds < STALE_THRESHOLD:
-                        self.state.connected_to_jarvis = True
-                        self.state.jarvis_session_id = jarvis_state.get("session_id", "")
-                        logger.info(f"Connected to JARVIS session: {self.state.jarvis_session_id}")
-                        await self.notify_jarvis("connected", {
-                            "port": self.port,
-                            "model_loaded": self.state.model_loaded,
-                        })
-                        return
-                except (ValueError, TypeError):
-                    pass
-
-        self.state.connected_to_jarvis = False
-        logger.info("Main JARVIS not detected - running standalone")
+        """
+        v93.3: DEPRECATED - Use _try_jarvis_connection instead.
+        Kept for backward compatibility.
+        """
+        connected = await self._try_jarvis_connection()
+        if not connected:
+            self.state.connected_to_jarvis = False
+            if not self.state.startup_phase:
+                # Only log standalone message after startup grace period
+                logger.info("[v93.3] Main JARVIS not detected - running standalone")
 
     async def _write_state(self) -> None:
-        """Write current state to shared file."""
+        """Write current state to shared file with atomic write."""
         try:
             self.state.last_heartbeat = datetime.now().isoformat()
-            PRIME_STATE_FILE.write_text(json.dumps(self.state.to_dict(), indent=2))
+            # v93.3: Atomic write to prevent partial state reads
+            temp_file = PRIME_STATE_FILE.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(self.state.to_dict(), indent=2))
+            temp_file.replace(PRIME_STATE_FILE)
         except Exception as e:
             logger.warning(f"Failed to write state: {e}")
 
     async def _heartbeat_loop(self) -> None:
-        """Background loop to maintain heartbeat and sync state."""
+        """
+        v93.3: Enhanced background heartbeat loop with intelligent reconnection.
+
+        Features:
+        - Periodic state sync
+        - Intelligent JARVIS reconnection with backoff
+        - Connection state tracking
+        - Handles both connected and standalone modes
+        """
+        reconnect_delay = HEARTBEAT_INTERVAL
+        consecutive_failures = 0
+
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-                # Update heartbeat
+                # Update heartbeat - always write state
                 await self._write_state()
 
-                # Re-check JARVIS connection periodically
+                # v93.3: Intelligent reconnection logic
                 if not self.state.connected_to_jarvis:
-                    await self._check_jarvis_connection()
+                    # Attempt reconnection
+                    self.state.connection_state = "reconnecting"
+
+                    connected = await self._try_jarvis_connection()
+
+                    if connected:
+                        self.state.connection_state = "connected"
+                        consecutive_failures = 0
+                        reconnect_delay = HEARTBEAT_INTERVAL
+                        logger.info(
+                            f"[v93.3] Reconnected to JARVIS "
+                            f"(session={self.state.jarvis_session_id[:8] if self.state.jarvis_session_id else 'N/A'}...)"
+                        )
+                    else:
+                        consecutive_failures += 1
+                        self.state.connection_state = "standalone"
+
+                        # Exponential backoff for reconnection attempts
+                        if consecutive_failures > 3:
+                            reconnect_delay = min(
+                                reconnect_delay * RETRY_BACKOFF_MULTIPLIER,
+                                MAX_RETRY_DELAY * 2
+                            )
+
+                        if consecutive_failures % 5 == 0:
+                            logger.debug(
+                                f"[v93.3] JARVIS reconnection attempt {consecutive_failures} failed, "
+                                f"next retry in {reconnect_delay:.1f}s"
+                            )
+                else:
+                    # Verify JARVIS is still alive
+                    jarvis_state = await self.get_jarvis_state()
+                    if jarvis_state:
+                        last_update = jarvis_state.get("last_update", "")
+                        if last_update:
+                            try:
+                                update_time = datetime.fromisoformat(last_update)
+                                age_seconds = (datetime.now() - update_time).total_seconds()
+
+                                if age_seconds > STALE_THRESHOLD:
+                                    # JARVIS went stale
+                                    logger.warning(
+                                        f"[v93.3] JARVIS connection lost "
+                                        f"(last heartbeat {age_seconds:.0f}s ago)"
+                                    )
+                                    self.state.connected_to_jarvis = False
+                                    self.state.connection_state = "reconnecting"
+                            except (ValueError, TypeError):
+                                pass
+                    else:
+                        # JARVIS state file disappeared
+                        logger.warning("[v93.3] JARVIS state file not found - connection lost")
+                        self.state.connected_to_jarvis = False
+                        self.state.connection_state = "reconnecting"
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"Heartbeat error: {e}")
+                logger.warning(f"[v93.3] Heartbeat error: {e}")
 
 
 # ============================================================================
