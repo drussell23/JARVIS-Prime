@@ -115,7 +115,8 @@ class StartupState:
         """
         Get current status for health endpoint.
 
-        v93.5: Reports model_load_elapsed_seconds DURING loading (not just after)
+        v93.7: Enhanced with detailed step information and loading progress.
+        Reports model_load_elapsed_seconds DURING loading (not just after)
         to enable intelligent progress-based timeout extension.
         """
         elapsed = time.time() - self.start_time
@@ -130,6 +131,11 @@ class StartupState:
         if self.init_elapsed:
             result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
 
+        # v93.7: Report current initialization step for better debugging
+        if self.details:
+            result["current_step"] = self.details.get("step", "unknown")
+            result["details"] = self.details
+
         # v93.5: Report model load elapsed DURING loading (not just after)
         # This enables the orchestrator's intelligent timeout extension
         if self.model_load_elapsed:
@@ -139,11 +145,12 @@ class StartupState:
             current_elapsed = time.time() - self.model_load_start
             result["model_load_elapsed_seconds"] = round(current_elapsed, 1)
             result["model_loading_in_progress"] = True
+            # v93.7: Estimate progress based on typical load time
+            model_timeout = self.details.get("model_load_timeout", 600.0)
+            result["model_load_progress_pct"] = min(95, round((current_elapsed / model_timeout) * 100, 1))
 
         if self.error:
             result["error"] = self.error
-        if self.details:
-            result["details"] = self.details
         return result
 
 
@@ -1160,20 +1167,68 @@ async def main():
             _executor = LlamaCppExecutor(config)
 
             # -----------------------------------------------------------------
-            # STEP 8: Load model
+            # STEP 8: Load model (v93.7: with timeout and progress reporting)
             # -----------------------------------------------------------------
             _startup_state.details["step"] = "loading_model"
             _startup_state.model_load_start = time.time()
 
+            # v93.7: Configurable model loading timeout
+            model_load_timeout = float(os.environ.get("MODEL_LOAD_TIMEOUT", "600.0"))  # 10 min default
+
             if model_path.exists():
-                logger.info(f"[Background] Loading model: {model_path}")
+                model_size_mb = model_path.stat().st_size / (1024 * 1024)
+                logger.info(f"[Background] Loading model: {model_path} ({model_size_mb:.1f}MB)")
+                logger.info(f"[Background] Model load timeout: {model_load_timeout}s")
+                _startup_state.details["model_size_mb"] = round(model_size_mb, 1)
+                _startup_state.details["model_load_timeout"] = model_load_timeout
+
                 start = time.time()
-                await _executor.load(model_path)
-                load_time = time.time() - start
-                _startup_state.model_load_elapsed = load_time
-                _startup_state.model_loaded = True
-                _startup_state.model_path = str(model_path)
-                logger.info(f"[Background] Model loaded in {load_time:.2f}s")
+
+                # v93.7: Progress reporting task
+                async def report_progress():
+                    """Report progress every 30 seconds during model loading."""
+                    while True:
+                        await asyncio.sleep(30)
+                        elapsed = time.time() - start
+                        remaining = model_load_timeout - elapsed
+                        logger.info(
+                            f"[Background] Model loading... {elapsed:.0f}s elapsed, "
+                            f"{remaining:.0f}s remaining (timeout: {model_load_timeout}s)"
+                        )
+                        _startup_state.details["loading_elapsed"] = round(elapsed, 1)
+
+                progress_task = asyncio.create_task(report_progress())
+
+                try:
+                    # v93.7: Model loading with timeout protection
+                    await asyncio.wait_for(
+                        _executor.load(model_path),
+                        timeout=model_load_timeout
+                    )
+                    load_time = time.time() - start
+                    _startup_state.model_load_elapsed = load_time
+                    _startup_state.model_loaded = True
+                    _startup_state.model_path = str(model_path)
+                    logger.info(f"[Background] Model loaded in {load_time:.2f}s")
+
+                except asyncio.TimeoutError:
+                    load_time = time.time() - start
+                    logger.error(
+                        f"[Background] MODEL LOAD TIMEOUT after {load_time:.1f}s "
+                        f"(limit: {model_load_timeout}s)"
+                    )
+                    _startup_state.phase = "error"
+                    _startup_state.error = f"Model load timeout after {load_time:.1f}s"
+                    _startup_state.model_load_elapsed = load_time
+                    progress_task.cancel()
+                    return
+
+                finally:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
 
                 if _bridge:
                     try:
