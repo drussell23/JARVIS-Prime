@@ -1,0 +1,208 @@
+# =============================================================================
+# JARVIS Prime Docker Compose v2.0.0
+# =============================================================================
+#
+# Production-ready Docker Compose configuration for JARVIS Prime.
+# Pre-loads models during build, persists cache via volumes.
+#
+# Usage:
+#   # Start service (builds if needed)
+#   docker compose -f docker/docker-compose.yml up -d
+#
+#   # Build with specific model
+#   docker compose -f docker/docker-compose.yml build \
+#     --build-arg DEFAULT_MODEL=mistral-7b-instruct
+#
+#   # View logs
+#   docker compose -f docker/docker-compose.yml logs -f jarvis-prime
+#
+#   # Stop service
+#   docker compose -f docker/docker-compose.yml down
+#
+#   # Full rebuild (no cache)
+#   docker compose -f docker/docker-compose.yml build --no-cache
+#
+# Test Endpoints:
+#   curl http://localhost:8000/health
+#   curl http://localhost:8000/v1/models
+#   curl -X POST http://localhost:8000/generate -H "Content-Type: application/json" \
+#     -d '{"prompt": "Hello, JARVIS!", "max_tokens": 50}'
+#
+# v2.0.0 - Advanced Docker Compose with model pre-loading and hybrid orchestration
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # JARVIS Prime - Local LLM Inference Service
+  # ===========================================================================
+  jarvis-prime:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
+        DEFAULT_MODEL: "${JARVIS_PRIME_MODEL:-phi-3.5-mini}"
+        PRELOAD_MODELS: "${PRELOAD_MODELS:-true}"
+        MODEL_CACHE_DIR: "/opt/jarvis_prime_cache"
+
+    image: jarvis-prime:${JARVIS_PRIME_VERSION:-latest}
+    container_name: jarvis-prime-service
+
+    # Port mapping - exposes 8000 for JARVIS ecosystem integration
+    ports:
+      - "${JARVIS_PRIME_PORT:-8000}:8000"
+
+    # Environment variables for runtime configuration
+    environment:
+      # Server configuration
+      - PORT=8000
+      - HOST=0.0.0.0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+
+      # Model configuration
+      - MODEL_CACHE_DIR=/opt/jarvis_prime_cache
+      - MODEL_PATH=/opt/jarvis_prime_cache/models/current.gguf
+      - DEFAULT_MODEL=${JARVIS_PRIME_MODEL:-phi-3.5-mini}
+      - AUTO_DOWNLOAD_MODEL=${AUTO_DOWNLOAD_MODEL:-true}
+
+      # HuggingFace cache paths
+      - HF_HOME=/opt/jarvis_prime_cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/opt/jarvis_prime_cache/huggingface
+      - TRANSFORMERS_CACHE=/opt/jarvis_prime_cache/huggingface
+      - TORCH_HOME=/opt/jarvis_prime_cache/torch
+      - XDG_CACHE_HOME=/opt/jarvis_prime_cache/xdg
+
+      # Model loading configuration
+      - MODEL_LOAD_TIMEOUT=${MODEL_LOAD_TIMEOUT:-600}
+      - WARMUP_ON_START=${WARMUP_ON_START:-true}
+      - MODEL_QUANTIZATION=${MODEL_QUANTIZATION:-Q4_K_M}
+
+      # llama-cpp-python configuration
+      - N_CTX=${N_CTX:-4096}
+      - N_THREADS=${N_THREADS:-4}
+      - N_GPU_LAYERS=${N_GPU_LAYERS:-0}
+      - N_BATCH=${N_BATCH:-512}
+
+      # Performance tuning
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-10}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
+
+      # Cross-repo bridge configuration (for JARVIS integration)
+      - JARVIS_BRIDGE_ENABLED=${JARVIS_BRIDGE_ENABLED:-true}
+      - JARVIS_BODY_URL=${JARVIS_BODY_URL:-http://host.docker.internal:8010}
+
+      # Python settings
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+
+    # Persistent volumes for model cache
+    volumes:
+      # Model cache persists between restarts (faster cold starts)
+      - jarvis-prime-models:/opt/jarvis_prime_cache/models
+      - jarvis-prime-hf-cache:/opt/jarvis_prime_cache/huggingface
+
+      # Mount local models directory (for development)
+      # Uncomment to use local models instead of downloaded ones:
+      # - ../models:/opt/jarvis_prime_cache/models:ro
+
+    # Health check configuration
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 180s  # Allow 3 minutes for model loading
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Resource limits (adjust based on model size)
+    deploy:
+      resources:
+        limits:
+          cpus: "${JARVIS_PRIME_CPU_LIMIT:-4.0}"
+          memory: "${JARVIS_PRIME_MEMORY_LIMIT:-16G}"
+        reservations:
+          cpus: "1.0"
+          memory: "4G"
+
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,environment"
+      # Alternative: Use fluentd for centralized logging
+      # driver: fluentd
+      # options:
+      #   fluentd-address: localhost:24224
+      #   tag: jarvis-prime
+
+    # Labels for service discovery and orchestration
+    labels:
+      - "com.jarvis.service=jarvis-prime"
+      - "com.jarvis.version=${JARVIS_PRIME_VERSION:-2.0.0}"
+      - "com.jarvis.component=local-llm"
+      - "com.jarvis.tier=tier-0"
+      - "traefik.enable=false"
+
+    # Network configuration
+    networks:
+      - jarvis-network
+
+    # Extra hosts for Docker Desktop (allows host.docker.internal)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ===========================================================================
+  # Optional: Model Downloader Sidecar (for background downloads)
+  # ===========================================================================
+  # Uncomment to enable background model downloading while server runs
+  # model-downloader:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile
+  #     target: builder
+  #   container_name: jarvis-prime-model-downloader
+  #   command: >
+  #     python /tmp/preload_models.py
+  #       --cache-dir /opt/jarvis_prime_cache/models
+  #       --model ${JARVIS_PRIME_MODEL:-phi-3.5-mini}
+  #       --warmup false
+  #   volumes:
+  #     - jarvis-prime-models:/opt/jarvis_prime_cache/models
+  #     - jarvis-prime-hf-cache:/opt/jarvis_prime_cache/huggingface
+  #   networks:
+  #     - jarvis-network
+  #   profiles:
+  #     - download  # Only run with: docker compose --profile download up
+
+# =============================================================================
+# Volumes for persistent storage
+# =============================================================================
+volumes:
+  jarvis-prime-models:
+    name: jarvis-prime-model-cache
+    labels:
+      - "com.jarvis.volume=models"
+      - "com.jarvis.service=jarvis-prime"
+
+  jarvis-prime-hf-cache:
+    name: jarvis-prime-hf-cache
+    labels:
+      - "com.jarvis.volume=huggingface-cache"
+      - "com.jarvis.service=jarvis-prime"
+
+# =============================================================================
+# Networks for service communication
+# =============================================================================
+networks:
+  jarvis-network:
+    name: jarvis-network
+    driver: bridge
+    # Enable IPv6 if needed
+    # ipam:
+    #   config:
+    #     - subnet: "fd00:dead:beef::/48"
