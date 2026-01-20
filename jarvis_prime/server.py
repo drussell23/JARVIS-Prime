@@ -40,6 +40,7 @@ Hardware Detection:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -492,9 +493,59 @@ def parse_args():
     return parser.parse_args()
 
 
+class StartupState:
+    """
+    v93.1: Track server startup state for immediate health checks.
+
+    This allows the HTTP server to start IMMEDIATELY and respond to health
+    checks while heavy initialization (ML imports, model loading) happens
+    in the background.
+    """
+    def __init__(self):
+        self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
+        self.start_time = time.time()
+        self.error: Optional[str] = None
+        self.manager = None
+        self.init_elapsed: Optional[float] = None
+        self.model_load_start: Optional[float] = None
+        self.model_load_elapsed: Optional[float] = None
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status for health endpoint."""
+        elapsed = time.time() - self.start_time
+        result = {
+            "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
+            "phase": self.phase,
+            "startup_elapsed_seconds": round(elapsed, 1),
+            "pid": os.getpid(),
+        }
+        if self.init_elapsed:
+            result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
+        if self.model_load_elapsed:
+            result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
+        if self.error:
+            result["error"] = self.error
+        return result
+
+
+# Global startup state for immediate health checks
+_startup_state: Optional[StartupState] = None
+
+
 async def main():
-    """Main entry point with Trinity integration."""
-    global _trinity_integration
+    """
+    v93.1: Main entry point with IMMEDIATE HTTP server startup.
+
+    CRITICAL FIX: The HTTP server now starts FIRST before any heavy imports
+    or model loading. This ensures health checks succeed immediately while
+    initialization happens in the background.
+
+    Startup Flow:
+    1. Start HTTP server immediately (responds with "starting" status)
+    2. Run heavy initialization in background task
+    3. Update status to "healthy" when ready
+    """
+    global _trinity_integration, _startup_state
 
     args = parse_args()
 
@@ -509,243 +560,40 @@ async def main():
     # Print banner
     logger.info("=" * 70)
     logger.info("JARVIS-Prime Tier-0 Brain Server")
-    logger.info("v84.0 - Trinity-Integrated with Advanced Async")
+    logger.info("v93.1 - Immediate Startup with Background Initialization")
     logger.info("=" * 70)
-
-    # Detect hardware
-    try:
-        from jarvis_prime.core.llama_cpp_executor import HardwareDetector, LlamaCppConfig
-        hw = HardwareDetector.detect()
-        logger.info(f"Hardware: {hw.gpu_name or 'CPU'}")
-        logger.info(f"Backend: {hw.backend.name}")
-        logger.info(f"Memory: {hw.total_memory_gb:.1f} GB")
-        if hw.metal_supported:
-            logger.info("Metal GPU: Enabled")
-    except Exception as e:
-        logger.warning(f"Hardware detection failed: {e}")
-        hw = None
-
-    logger.info("-" * 70)
-    logger.info(f"Models directory: {models_dir}")
-    logger.info(f"Executor: {args.executor}")
-    logger.info(f"GPU Layers: {'CPU only' if args.cpu_only else args.n_gpu_layers}")
-    logger.info(f"Context Size: {args.context_size}")
     logger.info(f"Host: {args.host}:{args.port}")
     logger.info("-" * 70)
 
+    # Initialize startup state FIRST
+    _startup_state = StartupState()
+
     try:
-        # Import components
-        from jarvis_prime.core.model_manager import PrimeModelManager, create_api_app
+        # =====================================================================
+        # STEP 1: Create minimal FastAPI app that responds to health checks
+        # =====================================================================
+        from fastapi import FastAPI, HTTPException
 
-        # Select executor based on args
-        executor_class = None
-        executor_config = None
-
-        if args.executor == "llama-cpp":
-            from jarvis_prime.core.llama_cpp_executor import (
-                LlamaCppExecutor,
-                LlamaCppConfig,
-                GGUFModelDownloader,
-                get_default_model_path,
-            )
-
-            # Configure for hardware
-            if args.cpu_only:
-                executor_config = LlamaCppConfig.for_cpu(args.context_size)
-            else:
-                executor_config = LlamaCppConfig.auto_detect(args.context_size)
-                executor_config.n_gpu_layers = args.n_gpu_layers
-
-            executor_class = LlamaCppExecutor
-            logger.info(f"Using LlamaCppExecutor (n_gpu_layers={executor_config.n_gpu_layers})")
-
-            # Find or download model
-            initial_model = args.initial_model
-            if initial_model is None:
-                # Look for existing model
-                model_path = get_default_model_path()
-                if model_path.exists():
-                    initial_model = str(model_path)
-                    logger.info(f"Found model: {model_path.name}")
-                elif args.auto_download:
-                    logger.info("No model found, downloading recommended model...")
-                    downloader = GGUFModelDownloader(models_dir=Path(models_dir))
-                    recommended = downloader.get_recommended_model()
-                    if recommended:
-                        model_path = await downloader.download(
-                            f"{recommended.repo_id}/{recommended.filename}"
-                        )
-                        initial_model = str(model_path)
-                    else:
-                        logger.error("No suitable model found for your hardware")
-                        logger.error("Run: python -m jarvis_prime.scripts.download_brain")
-                        sys.exit(1)
-                else:
-                    logger.warning("No model found. Run with --auto-download or:")
-                    logger.warning("  python -m jarvis_prime.scripts.download_brain")
-
-        # Create manager with selected executor
-        manager = PrimeModelManager(
-            models_dir=models_dir,
-            telemetry_dir=args.telemetry_dir,
-            reactor_core_watch_dir=args.reactor_core_dir,
-            executor_class=executor_class,
+        app = FastAPI(
+            title="JARVIS-Prime API",
+            description="OpenAI-compatible API for JARVIS-Prime Tier-0 Brain",
+            version="1.0.0",
         )
 
-        # Start manager
-        model_path = Path(initial_model) if initial_model else None
-        await manager.start(initial_model_path=model_path)
-
-        # v84.0: Initialize Trinity Integration
-        _trinity_integration = TrinityIntegration()
-        trinity_model_path = str(model_path) if model_path else ""
-        trinity_connected = await _trinity_integration.initialize(
-            port=args.port,
-            model_path=trinity_model_path,
-            model_loaded=model_path is not None and model_path.exists(),
-        )
-
-        if trinity_connected:
-            logger.info("[Trinity] ✓ J-Prime connected to Trinity network")
-
-            # Register inference callback for Trinity health monitoring
-            def on_inference_complete(latency_ms: float, success: bool = True):
-                if _trinity_integration:
-                    _trinity_integration.record_inference(latency_ms, success)
-
-            # Register partition callback for graceful degradation
-            async def on_partition_detected():
-                logger.warning("[Trinity] Partition detected - entering standalone mode")
-                # Could pause non-critical operations here
-
-            _trinity_integration.register_partition_callback(on_partition_detected)
-        else:
-            logger.info("[Trinity] Running in standalone mode (no Trinity connection)")
-
-        # v84.0: Advanced Heartbeat Writer for Service Discovery
-        heartbeat_task = None
-        heartbeat_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_prime.json"
-
-        async def advanced_heartbeat_writer():
+        @app.get("/health")
+        async def health():
             """
-            v84.0: Write detailed heartbeat for intelligent service discovery.
+            v93.1: Immediate health endpoint.
 
-            Includes:
-            - Port number for discovery
-            - Model status
-            - Process metrics
-            - API format info
-            - Inference statistics
+            Returns status IMMEDIATELY - even during heavy initialization.
             """
-            import tempfile
+            status = _startup_state.get_status() if _startup_state else {"status": "starting"}
 
-            trinity_dir = Path.home() / ".jarvis" / "trinity" / "components"
-            trinity_dir.mkdir(parents=True, exist_ok=True)
+            if status.get("status") == "error":
+                raise HTTPException(status_code=503, detail=status)
 
-            heartbeat_interval = float(os.getenv("JARVIS_PRIME_HEARTBEAT_INTERVAL", "5.0"))
+            return status
 
-            while True:
-                try:
-                    # Build comprehensive heartbeat data
-                    heartbeat_data = {
-                        # Identity
-                        "component": "jarvis_prime",
-                        "component_type": "j_prime",
-                        "instance_id": f"jprime-{os.getpid()}-{int(time.time())}",
-                        "pid": os.getpid(),
-
-                        # Network
-                        "port": args.port,
-                        "host": args.host,
-                        "endpoint": f"http://localhost:{args.port}",
-                        "api_format": "openai",  # J-Prime uses OpenAI-compatible format
-
-                        # Model status
-                        "model_loaded": manager.current_model is not None if hasattr(manager, 'current_model') else False,
-                        "model_name": str(manager.current_model.name) if hasattr(manager, 'current_model') and manager.current_model else None,
-                        "model_path": str(model_path) if model_path else None,
-
-                        # Health
-                        "status": "running",
-                        "healthy": True,
-                        "timestamp": time.time(),
-
-                        # Process metrics
-                        "uptime_seconds": time.time() - _trinity_integration.start_time if _trinity_integration else 0,
-                    }
-
-                    # Add system metrics if available
-                    try:
-                        import psutil
-                        proc = psutil.Process()
-                        heartbeat_data["cpu_percent"] = proc.cpu_percent()
-                        heartbeat_data["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
-                        heartbeat_data["system_memory_percent"] = psutil.virtual_memory().percent
-                    except ImportError:
-                        pass
-
-                    # Add Trinity state if available
-                    if _trinity_integration:
-                        trinity_status = _trinity_integration.get_status()
-                        heartbeat_data["trinity_connected"] = trinity_status.get("connected", False)
-                        heartbeat_data["trinity_state"] = trinity_status.get("state", "UNKNOWN")
-
-                    # Atomic write (write to temp file, then rename)
-                    tmp_fd = None
-                    tmp_name = None
-                    try:
-                        tmp_fd, tmp_name = tempfile.mkstemp(
-                            dir=trinity_dir,
-                            prefix=".jarvis_prime.",
-                            suffix=".tmp"
-                        )
-                        with os.fdopen(tmp_fd, 'w') as f:
-                            tmp_fd = None  # fdopen takes ownership
-                            json.dump(heartbeat_data, f, indent=2)
-                            f.flush()
-                            os.fsync(f.fileno())
-
-                        # Atomic rename
-                        os.replace(tmp_name, heartbeat_file)
-                        tmp_name = None  # Rename succeeded
-
-                    except Exception as e:
-                        logger.debug(f"[Heartbeat] Write failed: {e}")
-                        if tmp_name and os.path.exists(tmp_name):
-                            try:
-                                os.unlink(tmp_name)
-                            except OSError:
-                                pass
-                    finally:
-                        if tmp_fd is not None:
-                            try:
-                                os.close(tmp_fd)
-                            except OSError:
-                                pass
-
-                    await asyncio.sleep(heartbeat_interval)
-
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.debug(f"[Heartbeat] Error: {e}")
-                    await asyncio.sleep(heartbeat_interval)
-
-            # Cleanup heartbeat file on shutdown
-            try:
-                if heartbeat_file.exists():
-                    heartbeat_file.unlink()
-            except Exception:
-                pass
-
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(advanced_heartbeat_writer())
-        logger.info(f"[Heartbeat] ✓ Writer started (file={heartbeat_file})")
-
-        # Create FastAPI app
-        app = create_api_app(manager)
-
-        # v84.0: Add Trinity status endpoint to the app
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""
@@ -753,35 +601,298 @@ async def main():
                 return _trinity_integration.get_status()
             return {"enabled": False, "state": "DISABLED"}
 
-        # Run with uvicorn
+        # Placeholder routes that will be replaced once manager is ready
+        _completion_routes_ready = False
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions_placeholder(request: dict):
+            """Placeholder until model manager is ready."""
+            if not _completion_routes_ready:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Model still loading",
+                        "status": _startup_state.get_status() if _startup_state else {}
+                    }
+                )
+            return {"error": "Not implemented"}
+
+        @app.post("/v1/completions")
+        async def completions_placeholder(request: dict):
+            """Placeholder until model manager is ready."""
+            if not _completion_routes_ready:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Model still loading",
+                        "status": _startup_state.get_status() if _startup_state else {}
+                    }
+                )
+            return {"error": "Not implemented"}
+
+        # =====================================================================
+        # STEP 2: Start uvicorn server IMMEDIATELY
+        # =====================================================================
         import uvicorn
 
         config = uvicorn.Config(
             app,
             host=args.host,
             port=args.port,
-            workers=args.workers,
-            reload=args.reload,
+            workers=1,  # Single worker for startup
             log_level="debug" if args.debug else "info",
         )
 
         server = uvicorn.Server(config)
 
         # Handle shutdown
-        loop = asyncio.get_event_loop()
+        shutdown_event = asyncio.Event()
 
-        def signal_handler():
+        async def handle_shutdown():
+            """Handle graceful shutdown."""
             logger.info("Shutdown signal received")
-            loop.create_task(shutdown(manager, server, heartbeat_task, heartbeat_file))
+            shutdown_event.set()
+            server.should_exit = True
 
+        loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler)
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(handle_shutdown()))
 
         logger.info("=" * 70)
-        logger.info("Server starting...")
-        logger.info(f"API endpoint: http://{args.host}:{args.port}/v1/chat/completions")
+        logger.info("[v93.1] HTTP server starting IMMEDIATELY")
+        logger.info(f"Health endpoint: http://{args.host}:{args.port}/health")
+        logger.info("Heavy initialization will run in background...")
         logger.info("=" * 70)
+
+        # =====================================================================
+        # STEP 3: Run heavy initialization in background
+        # =====================================================================
+        async def background_initialization():
+            """
+            v93.1: Run all heavy initialization in background.
+
+            This includes:
+            - Heavy ML library imports (torch, scikit-learn, etc.)
+            - Hardware detection
+            - Model manager creation
+            - Model loading
+            - Trinity integration
+            - Heartbeat writer
+            """
+            nonlocal _completion_routes_ready
+
+            try:
+                _startup_state.phase = "initializing"
+                init_start = time.time()
+
+                logger.info("[Background] Starting heavy initialization...")
+
+                # Heavy imports (triggers torch/scikit-learn warnings)
+                logger.info("[Background] Importing ML libraries...")
+                from jarvis_prime.core.model_manager import PrimeModelManager, create_api_app
+
+                # Detect hardware
+                try:
+                    from jarvis_prime.core.llama_cpp_executor import HardwareDetector, LlamaCppConfig
+                    hw = HardwareDetector.detect()
+                    logger.info(f"[Background] Hardware: {hw.gpu_name or 'CPU'}")
+                    logger.info(f"[Background] Backend: {hw.backend.name}")
+                    logger.info(f"[Background] Memory: {hw.total_memory_gb:.1f} GB")
+                except Exception as e:
+                    logger.warning(f"[Background] Hardware detection failed: {e}")
+
+                # Select executor
+                executor_class = None
+                initial_model = args.initial_model
+                model_path = None
+
+                if args.executor == "llama-cpp":
+                    from jarvis_prime.core.llama_cpp_executor import (
+                        LlamaCppExecutor,
+                        LlamaCppConfig,
+                        GGUFModelDownloader,
+                        get_default_model_path,
+                    )
+
+                    # Configure for hardware
+                    if args.cpu_only:
+                        executor_config = LlamaCppConfig.for_cpu(args.context_size)
+                    else:
+                        executor_config = LlamaCppConfig.auto_detect(args.context_size)
+                        executor_config.n_gpu_layers = args.n_gpu_layers
+
+                    executor_class = LlamaCppExecutor
+                    logger.info(f"[Background] Using LlamaCppExecutor (n_gpu_layers={executor_config.n_gpu_layers})")
+
+                    # Find model
+                    if initial_model is None:
+                        model_path_obj = get_default_model_path()
+                        if model_path_obj.exists():
+                            initial_model = str(model_path_obj)
+                            logger.info(f"[Background] Found model: {model_path_obj.name}")
+                        elif args.auto_download:
+                            logger.info("[Background] Downloading model...")
+                            downloader = GGUFModelDownloader(models_dir=Path(models_dir))
+                            recommended = downloader.get_recommended_model()
+                            if recommended:
+                                model_path_obj = await downloader.download(
+                                    f"{recommended.repo_id}/{recommended.filename}"
+                                )
+                                initial_model = str(model_path_obj)
+
+                _startup_state.init_elapsed = time.time() - init_start
+                logger.info(f"[Background] Initialization complete ({_startup_state.init_elapsed:.1f}s)")
+
+                # Create manager
+                manager = PrimeModelManager(
+                    models_dir=models_dir,
+                    telemetry_dir=args.telemetry_dir,
+                    reactor_core_watch_dir=args.reactor_core_dir,
+                    executor_class=executor_class,
+                )
+                _startup_state.manager = manager
+
+                # Start manager (with background model loading)
+                _startup_state.phase = "loading_model"
+                _startup_state.model_load_start = time.time()
+                model_path = Path(initial_model) if initial_model else None
+                await manager.start(initial_model_path=model_path, background_model_load=True)
+
+                # Wait for model to load
+                if model_path:
+                    logger.info(f"[Background] Waiting for model to load: {model_path.name}")
+                    while manager.get_health_status() == "starting":
+                        await asyncio.sleep(1.0)
+                        if shutdown_event.is_set():
+                            return
+                    _startup_state.model_load_elapsed = time.time() - _startup_state.model_load_start
+                    logger.info(f"[Background] Model loaded ({_startup_state.model_load_elapsed:.1f}s)")
+
+                # Initialize Trinity
+                global _trinity_integration
+                _trinity_integration = TrinityIntegration()
+                trinity_model_path = str(model_path) if model_path else ""
+                await _trinity_integration.initialize(
+                    port=args.port,
+                    model_path=trinity_model_path,
+                    model_loaded=model_path is not None and model_path.exists(),
+                )
+
+                # Replace routes with real API
+                real_app = create_api_app(manager)
+
+                # Copy real routes to main app
+                for route in real_app.routes:
+                    if hasattr(route, 'path'):
+                        # Skip health - we keep our own
+                        if route.path in ['/health', '/trinity/status']:
+                            continue
+                        # Remove placeholder and add real route
+                        app.routes = [r for r in app.routes if getattr(r, 'path', None) != route.path]
+                        app.routes.append(route)
+
+                _completion_routes_ready = True
+
+                # Start heartbeat writer
+                await start_heartbeat_writer(args, manager, model_path)
+
+                # Mark as ready
+                _startup_state.phase = "ready"
+                total_time = time.time() - _startup_state.start_time
+                logger.info("=" * 70)
+                logger.info(f"[v93.1] JARVIS-Prime fully ready in {total_time:.1f}s")
+                logger.info(f"API endpoint: http://{args.host}:{args.port}/v1/chat/completions")
+                logger.info("=" * 70)
+
+            except Exception as e:
+                logger.error(f"[Background] Initialization failed: {e}")
+                _startup_state.phase = "error"
+                _startup_state.error = str(e)
+
+        async def start_heartbeat_writer(args, manager, model_path):
+            """Start the heartbeat writer task."""
+            import tempfile
+
+            heartbeat_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_prime.json"
+            trinity_dir = heartbeat_file.parent
+            trinity_dir.mkdir(parents=True, exist_ok=True)
+
+            heartbeat_interval = float(os.getenv("JARVIS_PRIME_HEARTBEAT_INTERVAL", "5.0"))
+
+            async def writer():
+                while not shutdown_event.is_set():
+                    try:
+                        heartbeat_data = {
+                            "component": "jarvis_prime",
+                            "component_type": "j_prime",
+                            "instance_id": f"jprime-{os.getpid()}-{int(time.time())}",
+                            "pid": os.getpid(),
+                            "port": args.port,
+                            "host": args.host,
+                            "endpoint": f"http://localhost:{args.port}",
+                            "api_format": "openai",
+                            "model_loaded": manager.current_model is not None if hasattr(manager, 'current_model') else False,
+                            "model_name": str(manager.current_model.name) if hasattr(manager, 'current_model') and manager.current_model else None,
+                            "model_path": str(model_path) if model_path else None,
+                            "status": _startup_state.phase if _startup_state else "unknown",
+                            "healthy": _startup_state.phase == "ready" if _startup_state else False,
+                            "timestamp": time.time(),
+                            "uptime_seconds": time.time() - _startup_state.start_time if _startup_state else 0,
+                        }
+
+                        try:
+                            import psutil
+                            proc = psutil.Process()
+                            heartbeat_data["cpu_percent"] = proc.cpu_percent()
+                            heartbeat_data["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
+                        except ImportError:
+                            pass
+
+                        if _trinity_integration:
+                            trinity_status = _trinity_integration.get_status()
+                            heartbeat_data["trinity_connected"] = trinity_status.get("connected", False)
+                            heartbeat_data["trinity_state"] = trinity_status.get("state", "UNKNOWN")
+
+                        # Atomic write
+                        tmp_fd, tmp_name = tempfile.mkstemp(dir=trinity_dir, prefix=".jprime.", suffix=".tmp")
+                        try:
+                            with os.fdopen(tmp_fd, 'w') as f:
+                                json.dump(heartbeat_data, f, indent=2)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(tmp_name, heartbeat_file)
+                        except Exception:
+                            if os.path.exists(tmp_name):
+                                os.unlink(tmp_name)
+
+                        await asyncio.sleep(heartbeat_interval)
+
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.debug(f"[Heartbeat] Error: {e}")
+                        await asyncio.sleep(heartbeat_interval)
+
+            asyncio.create_task(writer())
+            logger.info(f"[Heartbeat] Writer started (file={heartbeat_file})")
+
+        # Start background initialization
+        init_task = asyncio.create_task(background_initialization())
+
+        # Run server (this blocks until shutdown)
         await server.serve()
+
+        # Cleanup
+        init_task.cancel()
+        try:
+            await init_task
+        except asyncio.CancelledError:
+            pass
+
+        if _startup_state and _startup_state.manager:
+            await _startup_state.manager.stop()
+        if _trinity_integration:
+            await _trinity_integration.shutdown()
 
     except ImportError as e:
         logger.error(f"Missing dependency: {e}")
@@ -792,13 +903,19 @@ async def main():
         raise
 
 
+# v93.1: Legacy shutdown function (deprecated - cleanup is now handled inline in main())
 async def shutdown(
     manager,
     server,
     heartbeat_task: Optional[asyncio.Task] = None,
     heartbeat_file: Optional[Path] = None,
 ):
-    """Graceful shutdown with Trinity coordination and heartbeat cleanup."""
+    """
+    Graceful shutdown with Trinity coordination and heartbeat cleanup.
+
+    DEPRECATED: v93.1 handles cleanup inline in main() for better control.
+    This function is kept for backwards compatibility only.
+    """
     logger.info("Shutting down...")
 
     # v84.0: Cancel heartbeat task first
@@ -828,8 +945,10 @@ async def shutdown(
             logger.warning(f"[Trinity] Shutdown error: {e}")
 
     # Then stop the model manager
-    await manager.stop()
-    server.should_exit = True
+    if manager:
+        await manager.stop()
+    if server:
+        server.should_exit = True
     logger.info("Shutdown complete")
 
 
