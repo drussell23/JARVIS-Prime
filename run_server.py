@@ -121,6 +121,10 @@ class StartupState:
         """
         elapsed = time.time() - self.start_time
         result = {
+            # v93.13: Add "service" field for Trinity cross-repo discovery
+            # TrinityIntegrator._discover_running_component() checks this field
+            # to verify it's talking to the correct service during startup
+            "service": "jarvis_prime",
             "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
             "phase": self.phase,
             "startup_elapsed_seconds": round(elapsed, 1),

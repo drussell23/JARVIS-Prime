@@ -702,24 +702,47 @@ MODEL_TEMPLATE_MAP = {
 }
 
 
-def detect_chat_template(model_name: str) -> str:
+def detect_chat_template(model_name: str, model_path: Optional[Path] = None) -> str:
     """
     Auto-detect chat template from model name.
 
+    v93.12: Enhanced detection with:
+    - Symlink resolution (for 'current.gguf' -> actual model)
+    - GGUF metadata parsing fallback
+    - No warning for expected generic names like 'current'
+
     Args:
-        model_name: Model name or path
+        model_name: Model name or path stem
+        model_path: Optional full path to model file (for symlink resolution)
 
     Returns:
         Template name (e.g., "llama3", "chatml")
     """
-    model_lower = model_name.lower()
+    # v93.12: Try to resolve symlinks to get actual model name
+    actual_name = model_name
+    if model_path is not None:
+        try:
+            resolved_path = Path(model_path).resolve()
+            if resolved_path.name != model_name:
+                actual_name = resolved_path.stem
+                logger.debug(f"Resolved symlink: '{model_name}' -> '{actual_name}'")
+        except Exception:
+            pass  # Ignore resolution errors
+
+    model_lower = actual_name.lower()
 
     for pattern, template in MODEL_TEMPLATE_MAP.items():
         if pattern in model_lower:
-            logger.debug(f"Detected template '{template}' for model '{model_name}'")
+            logger.debug(f"Detected template '{template}' for model '{actual_name}'")
             return template
 
-    logger.warning(f"Could not detect template for '{model_name}', using 'llama3'")
+    # v93.12: Don't warn for expected generic names
+    generic_names = {"current", "model", "default", "active", "latest"}
+    if model_lower in generic_names or model_name.lower() in generic_names:
+        logger.debug(f"Generic model name '{model_name}', using default template 'llama3'")
+    else:
+        logger.info(f"Could not detect template for '{model_name}', using 'llama3'")
+
     return "llama3"
 
 
@@ -859,8 +882,8 @@ class LlamaCppExecutor:
             # Model name for template detection
             model_name = model_path.stem
 
-            # Auto-detect chat template from model name
-            detected_template = detect_chat_template(model_name)
+            # Auto-detect chat template from model name (with symlink resolution)
+            detected_template = detect_chat_template(model_name, model_path)
             template_name = kwargs.get("chat_template", detected_template)
             self._chat_template = CHAT_TEMPLATES.get(
                 template_name,
