@@ -924,6 +924,13 @@ class CrossRepoBridge:
                 }
             else:
                 # Register new entry
+                # v93.16: Include process_start_time for PID reuse detection
+                try:
+                    import psutil
+                    process_start_time = psutil.Process(os.getpid()).create_time()
+                except Exception:
+                    process_start_time = time.time()
+
                 services[service_name] = {
                     "service_name": service_name,
                     "pid": os.getpid(),
@@ -933,6 +940,7 @@ class CrossRepoBridge:
                     "status": "healthy" if self.state.model_loaded else "starting",
                     "registered_at": current_time,
                     "last_heartbeat": current_time,
+                    "process_start_time": process_start_time,  # v93.16: PID reuse detection
                     "metadata": {
                         "model_loaded": self.state.model_loaded,
                         "model_path": self.state.model_path,
