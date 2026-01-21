@@ -1029,6 +1029,8 @@ async def main():
                     AGIEnhancedInference,
                 )
 
+                # v93.12: Configure AGI Hub with sensible timeouts
+                # These can be overridden via environment variables
                 agi_config = AGIHubConfig(
                     enable_orchestrator=True,
                     enable_reasoning=True,
@@ -1037,14 +1039,26 @@ async def main():
                     enable_hardware_optimization=True,
                     enable_auto_reasoning=True,
                     enable_experience_recording=True,
+                    # v93.12: Timeout configuration (prevents hanging)
+                    enable_agi_models_v80=os.getenv("ENABLE_AGI_MODELS_V80", "true").lower() == "true",
+                    agi_models_v80_timeout=float(os.getenv("AGI_MODELS_V80_TIMEOUT", "30.0")),
+                    agi_models_v80_graceful_degradation=True,  # Don't fail startup if v80.0 models fail
+                    subsystem_init_timeout=float(os.getenv("SUBSYSTEM_INIT_TIMEOUT", "60.0")),
+                    parallel_init_timeout=float(os.getenv("PARALLEL_INIT_TIMEOUT", "120.0")),
                 )
 
                 _agi_hub = await get_agi_hub(agi_config)
                 log_step_complete("AGI Integration Hub", time.time() - step_start)
+            except asyncio.TimeoutError:
+                # v93.12: Handle timeout gracefully - don't block startup
+                logger.warning(f"   ⏱️ AGI Hub init timed out - continuing without it")
+                _agi_hub = None
             except ImportError as e:
                 logger.warning(f"   ⚠️ AGI Hub not available: {e}")
             except Exception as e:
                 logger.warning(f"   ⚠️ AGI Hub init failed: {e}")
+                import traceback
+                traceback.print_exc()
 
             # -----------------------------------------------------------------
             # STEP 5: Initialize Neural Orchestrator

@@ -161,6 +161,12 @@ class AGIHubConfig:
     enable_multimodal: bool = True
     enable_hardware_optimization: bool = True
 
+    # v93.12: Advanced AGI Models Configuration
+    # These are OPTIONAL and non-critical - failures should NOT block startup
+    enable_agi_models_v80: bool = True  # Enable v80.0 AGI models (model manager, continual learning, self-modification)
+    agi_models_v80_timeout: float = 30.0  # Max time (seconds) to wait for v80.0 models initialization
+    agi_models_v80_graceful_degradation: bool = True  # Continue even if v80.0 models fail
+
     # Reasoning settings
     default_reasoning_strategy: str = "chain_of_thought"
     enable_auto_reasoning: bool = True  # Auto-select strategy based on request
@@ -176,6 +182,10 @@ class AGIHubConfig:
     prefer_neural_engine: bool = True
     prefer_metal_gpu: bool = True
     enable_memory_mapping: bool = True
+
+    # v93.12: Per-subsystem timeout configuration
+    subsystem_init_timeout: float = 60.0  # Default timeout for any subsystem initialization
+    parallel_init_timeout: float = 120.0  # Overall timeout for parallel initialization
 
     # Analysis settings
     complexity_keywords: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -355,58 +365,165 @@ class AGIIntegrationHub:
     # -------------------------------------------------------------------------
 
     async def initialize(self) -> bool:
-        """Initialize all AGI subsystems."""
+        """
+        Initialize all AGI subsystems with timeout protection.
+
+        v93.12: Enhanced with:
+        - Per-subsystem timeout protection
+        - Graceful degradation for non-critical subsystems
+        - Progress reporting for monitoring
+        - Parallel initialization with overall timeout
+        """
         async with self._init_lock:
             if self._initialized:
                 return True
 
             logger.info("Initializing AGI Integration Hub...")
+            init_start = time.time()
 
             try:
-                # Initialize subsystems in parallel where possible
-                init_tasks = []
+                # v93.12: Create named tasks for better error reporting
+                init_tasks: Dict[str, asyncio.Task] = {}
+                subsystem_timeout = self._config.subsystem_init_timeout
 
+                # Core subsystems (critical)
                 if self._config.enable_hardware_optimization:
-                    init_tasks.append(self._init_hardware())
-
-                if self._config.enable_orchestrator:
-                    init_tasks.append(self._init_orchestrator())
-
-                if self._config.enable_reasoning:
-                    init_tasks.append(self._init_reasoning())
-
-                if self._config.enable_learning:
-                    init_tasks.append(self._init_learning())
-
-                if self._config.enable_multimodal:
-                    init_tasks.append(self._init_multimodal())
-
-                # v80.0: Initialize advanced AGI models
-                init_tasks.append(self._init_agi_models_v80())
-
-                results = await asyncio.gather(*init_tasks, return_exceptions=True)
-
-                # Check results
-                success_count = sum(1 for r in results if r is True)
-                error_count = sum(1 for r in results if isinstance(r, Exception))
-
-                if error_count > 0:
-                    logger.warning(
-                        f"AGI Hub initialized with {error_count} subsystem failures"
+                    init_tasks["hardware"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_hardware(),
+                            subsystem_timeout,
+                            "hardware_optimizer"
+                        )
                     )
 
+                if self._config.enable_orchestrator:
+                    init_tasks["orchestrator"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_orchestrator(),
+                            subsystem_timeout,
+                            "orchestrator"
+                        )
+                    )
+
+                if self._config.enable_reasoning:
+                    init_tasks["reasoning"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_reasoning(),
+                            subsystem_timeout,
+                            "reasoning"
+                        )
+                    )
+
+                if self._config.enable_learning:
+                    init_tasks["learning"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_learning(),
+                            subsystem_timeout,
+                            "learning"
+                        )
+                    )
+
+                if self._config.enable_multimodal:
+                    init_tasks["multimodal"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_multimodal(),
+                            subsystem_timeout,
+                            "multimodal"
+                        )
+                    )
+
+                # v80.0 AGI Models (OPTIONAL - controlled by config)
+                if self._config.enable_agi_models_v80:
+                    init_tasks["agi_models_v80"] = asyncio.create_task(
+                        self._init_with_timeout(
+                            self._init_agi_models_v80(),
+                            self._config.agi_models_v80_timeout,
+                            "agi_models_v80"
+                        )
+                    )
+                else:
+                    logger.info("v80.0 AGI Models disabled by configuration")
+
+                # v93.12: Wait for all tasks with overall timeout
+                if init_tasks:
+                    try:
+                        results = await asyncio.wait_for(
+                            asyncio.gather(
+                                *init_tasks.values(),
+                                return_exceptions=True
+                            ),
+                            timeout=self._config.parallel_init_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            f"AGI Hub parallel init timed out after "
+                            f"{self._config.parallel_init_timeout}s"
+                        )
+                        # Cancel remaining tasks
+                        for name, task in init_tasks.items():
+                            if not task.done():
+                                task.cancel()
+                                logger.warning(f"Cancelled hung subsystem: {name}")
+                        results = []
+                else:
+                    results = []
+
+                # Check results with detailed logging
+                success_count = 0
+                error_count = 0
+                timeout_count = 0
+
+                for (name, task), result in zip(init_tasks.items(), results):
+                    if result is True:
+                        success_count += 1
+                        logger.debug(f"  ✅ {name}: initialized")
+                    elif isinstance(result, asyncio.TimeoutError):
+                        timeout_count += 1
+                        logger.warning(f"  ⏱️ {name}: timed out")
+                    elif isinstance(result, Exception):
+                        error_count += 1
+                        logger.warning(f"  ❌ {name}: {type(result).__name__}: {result}")
+                    else:
+                        # False return
+                        logger.warning(f"  ⚠️ {name}: returned {result}")
+
+                elapsed = time.time() - init_start
                 self._initialized = success_count > 0
 
                 logger.info(
-                    f"AGI Integration Hub initialized: {success_count}/{len(init_tasks)} "
-                    f"subsystems active"
+                    f"AGI Integration Hub initialized in {elapsed:.1f}s: "
+                    f"{success_count}/{len(init_tasks)} subsystems active"
+                    + (f", {timeout_count} timed out" if timeout_count else "")
+                    + (f", {error_count} errors" if error_count else "")
                 )
 
                 return self._initialized
 
             except Exception as e:
                 logger.error(f"Failed to initialize AGI Hub: {e}")
+                import traceback
+                traceback.print_exc()
                 return False
+
+    async def _init_with_timeout(
+        self,
+        coro,
+        timeout: float,
+        name: str
+    ) -> bool:
+        """
+        Wrap a coroutine with timeout protection.
+
+        v93.12: Ensures no subsystem can hang the entire initialization.
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Subsystem {name} timed out after {timeout}s")
+            raise
+        except Exception as e:
+            logger.error(f"Subsystem {name} failed: {e}")
+            raise
 
     async def _init_hardware(self) -> bool:
         """Initialize hardware optimization subsystem."""
@@ -570,7 +687,13 @@ class AGIIntegrationHub:
 
     async def _init_agi_models_v80(self) -> bool:
         """
-        Initialize v80.0 AGI Models subsystems.
+        Initialize v80.0 AGI Models subsystems with timeout protection.
+
+        v93.12: Enhanced with:
+        - Per-component timeout protection (prevents hanging)
+        - Graceful degradation (individual failures don't block others)
+        - Detailed progress logging for debugging
+        - Parallel initialization where safe
 
         Includes:
             - AGI Model Manager (MoE, specialized models)
@@ -579,83 +702,145 @@ class AGIIntegrationHub:
             - Knowledge Distillation Engine
             - Active Learning Engine
         """
-        try:
-            # Import v80.0 models
-            from jarvis_prime.models import (
-                get_model_manager,
-                get_continual_learner,
-                get_self_modifier,
-                KnowledgeDistillationEngine,
-                ActiveLearningEngine,
-                NeuralArchitectureSearch,
-            )
+        # v93.12: Per-component timeout (shorter than overall timeout)
+        component_timeout = min(
+            self._config.agi_models_v80_timeout / 3,  # Divide among 3 main async components
+            15.0  # But never more than 15s per component
+        )
 
-            # Initialize AGI Model Manager
+        init_results = {
+            "model_manager": False,
+            "continual_learner": False,
+            "self_modifier": False,
+            "knowledge_distiller": False,
+            "active_learner": False,
+            "nas_engine": False,
+        }
+
+        try:
+            # Import v80.0 models (synchronous import with timeout protection)
+            logger.info(f"v80.0: Importing AGI models module...")
             try:
-                self._agi_model_manager = await get_model_manager()
+                from jarvis_prime.models import (
+                    get_model_manager,
+                    get_continual_learner,
+                    get_self_modifier,
+                    KnowledgeDistillationEngine,
+                    ActiveLearningEngine,
+                    NeuralArchitectureSearch,
+                )
+            except ImportError as e:
+                logger.warning(f"v80.0 AGI Models module not available: {e}")
+                if self._config.agi_models_v80_graceful_degradation:
+                    return False  # Graceful degradation
+                raise
+
+            # ----------------------------------------------------------------
+            # ASYNC COMPONENTS (with individual timeouts)
+            # These are the ones that can hang - wrap each with timeout
+            # ----------------------------------------------------------------
+
+            # 1. AGI Model Manager
+            logger.info(f"v80.0: Initializing AGI Model Manager (timeout: {component_timeout}s)...")
+            try:
+                self._agi_model_manager = await asyncio.wait_for(
+                    get_model_manager(),
+                    timeout=component_timeout
+                )
                 logger.info("v80.0 AGI Model Manager initialized")
+                init_results["model_manager"] = True
+            except asyncio.TimeoutError:
+                logger.warning(f"AGI Model Manager timed out after {component_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"AGI Model Manager init failed: {e}")
 
-            # Initialize Continual Learning
+            # 2. Continual Learning Engine (most likely to hang due to vector store init)
+            logger.info(f"v80.0: Initializing Continual Learning (timeout: {component_timeout}s)...")
             try:
-                self._continual_learner = await get_continual_learner()
+                self._continual_learner = await asyncio.wait_for(
+                    get_continual_learner(),
+                    timeout=component_timeout
+                )
                 logger.info("v80.0 Continual Learning Engine initialized")
+                init_results["continual_learner"] = True
+            except asyncio.TimeoutError:
+                logger.warning(f"Continual Learning timed out after {component_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"Continual Learning init failed: {e}")
 
-            # Initialize Self-Modification Engine
+            # 3. Self-Modification Engine
+            logger.info(f"v80.0: Initializing Self-Modification Engine (timeout: {component_timeout}s)...")
             try:
-                self._self_modifier = await get_self_modifier()
+                self._self_modifier = await asyncio.wait_for(
+                    get_self_modifier(),
+                    timeout=component_timeout
+                )
                 logger.info("v80.0 Self-Modification Engine initialized")
+                init_results["self_modifier"] = True
+            except asyncio.TimeoutError:
+                logger.warning(f"Self-Modification timed out after {component_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"Self-Modification init failed: {e}")
 
-            # Initialize Knowledge Distillation
+            # ----------------------------------------------------------------
+            # SYNC COMPONENTS (fast, shouldn't hang)
+            # ----------------------------------------------------------------
+
+            # 4. Knowledge Distillation
             try:
                 self._knowledge_distiller = KnowledgeDistillationEngine()
                 logger.info("v80.0 Knowledge Distillation Engine initialized")
+                init_results["knowledge_distiller"] = True
             except Exception as e:
                 logger.warning(f"Knowledge Distillation init failed: {e}")
 
-            # Initialize Active Learning
+            # 5. Active Learning
             try:
                 self._active_learner = ActiveLearningEngine()
                 logger.info("v80.0 Active Learning Engine initialized")
+                init_results["active_learner"] = True
             except Exception as e:
                 logger.warning(f"Active Learning init failed: {e}")
 
-            # Initialize NAS Engine
+            # 6. NAS Engine
             try:
                 self._nas_engine = NeuralArchitectureSearch()
                 logger.info("v80.0 Neural Architecture Search initialized")
+                init_results["nas_engine"] = True
             except Exception as e:
                 logger.warning(f"NAS init failed: {e}")
 
             # Update status
             self._subsystem_status[AGISubsystem.AGI_MODELS] = SubsystemStatus(
                 name="agi_models_v80",
-                initialized=self._agi_model_manager is not None,
-                healthy=True,
+                initialized=init_results["model_manager"],
+                healthy=init_results["model_manager"],
                 last_check=time.time(),
             )
 
             self._subsystem_status[AGISubsystem.CONTINUAL_LEARNING] = SubsystemStatus(
                 name="continual_learning_v80",
-                initialized=self._continual_learner is not None,
-                healthy=True,
+                initialized=init_results["continual_learner"],
+                healthy=init_results["continual_learner"],
                 last_check=time.time(),
             )
 
             self._subsystem_status[AGISubsystem.SELF_IMPROVEMENT] = SubsystemStatus(
                 name="self_improvement_v80",
-                initialized=self._self_modifier is not None,
-                healthy=True,
+                initialized=init_results["self_modifier"],
+                healthy=init_results["self_modifier"],
                 last_check=time.time(),
             )
 
-            logger.info("v80.0 AGI Models subsystems initialized successfully")
-            return True
+            # Report summary
+            success_count = sum(1 for v in init_results.values() if v)
+            total_count = len(init_results)
+            logger.info(
+                f"v80.0 AGI Models: {success_count}/{total_count} components initialized"
+            )
+
+            # v93.12: Return True if ANY component initialized (graceful degradation)
+            return success_count > 0
 
         except ImportError as e:
             logger.warning(f"v80.0 AGI Models not available: {e}")
@@ -668,7 +853,9 @@ class AGIIntegrationHub:
                 healthy=False,
                 error=str(e),
             )
-            return False
+            if self._config.agi_models_v80_graceful_degradation:
+                return False  # Continue with degraded functionality
+            raise
 
     # -------------------------------------------------------------------------
     # V80.0 AGI MODEL ACCESSORS

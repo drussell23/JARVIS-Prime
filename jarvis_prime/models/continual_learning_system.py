@@ -1212,22 +1212,44 @@ class ContinualLearningEngine:
         Ensure the engine is fully initialized with populated vector store.
 
         v92.1: Idempotent initialization check.
+        v93.12: Added timeout protection to prevent blocking startup.
         """
         if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
             async with self._lock:
                 if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
-                    # Load persisted state
+                    # v93.12: Configurable initialization timeout
+                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "10.0"))
+
+                    # Load persisted state (with timeout)
                     try:
-                        await self.load_state()
+                        await asyncio.wait_for(
+                            self.load_state(),
+                            timeout=init_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Loading state timed out after {init_timeout}s - continuing with fresh state")
                     except Exception as e:
                         logger.warning(f"Could not load state: {e}")
 
-                    # Initialize vector store
+                    # Initialize vector store (with timeout)
                     auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
+                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "15.0"))
                     if auto_init and self.rag_engine:
-                        await self.initialize_vector_store()
+                        try:
+                            await asyncio.wait_for(
+                                self.initialize_vector_store(),
+                                timeout=vector_store_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"Vector store init timed out after {vector_store_timeout}s - "
+                                f"will initialize on-demand later"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Vector store init failed: {e}")
 
                     self._fully_initialized = True
+                    logger.info("ContinualLearningEngine ensure_initialized complete")
 
     def get_status(self) -> Dict[str, Any]:
         """Get engine status."""
