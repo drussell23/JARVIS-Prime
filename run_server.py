@@ -31,20 +31,54 @@ Endpoints:
 """
 
 # =============================================================================
-# v93.0: Suppress non-critical warnings BEFORE any imports
+# v93.16: COMPREHENSIVE Warning Suppression - BEFORE any imports
 # =============================================================================
-import warnings
+# Set environment variable FIRST to suppress warnings at the interpreter level
+import os
+os.environ.setdefault('PYTHONWARNINGS', 'ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning')
+# Also set TF and other library-specific environment variables
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')  # Suppress TensorFlow warnings
+os.environ.setdefault('TRANSFORMERS_VERBOSITY', 'error')  # Suppress transformers warnings
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')  # Suppress tokenizers warning
 
+import warnings
+import sys
+
+# v93.16: Use simplefilter FIRST to catch everything, then add specific filters
+warnings.simplefilter('ignore', category=UserWarning)
+warnings.simplefilter('ignore', category=DeprecationWarning)
+warnings.simplefilter('ignore', category=FutureWarning)
+
+# v93.16: Specific filters for known warning messages
 warnings.filterwarnings('ignore', message='.*urllib3.*OpenSSL.*LibreSSL.*')
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='urllib3')
 warnings.filterwarnings('ignore', message='.*Torch version.*has not been tested.*')
 warnings.filterwarnings('ignore', message='.*coremltools.*')
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
-# v93.14: Suppress scikit-learn version compatibility warnings
 warnings.filterwarnings('ignore', message='.*scikit-learn version.*is not supported.*')
 warnings.filterwarnings('ignore', message='.*Disabling scikit-learn conversion API.*')
+warnings.filterwarnings('ignore', message='.*Minimum required version.*')
+warnings.filterwarnings('ignore', message='.*Maximum required version.*')
+
+# v93.16: Aggressive suppression for coremltools at module level
+warnings.filterwarnings('ignore', module='coremltools.*')
+warnings.filterwarnings('ignore', module='sklearn.*')
+warnings.filterwarnings('ignore', module='torch.*')
+
+# v93.16: Override warnings.warn to filter at the source
+_original_warn = warnings.warn
+def _filtered_warn(message, category=UserWarning, stacklevel=1):
+    """Filtered warn that suppresses known non-critical warnings."""
+    msg_str = str(message).lower()
+    suppress_patterns = [
+        'scikit-learn', 'coremltools', 'torch version', 'not supported',
+        'has not been tested', 'minimum required', 'maximum required',
+        'disabling', 'conversion api'
+    ]
+    if any(pattern in msg_str for pattern in suppress_patterns):
+        return  # Suppress
+    _original_warn(message, category, stacklevel + 1)
+warnings.warn = _filtered_warn
 
 # =============================================================================
 # MINIMAL IMPORTS ONLY - Heavy imports happen in background_initialization
