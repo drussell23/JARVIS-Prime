@@ -702,11 +702,21 @@ class AGIIntegrationHub:
             - Knowledge Distillation Engine
             - Active Learning Engine
         """
-        # v93.12: Per-component timeout (shorter than overall timeout)
-        component_timeout = min(
-            self._config.agi_models_v80_timeout / 3,  # Divide among 3 main async components
-            15.0  # But never more than 15s per component
+        # v93.14: Enhanced per-component timeout with environment variable overrides
+        # Default: divide overall timeout among 3 main async components, capped at 15s
+        default_component_timeout = min(
+            self._config.agi_models_v80_timeout / 3,
+            15.0
         )
+
+        # v93.14: Per-component timeout overrides via environment variables
+        # Allows fine-grained control over each component's initialization timeout
+        component_timeouts = {
+            "model_manager": float(os.getenv("AGI_MODEL_MANAGER_TIMEOUT", str(default_component_timeout))),
+            "continual_learner": float(os.getenv("AGI_CONTINUAL_LEARNING_TIMEOUT", str(default_component_timeout))),
+            "self_modifier": float(os.getenv("AGI_SELF_MODIFIER_TIMEOUT", str(default_component_timeout))),
+        }
+        component_timeout = default_component_timeout  # Fallback for compatibility
 
         init_results = {
             "model_manager": False,
@@ -738,47 +748,53 @@ class AGIIntegrationHub:
             # ----------------------------------------------------------------
             # ASYNC COMPONENTS (with individual timeouts)
             # These are the ones that can hang - wrap each with timeout
+            # v93.14: Uses per-component timeouts for fine-grained control
             # ----------------------------------------------------------------
 
             # 1. AGI Model Manager
-            logger.info(f"v80.0: Initializing AGI Model Manager (timeout: {component_timeout}s)...")
+            mm_timeout = component_timeouts["model_manager"]
+            logger.info(f"v80.0: Initializing AGI Model Manager (timeout: {mm_timeout}s)...")
             try:
                 self._agi_model_manager = await asyncio.wait_for(
                     get_model_manager(),
-                    timeout=component_timeout
+                    timeout=mm_timeout
                 )
                 logger.info("v80.0 AGI Model Manager initialized")
                 init_results["model_manager"] = True
             except asyncio.TimeoutError:
-                logger.warning(f"AGI Model Manager timed out after {component_timeout}s - skipping")
+                logger.warning(f"AGI Model Manager timed out after {mm_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"AGI Model Manager init failed: {e}")
 
-            # 2. Continual Learning Engine (most likely to hang due to vector store init)
-            logger.info(f"v80.0: Initializing Continual Learning (timeout: {component_timeout}s)...")
+            # 2. Continual Learning Engine
+            # v93.14: Now uses parallel initialization with background loading
+            # Should complete much faster as engine is marked ready immediately
+            cl_timeout = component_timeouts["continual_learner"]
+            logger.info(f"v80.0: Initializing Continual Learning (timeout: {cl_timeout}s)...")
             try:
                 self._continual_learner = await asyncio.wait_for(
                     get_continual_learner(),
-                    timeout=component_timeout
+                    timeout=cl_timeout
                 )
                 logger.info("v80.0 Continual Learning Engine initialized")
                 init_results["continual_learner"] = True
             except asyncio.TimeoutError:
-                logger.warning(f"Continual Learning timed out after {component_timeout}s - skipping")
+                logger.warning(f"Continual Learning timed out after {cl_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"Continual Learning init failed: {e}")
 
             # 3. Self-Modification Engine
-            logger.info(f"v80.0: Initializing Self-Modification Engine (timeout: {component_timeout}s)...")
+            sm_timeout = component_timeouts["self_modifier"]
+            logger.info(f"v80.0: Initializing Self-Modification Engine (timeout: {sm_timeout}s)...")
             try:
                 self._self_modifier = await asyncio.wait_for(
                     get_self_modifier(),
-                    timeout=component_timeout
+                    timeout=sm_timeout
                 )
                 logger.info("v80.0 Self-Modification Engine initialized")
                 init_results["self_modifier"] = True
             except asyncio.TimeoutError:
-                logger.warning(f"Self-Modification timed out after {component_timeout}s - skipping")
+                logger.warning(f"Self-Modification timed out after {sm_timeout}s - skipping")
             except Exception as e:
                 logger.warning(f"Self-Modification init failed: {e}")
 

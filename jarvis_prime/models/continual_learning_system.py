@@ -1036,40 +1036,139 @@ class ContinualLearningEngine:
             logger.info("Updated EWC parameters")
 
     async def save_state(self):
-        """Save learning state to disk."""
+        """
+        Save learning state to disk with fully async I/O.
+
+        v93.14: Fixed blocking I/O - uses aiofiles or run_in_executor.
+        """
         async with self._lock:
-            # Save experience buffer
+            start_time = time.time()
+            save_tasks = []
+
+            # Task 1: Save experience buffer (already async)
             buffer_path = self._data_dir / "experience_buffer.pkl"
-            await self.experience_buffer.save(buffer_path)
+            save_tasks.append(self.experience_buffer.save(buffer_path))
 
-            # Save metrics
+            # Task 2: Save metrics (now async)
             metrics_path = self._data_dir / "metrics.json"
-            with open(metrics_path, 'w') as f:
-                json.dump({
-                    "experiences_learned": self.metrics.experiences_learned,
-                    "average_feedback": self.metrics.average_feedback,
-                    "replay_ratio": self.metrics.replay_ratio,
-                }, f)
+            metrics_data = {
+                "experiences_learned": self.metrics.experiences_learned,
+                "average_feedback": self.metrics.average_feedback,
+                "replay_ratio": self.metrics.replay_ratio,
+            }
+            save_tasks.append(self._save_metrics_async(metrics_path, metrics_data))
 
-            logger.info(f"Saved learning state to {self._data_dir}")
+            # v93.14: Run all save tasks in PARALLEL
+            await asyncio.gather(*save_tasks, return_exceptions=True)
+
+            elapsed = time.time() - start_time
+            logger.info(f"Saved learning state to {self._data_dir} in {elapsed:.2f}s")
+
+    async def _save_metrics_async(self, path: Path, data: Dict[str, Any]) -> None:
+        """
+        Save metrics with async I/O - fixes blocking open() call.
+
+        v93.14: Uses aiofiles or run_in_executor instead of sync open().
+        """
+        try:
+            if AIOFILES_AVAILABLE:
+                async with aiofiles.open(path, 'w') as f:
+                    await f.write(json.dumps(data, indent=2))
+            else:
+                # Fallback: run sync I/O in thread pool
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._save_json_sync,
+                    path,
+                    data
+                )
+        except Exception as e:
+            logger.warning(f"Metrics save failed: {e}")
+
+    @staticmethod
+    def _save_json_sync(path: Path, data: Dict[str, Any]) -> None:
+        """Synchronous JSON save helper for executor."""
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
 
     async def load_state(self):
-        """Load learning state from disk."""
+        """
+        Load learning state from disk with fully async I/O.
+
+        v93.14: Fixed root cause of blocking - uses async I/O throughout.
+        - Uses aiofiles for non-blocking file reads
+        - Falls back to run_in_executor for sync operations
+        - Parallel loading of independent components
+        """
         async with self._lock:
-            # Load experience buffer
+            start_time = time.time()
+            load_tasks = []
+
+            # Task 1: Load experience buffer (already async)
             buffer_path = self._data_dir / "experience_buffer.pkl"
             if buffer_path.exists():
-                await self.experience_buffer.load(buffer_path)
+                load_tasks.append(("experience_buffer", self._load_experience_buffer_async(buffer_path)))
 
-            # Load metrics
+            # Task 2: Load metrics (now async)
             metrics_path = self._data_dir / "metrics.json"
             if metrics_path.exists():
-                with open(metrics_path, 'r') as f:
-                    data = json.load(f)
-                    self.metrics.experiences_learned = data["experiences_learned"]
-                    self.metrics.average_feedback = data["average_feedback"]
+                load_tasks.append(("metrics", self._load_metrics_async(metrics_path)))
 
-            logger.info(f"Loaded learning state from {self._data_dir}")
+            # v93.14: Run all load tasks in parallel
+            if load_tasks:
+                results = await asyncio.gather(
+                    *[task for _, task in load_tasks],
+                    return_exceptions=True
+                )
+
+                for i, (name, _) in enumerate(load_tasks):
+                    if isinstance(results[i], Exception):
+                        logger.warning(f"Failed to load {name}: {results[i]}")
+
+            elapsed = time.time() - start_time
+            logger.info(f"Loaded learning state from {self._data_dir} in {elapsed:.2f}s")
+
+    async def _load_experience_buffer_async(self, path: Path) -> None:
+        """Load experience buffer with proper async I/O."""
+        try:
+            await self.experience_buffer.load(path)
+        except Exception as e:
+            logger.warning(f"Experience buffer load failed: {e}")
+
+    async def _load_metrics_async(self, path: Path) -> None:
+        """
+        Load metrics with async I/O - fixes the blocking open() call.
+
+        v93.14: Uses aiofiles or run_in_executor instead of sync open().
+        """
+        try:
+            if AIOFILES_AVAILABLE:
+                async with aiofiles.open(path, 'r') as f:
+                    content = await f.read()
+                    data = json.loads(content)
+            else:
+                # Fallback: run sync I/O in thread pool to not block event loop
+                loop = asyncio.get_event_loop()
+                data = await loop.run_in_executor(
+                    None,
+                    self._load_json_sync,
+                    path
+                )
+
+            self.metrics.experiences_learned = data.get("experiences_learned", 0)
+            self.metrics.average_feedback = data.get("average_feedback", 0.0)
+            if "replay_ratio" in data:
+                self.metrics.replay_ratio = data["replay_ratio"]
+
+        except Exception as e:
+            logger.warning(f"Metrics load failed: {e}")
+
+    @staticmethod
+    def _load_json_sync(path: Path) -> Dict[str, Any]:
+        """Synchronous JSON load helper for executor."""
+        with open(path, 'r') as f:
+            return json.load(f)
 
     async def initialize_vector_store(
         self,
@@ -1213,43 +1312,140 @@ class ContinualLearningEngine:
 
         v92.1: Idempotent initialization check.
         v93.12: Added timeout protection to prevent blocking startup.
+        v93.14: PARALLEL initialization - state loading and vector store init run concurrently.
+
+        Architecture:
+        - Phase 1 (FAST): Mark as initialized immediately so engine is usable
+        - Phase 2 (PARALLEL): Run state loading and vector store init concurrently
+        - Phase 3 (BACKGROUND): If parallel init times out, continue in background
+
+        This ensures:
+        1. The engine is usable within milliseconds
+        2. Heavy I/O doesn't block startup
+        3. Full initialization completes eventually
         """
         if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
             async with self._lock:
                 if not hasattr(self, '_fully_initialized') or not self._fully_initialized:
-                    # v93.12: Configurable initialization timeout
-                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "10.0"))
+                    start_time = time.time()
 
-                    # Load persisted state (with timeout)
-                    try:
-                        await asyncio.wait_for(
-                            self.load_state(),
-                            timeout=init_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Loading state timed out after {init_timeout}s - continuing with fresh state")
-                    except Exception as e:
-                        logger.warning(f"Could not load state: {e}")
-
-                    # Initialize vector store (with timeout)
-                    auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
-                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "15.0"))
-                    if auto_init and self.rag_engine:
-                        try:
-                            await asyncio.wait_for(
-                                self.initialize_vector_store(),
-                                timeout=vector_store_timeout
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"Vector store init timed out after {vector_store_timeout}s - "
-                                f"will initialize on-demand later"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Vector store init failed: {e}")
-
+                    # v93.14: Mark as initialized FIRST so engine is immediately usable
+                    # Heavy loading happens in parallel/background
                     self._fully_initialized = True
-                    logger.info("ContinualLearningEngine ensure_initialized complete")
+                    self._background_init_complete = False
+
+                    # v93.14: Get configuration
+                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "10.0"))
+                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "15.0"))
+                    auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
+                    background_init = os.getenv("LEARNING_BACKGROUND_INIT", "true").lower() == "true"
+
+                    # Combined timeout for parallel operations
+                    parallel_timeout = max(init_timeout, vector_store_timeout) + 5.0
+
+                    # v93.14: Build list of initialization tasks to run in PARALLEL
+                    init_tasks = []
+
+                    # Task 1: Load persisted state
+                    init_tasks.append(("load_state", self._init_load_state_with_timeout(init_timeout)))
+
+                    # Task 2: Initialize vector store (if enabled)
+                    if auto_init and self.rag_engine:
+                        init_tasks.append(("vector_store", self._init_vector_store_with_timeout(vector_store_timeout)))
+
+                    # v93.14: Run all init tasks in PARALLEL with combined timeout
+                    if init_tasks:
+                        try:
+                            results = await asyncio.wait_for(
+                                asyncio.gather(
+                                    *[task for _, task in init_tasks],
+                                    return_exceptions=True
+                                ),
+                                timeout=parallel_timeout
+                            )
+
+                            # Log results
+                            for i, (name, _) in enumerate(init_tasks):
+                                if isinstance(results[i], Exception):
+                                    logger.debug(f"Init task '{name}' had issue: {results[i]}")
+
+                            self._background_init_complete = True
+
+                        except asyncio.TimeoutError:
+                            elapsed = time.time() - start_time
+                            logger.warning(
+                                f"Parallel initialization timed out after {elapsed:.1f}s - "
+                                f"continuing with background initialization"
+                            )
+
+                            # v93.14: Continue initialization in background if enabled
+                            if background_init:
+                                asyncio.create_task(
+                                    self._complete_background_init(),
+                                    name="continual_learning_background_init"
+                                )
+
+                    elapsed = time.time() - start_time
+                    logger.info(f"ContinualLearningEngine ensure_initialized complete in {elapsed:.2f}s")
+
+    async def _init_load_state_with_timeout(self, timeout: float) -> bool:
+        """Load state with timeout wrapper for parallel execution."""
+        try:
+            await asyncio.wait_for(self.load_state(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Loading state timed out after {timeout}s - continuing with fresh state")
+            return False
+        except Exception as e:
+            logger.warning(f"Could not load state: {e}")
+            return False
+
+    async def _init_vector_store_with_timeout(self, timeout: float) -> bool:
+        """Initialize vector store with timeout wrapper for parallel execution."""
+        try:
+            await asyncio.wait_for(self.initialize_vector_store(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Vector store init timed out after {timeout}s - "
+                f"will initialize on-demand later"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"Vector store init failed: {e}")
+            return False
+
+    async def _complete_background_init(self) -> None:
+        """
+        v93.14: Complete initialization in background without blocking.
+
+        This runs as a background task when parallel init times out,
+        ensuring full initialization eventually completes.
+        """
+        try:
+            logger.info("Starting background initialization of continual learning system...")
+
+            # Load state if not already loaded
+            if not hasattr(self, '_state_loaded') or not self._state_loaded:
+                try:
+                    await self.load_state()
+                    self._state_loaded = True
+                except Exception as e:
+                    logger.debug(f"Background state load failed: {e}")
+
+            # Initialize vector store if not already done
+            if self.rag_engine and (not hasattr(self, '_vector_store_initialized') or not self._vector_store_initialized):
+                try:
+                    await self.initialize_vector_store()
+                    self._vector_store_initialized = True
+                except Exception as e:
+                    logger.debug(f"Background vector store init failed: {e}")
+
+            self._background_init_complete = True
+            logger.info("Background initialization of continual learning system complete")
+
+        except Exception as e:
+            logger.warning(f"Background initialization failed: {e}")
 
     def get_status(self) -> Dict[str, Any]:
         """Get engine status."""
