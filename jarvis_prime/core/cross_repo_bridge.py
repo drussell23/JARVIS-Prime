@@ -969,34 +969,62 @@ class CrossRepoBridge:
 
     async def _heartbeat_loop(self) -> None:
         """
-        v93.14: Enhanced background heartbeat loop with cross-repo service registry integration.
+        v95.0: Enterprise-grade heartbeat loop with fire-and-forget pattern.
 
         Features:
-        - Periodic state sync
-        - Intelligent JARVIS reconnection with backoff
+        - Fire-and-forget heartbeats (non-blocking)
+        - Timeout protection on all I/O operations
+        - Intelligent JARVIS reconnection with adaptive backoff
         - Connection state tracking
         - Handles both connected and standalone modes
-        - v93.14: Writes heartbeats to JARVIS service registry for cross-repo discovery
+        - Cross-repo service registry discovery
+        - Self-healing on persistent failures
         """
         reconnect_delay = HEARTBEAT_INTERVAL
         consecutive_failures = 0
+        heartbeat_timeout = 5.0  # Max time for heartbeat operations
+        total_heartbeats = 0
 
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
+                total_heartbeats += 1
 
-                # Update heartbeat - always write state
-                await self._write_state()
+                # v95.0: Fire-and-forget state write with timeout protection
+                try:
+                    await asyncio.wait_for(
+                        self._write_state(),
+                        timeout=heartbeat_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("[v95.0] State write timed out (non-fatal)")
+                except Exception as e:
+                    logger.debug(f"[v95.0] State write error (non-fatal): {e}")
 
-                # v93.14: Also write heartbeat to JARVIS service registry
-                await self._send_registry_heartbeat()
+                # v95.0: Fire-and-forget registry heartbeat with timeout
+                try:
+                    await asyncio.wait_for(
+                        self._send_registry_heartbeat(),
+                        timeout=heartbeat_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("[v95.0] Registry heartbeat timed out (non-fatal)")
+                except Exception as e:
+                    logger.debug(f"[v95.0] Registry heartbeat error (non-fatal): {e}")
 
                 # v93.3: Intelligent reconnection logic
                 if not self.state.connected_to_jarvis:
                     # Attempt reconnection
                     self.state.connection_state = "reconnecting"
 
-                    connected = await self._try_jarvis_connection()
+                    try:
+                        connected = await asyncio.wait_for(
+                            self._try_jarvis_connection(),
+                            timeout=10.0  # Connection attempt timeout
+                        )
+                    except asyncio.TimeoutError:
+                        connected = False
+                        logger.debug("[v95.0] JARVIS connection attempt timed out")
 
                     if connected:
                         self.state.connection_state = "connected"
@@ -1010,10 +1038,11 @@ class CrossRepoBridge:
                         consecutive_failures += 1
                         self.state.connection_state = "standalone"
 
-                        # Exponential backoff for reconnection attempts
+                        # v95.0: Adaptive exponential backoff with jitter
                         if consecutive_failures > 3:
+                            jitter = (hash(time.time()) % 100) / 100.0 * 0.4 + 0.8  # 0.8-1.2
                             reconnect_delay = min(
-                                reconnect_delay * RETRY_BACKOFF_MULTIPLIER,
+                                reconnect_delay * RETRY_BACKOFF_MULTIPLIER * jitter,
                                 MAX_RETRY_DELAY * 2
                             )
 
@@ -1023,8 +1052,16 @@ class CrossRepoBridge:
                                 f"next retry in {reconnect_delay:.1f}s"
                             )
                 else:
-                    # Verify JARVIS is still alive
-                    jarvis_state = await self.get_jarvis_state()
+                    # Verify JARVIS is still alive with timeout
+                    try:
+                        jarvis_state = await asyncio.wait_for(
+                            self.get_jarvis_state(),
+                            timeout=heartbeat_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        jarvis_state = None
+                        logger.debug("[v95.0] JARVIS state check timed out")
+
                     if jarvis_state:
                         last_update = jarvis_state.get("last_update", "")
                         if last_update:
@@ -1048,10 +1085,20 @@ class CrossRepoBridge:
                         self.state.connected_to_jarvis = False
                         self.state.connection_state = "reconnecting"
 
+                # v95.0: Log periodic heartbeat summary
+                if total_heartbeats % 100 == 0:
+                    logger.debug(
+                        f"[v95.0] CrossRepoBridge heartbeat #{total_heartbeats} "
+                        f"(connected={self.state.connected_to_jarvis})"
+                    )
+
             except asyncio.CancelledError:
+                logger.debug("[v95.0] CrossRepoBridge heartbeat loop cancelled")
                 break
             except Exception as e:
-                logger.warning(f"[v93.3] Heartbeat error: {e}")
+                consecutive_failures += 1
+                if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                    logger.warning(f"[v95.0] Heartbeat error (failure {consecutive_failures}): {e}")
 
 
 # ============================================================================

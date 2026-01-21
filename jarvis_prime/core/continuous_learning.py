@@ -1109,6 +1109,34 @@ class ContinuousLearningEngine:
         await self._save_state()
         logger.info("Stopped continuous learning engine")
 
+    async def shutdown(self) -> None:
+        """
+        v95.0: Graceful shutdown with comprehensive cleanup.
+
+        This method is the preferred shutdown interface for AGI integration.
+        Delegates to stop() while providing additional cleanup.
+        """
+        logger.info("ContinuousLearningEngine shutdown initiated")
+
+        # Stop the learning loop first
+        await self.stop()
+
+        # Additional cleanup for graceful shutdown
+        try:
+            # Persist any remaining state
+            await self.persist_state()
+
+            # Clear references for garbage collection
+            self._buffer = None
+            self._ab_manager = None
+            self._ewc = None
+            self._si = None
+
+            self._initialized = False
+            logger.info("ContinuousLearningEngine shutdown complete")
+        except Exception as e:
+            logger.warning(f"ContinuousLearningEngine shutdown cleanup error: {e}")
+
     def record_experience(
         self,
         input_text: str,
