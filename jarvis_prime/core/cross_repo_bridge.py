@@ -874,15 +874,101 @@ class CrossRepoBridge:
         except Exception as e:
             logger.warning(f"Failed to write state: {e}")
 
+    async def _send_registry_heartbeat(self) -> None:
+        """
+        v93.14: Send heartbeat to JARVIS service registry for cross-repo discovery.
+
+        This writes directly to the shared service registry file at
+        ~/.jarvis/registry/services.json to keep jarvis-prime alive in the
+        registry without requiring the JARVIS supervisor to do health checks.
+
+        The service registry uses file-based locking (fcntl) for thread safety.
+        """
+        import fcntl
+
+        registry_dir = Path.home() / ".jarvis" / "registry"
+        registry_file = registry_dir / "services.json"
+
+        try:
+            # Ensure directory exists
+            registry_dir.mkdir(parents=True, exist_ok=True)
+
+            # Read current registry
+            services = {}
+            if registry_file.exists():
+                try:
+                    # Open with shared lock for reading
+                    with open(registry_file, 'r') as f:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                        try:
+                            services = json.load(f)
+                        finally:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.debug(f"[v93.14] Registry read error: {e}")
+                    services = {}
+
+            # Update or add jarvis-prime entry
+            service_name = "jarvis-prime"
+            current_time = time.time()
+
+            if service_name in services:
+                # Update existing entry
+                services[service_name]["last_heartbeat"] = current_time
+                services[service_name]["status"] = "healthy" if self.state.model_loaded else "starting"
+                services[service_name]["metadata"] = {
+                    "model_loaded": self.state.model_loaded,
+                    "model_path": self.state.model_path,
+                    "connection_state": self.state.connection_state,
+                    "instance_id": self.instance_id,
+                }
+            else:
+                # Register new entry
+                services[service_name] = {
+                    "service_name": service_name,
+                    "pid": os.getpid(),
+                    "port": self.port,
+                    "host": "localhost",
+                    "health_endpoint": "/health",
+                    "status": "healthy" if self.state.model_loaded else "starting",
+                    "registered_at": current_time,
+                    "last_heartbeat": current_time,
+                    "metadata": {
+                        "model_loaded": self.state.model_loaded,
+                        "model_path": self.state.model_path,
+                        "connection_state": self.state.connection_state,
+                        "instance_id": self.instance_id,
+                        "registered_by": "cross_repo_bridge",
+                    },
+                }
+                logger.info(f"[v93.14] Registered jarvis-prime with JARVIS service registry")
+
+            # Write back with exclusive lock (atomic)
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(services, f, indent=2)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            # Atomic rename
+            temp_file.replace(registry_file)
+
+        except Exception as e:
+            # Non-fatal - log and continue
+            logger.debug(f"[v93.14] Registry heartbeat error: {e}")
+
     async def _heartbeat_loop(self) -> None:
         """
-        v93.3: Enhanced background heartbeat loop with intelligent reconnection.
+        v93.14: Enhanced background heartbeat loop with cross-repo service registry integration.
 
         Features:
         - Periodic state sync
         - Intelligent JARVIS reconnection with backoff
         - Connection state tracking
         - Handles both connected and standalone modes
+        - v93.14: Writes heartbeats to JARVIS service registry for cross-repo discovery
         """
         reconnect_delay = HEARTBEAT_INTERVAL
         consecutive_failures = 0
@@ -893,6 +979,9 @@ class CrossRepoBridge:
 
                 # Update heartbeat - always write state
                 await self._write_state()
+
+                # v93.14: Also write heartbeat to JARVIS service registry
+                await self._send_registry_heartbeat()
 
                 # v93.3: Intelligent reconnection logic
                 if not self.state.connected_to_jarvis:
