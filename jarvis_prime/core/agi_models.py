@@ -1966,6 +1966,54 @@ class AGIOrchestrator:
             },
         }
 
+    async def shutdown(self) -> None:
+        """
+        Gracefully shutdown the AGI Orchestrator and all loaded models.
+
+        v95.0: Added to fix AttributeError when AGIIntegrationHub attempts
+        to shutdown the orchestrator during system shutdown.
+
+        Performs:
+        1. Logs final statistics
+        2. Clears model caches
+        3. Resets cognitive state
+        4. Marks orchestrator as uninitialized
+        """
+        logger.info("Shutting down AGI Orchestrator...")
+
+        try:
+            # Log final statistics before shutdown
+            stats = self.get_statistics()
+            total_activations = sum(stats.get("total_activations", {}).values())
+            logger.info(f"  Total model activations: {total_activations}")
+            logger.info(f"  Models loaded: {len(self._models)}")
+
+            # Clear model caches to free memory
+            for model_type, model in self._models.items():
+                try:
+                    if hasattr(model, '_cache'):
+                        cache_size = len(model._cache)
+                        model._cache.clear()
+                        logger.debug(f"  Cleared {cache_size} cache entries for {model_type.value}")
+                except Exception as e:
+                    logger.warning(f"  Failed to clear cache for {model_type.value}: {e}")
+
+            # Reset cognitive state
+            self._state = CognitiveState()
+
+            # Clear model references
+            self._models.clear()
+
+            # Mark as uninitialized
+            self._initialized = False
+
+            logger.info("AGI Orchestrator shutdown complete")
+
+        except Exception as e:
+            logger.error(f"Error during AGI Orchestrator shutdown: {e}")
+            # Still mark as uninitialized even on error
+            self._initialized = False
+
 
 # =============================================================================
 # FACTORY FUNCTIONS

@@ -1337,6 +1337,48 @@ class MultiModalFusionEngine:
             },
         }
 
+    async def shutdown(self) -> None:
+        """
+        Gracefully shutdown the MultiModalFusionEngine.
+
+        v95.0: Added to fix AttributeError when AGIIntegrationHub attempts
+        to shutdown the multimodal engine during system shutdown.
+
+        Performs:
+        1. Logs final statistics
+        2. Clears the fusion cache
+        3. Resets encoder references
+        4. Marks engine as uninitialized
+        """
+        logger.info("Shutting down MultiModalFusionEngine...")
+
+        try:
+            # Log final statistics before shutdown
+            stats = self.get_statistics()
+            logger.info(f"  Total fusions performed: {stats['total_fusions']}")
+            logger.info(f"  Cache entries to clear: {stats['cache_size']}")
+
+            # Clear the cache to free memory
+            cache_size = len(self._cache)
+            self._cache.clear()
+            logger.debug(f"  Cleared {cache_size} cached fusion results")
+
+            # Clear modality usage stats
+            self._modality_usage.clear()
+
+            # Reset encoder references (don't delete them, just clear the dict)
+            self._encoders.clear()
+
+            # Mark as uninitialized
+            self._initialized = False
+
+            logger.info("MultiModalFusionEngine shutdown complete")
+
+        except Exception as e:
+            logger.error(f"Error during MultiModalFusionEngine shutdown: {e}")
+            # Still mark as uninitialized even on error
+            self._initialized = False
+
 
 # =============================================================================
 # FACTORY FUNCTIONS

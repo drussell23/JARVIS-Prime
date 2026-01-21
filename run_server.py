@@ -65,19 +65,31 @@ warnings.filterwarnings('ignore', module='coremltools.*')
 warnings.filterwarnings('ignore', module='sklearn.*')
 warnings.filterwarnings('ignore', module='torch.*')
 
-# v93.16: Override warnings.warn to filter at the source
+# v95.0: Override warnings.warn to filter at the source
+# CRITICAL: Accept all parameters that Python's warnings.warn() can receive
+# including 'source' (added in Python 3.6) to prevent TypeError
 _original_warn = warnings.warn
-def _filtered_warn(message, category=UserWarning, stacklevel=1):
-    """Filtered warn that suppresses known non-critical warnings."""
+def _filtered_warn(message, category=UserWarning, stacklevel=1, source=None):
+    """
+    Filtered warn that suppresses known non-critical warnings.
+
+    v95.0: Added 'source' parameter to match Python's warnings.warn() signature.
+    Without this, any library calling warnings.warn(..., source=something)
+    would raise: TypeError: _filtered_warn() got an unexpected keyword argument 'source'
+    """
     msg_str = str(message).lower()
     suppress_patterns = [
         'scikit-learn', 'coremltools', 'torch version', 'not supported',
         'has not been tested', 'minimum required', 'maximum required',
-        'disabling', 'conversion api'
+        'disabling', 'conversion api', 'urllib3', 'libressl', 'openssl'
     ]
     if any(pattern in msg_str for pattern in suppress_patterns):
         return  # Suppress
-    _original_warn(message, category, stacklevel + 1)
+    # Pass source parameter to original warn if provided
+    if source is not None:
+        _original_warn(message, category, stacklevel + 1, source=source)
+    else:
+        _original_warn(message, category, stacklevel + 1)
 warnings.warn = _filtered_warn
 
 # =============================================================================
