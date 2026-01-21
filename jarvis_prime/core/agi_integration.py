@@ -925,28 +925,137 @@ class AGIIntegrationHub:
         return self._nas_engine
 
     async def shutdown(self) -> None:
-        """Gracefully shutdown all subsystems."""
+        """
+        Gracefully shutdown all subsystems with enterprise-grade robustness.
+
+        v95.0: Complete rewrite with defensive patterns:
+        - Safe shutdown helper prevents orphaned coroutines
+        - hasattr() checks prevent AttributeError cascades
+        - Individual timeout protection per subsystem
+        - Detailed logging for debugging
+        - Graceful degradation on partial failures
+
+        CRITICAL FIX: Previous implementation could leave coroutines orphaned
+        if any subsystem's shutdown() attribute didn't exist. The new pattern
+        wraps each shutdown in a safe helper that handles ALL edge cases.
+        """
         logger.info("Shutting down AGI Integration Hub...")
+        shutdown_start = time.time()
 
-        shutdown_tasks = []
+        # v95.0: Safe shutdown helper that handles all edge cases
+        async def _safe_shutdown(
+            subsystem: Any,
+            name: str,
+            timeout: float = 30.0
+        ) -> Tuple[str, bool, Optional[str]]:
+            """
+            Safely shutdown a subsystem with comprehensive error handling.
 
-        if self._learning_engine:
-            shutdown_tasks.append(self._learning_engine.shutdown())
+            Returns:
+                Tuple of (name, success, error_message)
+            """
+            if subsystem is None:
+                return (name, True, None)  # Not initialized, nothing to do
 
-        if self._orchestrator:
-            shutdown_tasks.append(self._orchestrator.shutdown())
+            try:
+                # Check if shutdown method exists BEFORE calling
+                if not hasattr(subsystem, 'shutdown'):
+                    logger.debug(f"  {name}: No shutdown method (skipped)")
+                    return (name, True, None)
 
-        if self._reasoning_engine:
-            shutdown_tasks.append(self._reasoning_engine.shutdown())
+                # Check if shutdown is callable
+                shutdown_method = getattr(subsystem, 'shutdown')
+                if not callable(shutdown_method):
+                    logger.warning(f"  {name}: shutdown is not callable")
+                    return (name, False, "shutdown not callable")
 
-        if self._multimodal_engine:
-            shutdown_tasks.append(self._multimodal_engine.shutdown())
+                # Call shutdown and check if it returns a coroutine
+                result = shutdown_method()
 
+                # Handle both sync and async shutdown methods
+                if asyncio.iscoroutine(result):
+                    # Async shutdown - await with timeout protection
+                    try:
+                        await asyncio.wait_for(result, timeout=timeout)
+                        logger.debug(f"  {name}: shutdown complete")
+                        return (name, True, None)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"  {name}: shutdown timed out after {timeout}s")
+                        return (name, False, f"timeout after {timeout}s")
+                    except asyncio.CancelledError:
+                        logger.warning(f"  {name}: shutdown was cancelled")
+                        return (name, False, "cancelled")
+                else:
+                    # Sync shutdown (returned None or a value)
+                    logger.debug(f"  {name}: sync shutdown complete")
+                    return (name, True, None)
+
+            except AttributeError as e:
+                # Shouldn't happen due to hasattr check, but be defensive
+                logger.warning(f"  {name}: AttributeError during shutdown: {e}")
+                return (name, False, str(e))
+            except Exception as e:
+                logger.error(f"  {name}: Exception during shutdown: {e}")
+                return (name, False, str(e))
+
+        # v95.0: Define subsystems to shutdown with their names
+        subsystems = [
+            (self._learning_engine, "ContinuousLearningEngine"),
+            (self._orchestrator, "AGIOrchestrator"),
+            (self._reasoning_engine, "ReasoningEngine"),
+            (self._multimodal_engine, "MultiModalFusionEngine"),
+            # v80.0 AGI Models
+            (self._continual_learner, "ContinualLearner_v80"),
+            (self._self_modifier, "SelfModifier_v80"),
+        ]
+
+        # v95.0: Create shutdown tasks safely - no coroutines created until we're
+        # inside the safe helper, preventing orphaned coroutine issues
+        shutdown_tasks = [
+            _safe_shutdown(subsystem, name)
+            for subsystem, name in subsystems
+            if subsystem is not None
+        ]
+
+        # Execute all shutdowns in parallel with exception isolation
         if shutdown_tasks:
-            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+            results = await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+
+            # Log summary
+            success_count = sum(
+                1 for r in results
+                if isinstance(r, tuple) and r[1] is True
+            )
+            total_count = len(results)
+
+            # Log any failures
+            for r in results:
+                if isinstance(r, tuple) and r[2] is not None:
+                    logger.warning(f"  Shutdown issue: {r[0]} - {r[2]}")
+                elif isinstance(r, Exception):
+                    logger.error(f"  Unexpected shutdown error: {r}")
+
+            elapsed = time.time() - shutdown_start
+            logger.info(
+                f"AGI Integration Hub shutdown complete: "
+                f"{success_count}/{total_count} subsystems in {elapsed:.2f}s"
+            )
+        else:
+            logger.info("AGI Integration Hub shutdown complete (no subsystems to shutdown)")
+
+        # Clear references to help garbage collection
+        self._learning_engine = None
+        self._orchestrator = None
+        self._reasoning_engine = None
+        self._multimodal_engine = None
+        self._continual_learner = None
+        self._self_modifier = None
+        self._agi_model_manager = None
+        self._knowledge_distiller = None
+        self._active_learner = None
+        self._nas_engine = None
 
         self._initialized = False
-        logger.info("AGI Integration Hub shutdown complete")
 
     # -------------------------------------------------------------------------
     # MAIN PROCESSING PIPELINE
@@ -1519,7 +1628,14 @@ async def shutdown_agi_hub() -> None:
     """
     Shutdown the global AGI Integration Hub.
 
-    v79.1: Thread-safe shutdown with condition notification.
+    v95.0: Enterprise-grade shutdown with comprehensive error handling.
+
+    Features:
+    - Thread-safe shutdown with condition notification
+    - Timeout protection to prevent hanging
+    - Detailed error logging
+    - Graceful degradation on failures
+    - Proper cleanup even if shutdown partially fails
     """
     global _global_hub, _hub_initializing
 
@@ -1527,14 +1643,40 @@ async def shutdown_agi_hub() -> None:
 
     async with condition:
         if _global_hub is not None:
+            hub_to_shutdown = _global_hub
+            logger.info("[AGI Hub] Initiating global shutdown...")
+
             try:
-                await _global_hub.shutdown()
+                # v95.0: Timeout protection - don't let shutdown hang forever
+                shutdown_timeout = 60.0  # 60 seconds max for full shutdown
+
+                await asyncio.wait_for(
+                    hub_to_shutdown.shutdown(),
+                    timeout=shutdown_timeout
+                )
+                logger.info("[AGI Hub] Global shutdown completed successfully")
+
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[AGI Hub] Shutdown timed out after {shutdown_timeout}s - "
+                    "forcing cleanup"
+                )
+            except asyncio.CancelledError:
+                logger.warning("[AGI Hub] Shutdown was cancelled - forcing cleanup")
             except Exception as e:
                 logger.error(f"[AGI Hub] Shutdown error: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
+                # v95.0: ALWAYS clean up global state, even on error
+                # This prevents the system from getting stuck in a bad state
                 _global_hub = None
                 _hub_initializing = False
                 condition.notify_all()  # Wake any waiters
+
+                logger.debug("[AGI Hub] Global state cleaned up")
+        else:
+            logger.debug("[AGI Hub] No active hub to shutdown")
 
 
 # =============================================================================

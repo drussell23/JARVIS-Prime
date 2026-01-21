@@ -1137,12 +1137,36 @@ async def initialize_bridge(
 
 
 async def shutdown_bridge() -> None:
-    """Shutdown the global bridge instance."""
+    """
+    Shutdown the global bridge instance.
+
+    v95.0: Enhanced with enterprise-grade error handling:
+    - Timeout protection to prevent hanging
+    - Exception isolation
+    - Guaranteed cleanup of global state
+    """
     global _bridge_instance
 
     if _bridge_instance:
-        await _bridge_instance.shutdown()
-        _bridge_instance = None
+        bridge_to_shutdown = _bridge_instance
+        logger.info("[v95.0] Initiating cross-repo bridge shutdown...")
+
+        try:
+            # v95.0: Timeout protection - don't let shutdown hang forever
+            await asyncio.wait_for(
+                bridge_to_shutdown.shutdown(),
+                timeout=30.0
+            )
+            logger.info("[v95.0] Cross-repo bridge shutdown completed")
+        except asyncio.TimeoutError:
+            logger.warning("[v95.0] Bridge shutdown timed out after 30s - forcing cleanup")
+        except asyncio.CancelledError:
+            logger.warning("[v95.0] Bridge shutdown was cancelled - forcing cleanup")
+        except Exception as e:
+            logger.error(f"[v95.0] Bridge shutdown error: {e}")
+        finally:
+            # v95.0: ALWAYS clean up global state, even on error
+            _bridge_instance = None
 
 
 @asynccontextmanager
