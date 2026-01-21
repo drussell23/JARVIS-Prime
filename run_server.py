@@ -42,6 +42,9 @@ warnings.filterwarnings('ignore', message='.*coremltools.*')
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+# v93.14: Suppress scikit-learn version compatibility warnings
+warnings.filterwarnings('ignore', message='.*scikit-learn version.*is not supported.*')
+warnings.filterwarnings('ignore', message='.*Disabling scikit-learn conversion API.*')
 
 # =============================================================================
 # MINIMAL IMPORTS ONLY - Heavy imports happen in background_initialization
