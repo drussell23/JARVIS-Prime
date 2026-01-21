@@ -1334,14 +1334,15 @@ class ContinualLearningEngine:
                     self._fully_initialized = True
                     self._background_init_complete = False
 
-                    # v93.14: Get configuration
-                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "10.0"))
-                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "15.0"))
+                    # v93.15: Get configuration - increased default timeouts for ML operations
+                    # ML model loading can take 30-60s on first load (downloading, compiling)
+                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "30.0"))  # was 10.0
+                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "45.0"))  # was 15.0
                     auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
                     background_init = os.getenv("LEARNING_BACKGROUND_INIT", "true").lower() == "true"
 
                     # Combined timeout for parallel operations
-                    parallel_timeout = max(init_timeout, vector_store_timeout) + 5.0
+                    parallel_timeout = max(init_timeout, vector_store_timeout) + 10.0  # extra buffer
 
                     # v93.14: Build list of initialization tasks to run in PARALLEL
                     init_tasks = []

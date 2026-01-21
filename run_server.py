@@ -887,6 +887,99 @@ async def main():
             raise HTTPException(status_code=500, detail=str(e))
 
     # =========================================================================
+    # WEBSOCKET EVENT STREAM - For Neural Mesh Integration (v93.15)
+    # =========================================================================
+    from fastapi import WebSocket, WebSocketDisconnect
+    from datetime import datetime
+
+    # v93.15: Global event queue and subscribers for WebSocket streaming
+    _ws_event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+    _ws_subscribers: List[WebSocket] = []
+
+    async def _broadcast_ws_event(event_type: str, data: Dict[str, Any]) -> None:
+        """Broadcast an event to all connected WebSocket subscribers."""
+        event = {
+            "event_type": event_type,
+            "data": data,
+            "timestamp": datetime.now().isoformat(),
+        }
+        for ws in _ws_subscribers[:]:  # Copy to avoid modification during iteration
+            try:
+                await ws.send_json(event)
+            except Exception:
+                # Remove dead connections
+                try:
+                    _ws_subscribers.remove(ws)
+                except ValueError:
+                    pass
+
+    @app.websocket("/ws/events")
+    async def websocket_events(websocket: WebSocket):
+        """
+        v93.15: WebSocket endpoint for real-time event streaming to Neural Mesh.
+
+        This endpoint allows JARVIS Body and other clients to receive real-time
+        events from JARVIS-Prime without polling.
+
+        Events include:
+        - connected: Initial connection event with status
+        - heartbeat: Periodic keep-alive (every 30s)
+        - inference_complete: After each inference
+        - model_loaded: When model loading completes
+        - error: On errors
+        """
+        await websocket.accept()
+        _ws_subscribers.append(websocket)
+        logger.info(f"[WebSocket] Client connected ({len(_ws_subscribers)} active)")
+
+        try:
+            # Send initial connection event
+            await websocket.send_json({
+                "event_type": "connected",
+                "data": {
+                    "status": "starting" if not _startup_state.ready else "ready",
+                    "phase": _startup_state.phase,
+                    "model_loaded": _startup_state.model_loaded,
+                    "instance_id": str(uuid.uuid4())[:8],
+                },
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            # Keep connection alive with heartbeats
+            while True:
+                try:
+                    # Wait for incoming message or timeout for heartbeat
+                    try:
+                        message = await asyncio.wait_for(
+                            websocket.receive_text(),
+                            timeout=30.0  # Heartbeat every 30s
+                        )
+                        # Handle ping/pong
+                        if message == "ping":
+                            await websocket.send_text("pong")
+                    except asyncio.TimeoutError:
+                        # Send heartbeat
+                        await websocket.send_json({
+                            "event_type": "heartbeat",
+                            "data": {
+                                "status": "ready" if _startup_state.ready else "starting",
+                                "model_loaded": _startup_state.model_loaded,
+                            },
+                            "timestamp": datetime.now().isoformat(),
+                        })
+                except WebSocketDisconnect:
+                    break
+
+        except Exception as e:
+            logger.debug(f"[WebSocket] Error: {e}")
+        finally:
+            try:
+                _ws_subscribers.remove(websocket)
+            except ValueError:
+                pass
+            logger.info(f"[WebSocket] Client disconnected ({len(_ws_subscribers)} remaining)")
+
+    # =========================================================================
     # HELPER FUNCTIONS
     # =========================================================================
     def _record_inference_metrics(tokens_in: int, tokens_out: int, latency_ms: float, success: bool):

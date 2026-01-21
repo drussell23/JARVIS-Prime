@@ -36,6 +36,21 @@ This integration layer provides:
 
 from __future__ import annotations
 
+# =============================================================================
+# v93.15: CRITICAL - Suppress ML library warnings BEFORE heavy imports
+# These warnings are emitted during torch/sklearn import
+# =============================================================================
+import warnings
+warnings.filterwarnings('ignore', message='.*scikit-learn version.*is not supported.*')
+warnings.filterwarnings('ignore', message='.*Disabling scikit-learn conversion API.*')
+warnings.filterwarnings('ignore', message='.*Torch version.*has not been tested.*')
+warnings.filterwarnings('ignore', message='.*coremltools.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='coremltools')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch')
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+# =============================================================================
+
 import asyncio
 import logging
 import os  # v93.14: Added for environment variable access
@@ -703,11 +718,12 @@ class AGIIntegrationHub:
             - Knowledge Distillation Engine
             - Active Learning Engine
         """
-        # v93.14: Enhanced per-component timeout with environment variable overrides
-        # Default: divide overall timeout among 3 main async components, capped at 15s
+        # v93.15: Enhanced per-component timeout with environment variable overrides
+        # Default: divide overall timeout among 3 main async components, capped at 30s
+        # Increased from 15s to 30s for heavy ML model loading operations
         default_component_timeout = min(
             self._config.agi_models_v80_timeout / 3,
-            15.0
+            30.0  # was 15.0 - too short for ML operations
         )
 
         # v93.14: Per-component timeout overrides via environment variables
