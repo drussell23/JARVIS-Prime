@@ -341,6 +341,75 @@ def _atomic_register_service(
         return False
 
 
+def _atomic_update_heartbeat(
+    service_names: List[str],
+    status: str = "running",
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v97.0: Atomically update heartbeat timestamp in the service registry.
+
+    This function ensures external services (like jarvis-prime) maintain
+    fresh heartbeats in the shared registry so they don't get cleaned up
+    as stale by the JARVIS service registry cleanup process.
+
+    Args:
+        service_names: List of service names to update heartbeat for
+        status: Service status (running, starting, stopping, etc.)
+        timeout: Max seconds to wait for lock
+
+    Returns:
+        True if heartbeat update succeeded, False otherwise
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            # Read current registry
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                        if not isinstance(existing_services, dict):
+                            existing_services = {}
+                except (json.JSONDecodeError, OSError):
+                    return False
+
+            # Update heartbeat for each service
+            current_time = time.time()
+            updated = False
+            for name in service_names:
+                if name in existing_services:
+                    existing_services[name]["last_heartbeat"] = current_time
+                    existing_services[name]["status"] = status
+                    updated = True
+
+            if not updated:
+                return False  # Services not found in registry
+
+            # Write back atomically
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            temp_file.replace(registry_file)
+
+        return True
+
+    except Exception as e:
+        logger.debug(f"[v97.0] Heartbeat update error: {e}")
+        return False
+
+
 def _atomic_deregister_service(
     service_names: List[str],
     timeout: float = _REGISTRY_LOCK_TIMEOUT,
@@ -1184,6 +1253,54 @@ async def main():
         # Handle shutdown
         shutdown_event = asyncio.Event()
         init_task: Optional[asyncio.Task] = None
+        # v97.0: Registry heartbeat task to prevent stale cleanup
+        registry_heartbeat_task: Optional[asyncio.Task] = None
+
+        async def _registry_heartbeat_loop() -> None:
+            """
+            v97.0: Periodically update heartbeat in the shared service registry.
+
+            This is CRITICAL for external services like jarvis-prime to prevent
+            being marked as stale by the JARVIS service registry cleanup process.
+            """
+            service_names = ["jarvis_prime", "jarvis-prime", "jprime"]
+            heartbeat_interval = 15.0
+            consecutive_failures = 0
+
+            logger.info(f"[v97.0] Registry heartbeat loop started for: {service_names}")
+
+            while not shutdown_event.is_set():
+                try:
+                    await asyncio.sleep(heartbeat_interval)
+
+                    if shutdown_event.is_set():
+                        break
+
+                    # Update heartbeat in service registry
+                    success = _atomic_update_heartbeat(
+                        service_names=service_names,
+                        status="running"
+                    )
+
+                    if success:
+                        consecutive_failures = 0
+                        logger.debug(f"[v97.0] Registry heartbeat updated for {service_names[0]}")
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 5:
+                            logger.warning(
+                                f"[v97.0] {consecutive_failures} consecutive heartbeat failures"
+                            )
+
+                except asyncio.CancelledError:
+                    logger.info("[v97.0] Registry heartbeat loop cancelled")
+                    break
+                except Exception as e:
+                    logger.debug(f"[v97.0] Registry heartbeat error: {e}")
+                    consecutive_failures += 1
+                    await asyncio.sleep(1.0)
+
+            logger.info("[v97.0] Registry heartbeat loop stopped")
 
         async def background_initialization():
             """
@@ -1477,6 +1594,14 @@ async def main():
                     f"[v96.0] ✅ Registered with service registry using atomic lock "
                     f"(port={actual_port}{fallback_msg}, pid={os.getpid()})"
                 )
+
+                # v97.0: Start registry heartbeat loop to prevent stale cleanup
+                nonlocal registry_heartbeat_task
+                registry_heartbeat_task = asyncio.create_task(
+                    _registry_heartbeat_loop(),
+                    name="jarvis_prime_registry_heartbeat"
+                )
+                logger.info("[v97.0] ✅ Registry heartbeat started (interval: 15s)")
             else:
                 logger.warning("[v96.0] Service registry registration failed (non-fatal)")
 
@@ -1485,12 +1610,21 @@ async def main():
         @app.on_event("shutdown")
         async def on_shutdown():
             """
-            v95.0: Clean up on server shutdown with service deregistration.
+            v97.0: Clean up on server shutdown with service deregistration.
 
             Ensures JARVIS Prime is removed from the shared service registry
             so TrinityIntegrator knows it's no longer available.
             """
-            nonlocal init_task
+            nonlocal init_task, registry_heartbeat_task
+
+            # v97.0: Stop registry heartbeat loop first
+            if registry_heartbeat_task and not registry_heartbeat_task.done():
+                registry_heartbeat_task.cancel()
+                try:
+                    await asyncio.wait_for(registry_heartbeat_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                logger.info("[v97.0] Registry heartbeat stopped")
 
             # v96.0: Deregister from shared service registry using atomic locking
             if _atomic_deregister_service(["jarvis_prime", "jarvis-prime", "jprime"]):

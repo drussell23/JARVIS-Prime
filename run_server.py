@@ -117,6 +117,185 @@ logging.basicConfig(
 logger = logging.getLogger("jarvis-prime")
 
 
+# =============================================================================
+# v97.0: Service Registry Functions for Cross-Repo Coordination
+# =============================================================================
+# These functions enable JARVIS Prime to register with the shared service
+# registry and maintain heartbeats to prevent stale cleanup.
+
+import fcntl
+from contextlib import contextmanager
+
+_REGISTRY_LOCK_TIMEOUT = 10.0
+
+@contextmanager
+def _acquire_registry_lock(lock_file: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
+    """Acquire an exclusive lock on the registry lock file."""
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_file, 'w')
+    start_time = time.time()
+
+    while True:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.time() - start_time > timeout:
+                lock_fd.close()
+                raise TimeoutError(f"Could not acquire registry lock within {timeout}s")
+            time.sleep(0.05)
+
+    try:
+        yield lock_fd
+    finally:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+
+
+def _atomic_register_service(
+    service_name: str,
+    service_data: Dict[str, Any],
+    alternate_names: Optional[List[str]] = None,
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v97.0: Register a service with the shared registry atomically.
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                        if not isinstance(existing_services, dict):
+                            existing_services = {}
+                except (json.JSONDecodeError, OSError):
+                    existing_services = {}
+
+            existing_services[service_name] = service_data
+            if alternate_names:
+                for alt_name in alternate_names:
+                    existing_services[alt_name] = service_data
+
+            registry_dir.mkdir(parents=True, exist_ok=True)
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(registry_file)
+
+        return True
+    except Exception as e:
+        logger.warning(f"[v97.0] Registry registration failed: {e}")
+        return False
+
+
+def _atomic_update_heartbeat(
+    service_names: List[str],
+    status: str = "running",
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v97.0: Atomically update heartbeat timestamp in the service registry.
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                except (json.JSONDecodeError, OSError):
+                    return False
+
+            current_time = time.time()
+            updated = False
+            for name in service_names:
+                if name in existing_services:
+                    existing_services[name]["last_heartbeat"] = current_time
+                    existing_services[name]["status"] = status
+                    updated = True
+
+            if not updated:
+                return False
+
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(registry_file)
+
+        return True
+    except Exception:
+        return False
+
+
+def _atomic_deregister_service(
+    service_names: List[str],
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v97.0: Deregister services from the shared registry atomically.
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                except (json.JSONDecodeError, OSError):
+                    return True
+
+            for name in service_names:
+                existing_services.pop(name, None)
+
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(registry_file)
+
+        return True
+    except Exception:
+        return False
+
+
+# v97.0: Global registry heartbeat task reference
+_registry_heartbeat_task: Optional[asyncio.Task] = None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="JARVIS-Prime Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
@@ -1532,13 +1711,64 @@ async def main():
     @app.on_event("startup")
     async def on_startup():
         """
-        v93.2: FastAPI startup event.
+        v97.0: FastAPI startup event with SERVICE REGISTRATION.
 
         This runs AFTER uvicorn binds to the port and starts listening.
         This is the key to solving the 61.9s timeout - the health endpoint
         is already responding when this function starts.
+
+        v97.0: Now registers with shared service registry to enable
+        TrinityIntegrator's registration-aware verification.
         """
+        global _registry_heartbeat_task
+
         logger.info("[v93.2] Server is now LISTENING - starting background initialization")
+
+        # v97.0: Register with shared service registry using ATOMIC locking
+        service_data = {
+            "service_name": "jarvis_prime",
+            "pid": os.getpid(),
+            "port": _args.port,
+            "host": _args.host,
+            "health_endpoint": "/health",
+            "status": "starting",
+            "registered_at": time.time(),
+            "last_heartbeat": time.time(),
+            "metadata": {
+                "version": "4.0.0",
+                "role": "inference",
+            },
+        }
+
+        if _atomic_register_service(
+            service_name="jarvis_prime",
+            service_data=service_data,
+            alternate_names=["jarvis-prime", "jprime"],
+        ):
+            logger.info(f"[v97.0] ✅ Registered with service registry (port={_args.port}, pid={os.getpid()})")
+
+            # Start registry heartbeat loop
+            async def _registry_heartbeat_loop():
+                service_names = ["jarvis_prime", "jarvis-prime", "jprime"]
+                while True:
+                    try:
+                        await asyncio.sleep(15.0)
+                        success = _atomic_update_heartbeat(service_names, status="running")
+                        if success:
+                            logger.debug("[v97.0] Registry heartbeat updated")
+                    except asyncio.CancelledError:
+                        break
+                    except Exception:
+                        pass
+
+            _registry_heartbeat_task = asyncio.create_task(
+                _registry_heartbeat_loop(),
+                name="jarvis_prime_registry_heartbeat"
+            )
+            logger.info("[v97.0] ✅ Registry heartbeat started (interval: 15s)")
+        else:
+            logger.warning("[v97.0] Service registry registration failed (non-fatal)")
+
         asyncio.create_task(background_initialization())
 
     # =========================================================================
@@ -1546,7 +1776,21 @@ async def main():
     # =========================================================================
     @app.on_event("shutdown")
     async def on_shutdown():
+        global _registry_heartbeat_task
+
         logger.info("Shutting down...")
+
+        # v97.0: Stop registry heartbeat and deregister
+        if _registry_heartbeat_task and not _registry_heartbeat_task.done():
+            _registry_heartbeat_task.cancel()
+            try:
+                await asyncio.wait_for(_registry_heartbeat_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            logger.info("[v97.0] Registry heartbeat stopped")
+
+        if _atomic_deregister_service(["jarvis_prime", "jarvis-prime", "jprime"]):
+            logger.info("[v97.0] ✅ Deregistered from service registry")
 
         if _neural_orchestrator:
             try:
