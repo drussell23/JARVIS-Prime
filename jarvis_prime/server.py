@@ -1076,23 +1076,115 @@ async def main():
         @app.on_event("startup")
         async def on_startup():
             """
-            v93.2: Trigger background initialization AFTER server is listening.
+            v95.0: Trigger background initialization and SERVICE REGISTRATION.
 
             This is the critical fix - the startup event fires AFTER uvicorn
             has successfully bound to the port and is ready to accept connections.
             Health checks will succeed immediately while heavy init runs.
+
+            v95.0 Enhancement:
+            - Registers JARVIS Prime with the shared service registry
+            - This enables TrinityIntegrator to verify registration (not just HTTP discovery)
+            - Fixes the timing issue where components were marked "pending"
             """
             nonlocal init_task
             logger.info("=" * 70)
-            logger.info("[v93.2] Server is now LISTENING - starting background initialization")
+            logger.info("[v95.0] Server is now LISTENING - starting background initialization")
             logger.info(f"Health endpoint ready: http://{args.host}:{args.port}/health")
             logger.info("=" * 70)
+
+            # v95.0: Register with shared service registry IMMEDIATELY
+            # This is CRITICAL for TrinityIntegrator's registration-aware verification
+            try:
+                registry_dir = Path(os.getenv(
+                    "JARVIS_REGISTRY_DIR",
+                    str(Path.home() / ".jarvis" / "registry")
+                ))
+                registry_dir.mkdir(parents=True, exist_ok=True)
+                registry_file = registry_dir / "services.json"
+
+                # Read existing registry (atomic)
+                existing_services = {}
+                if registry_file.exists():
+                    try:
+                        existing_services = json.loads(registry_file.read_text())
+                        if not isinstance(existing_services, dict):
+                            existing_services = {}
+                    except (json.JSONDecodeError, Exception):
+                        existing_services = {}
+
+                # Register JARVIS Prime
+                existing_services["jarvis_prime"] = {
+                    "service_name": "jarvis_prime",
+                    "pid": os.getpid(),
+                    "port": args.port,
+                    "host": args.host,
+                    "health_endpoint": "/health",
+                    "status": "starting",
+                    "registered_at": time.time(),
+                    "last_heartbeat": time.time(),
+                    "metadata": {
+                        "version": "4.0.0",
+                        "role": "inference",
+                        "gpu": os.getenv("JARVIS_PRIME_GPU", "auto"),
+                    }
+                }
+
+                # Also register under alternate names for compatibility
+                existing_services["jarvis-prime"] = existing_services["jarvis_prime"]
+                existing_services["jprime"] = existing_services["jarvis_prime"]
+
+                # Write atomically using temp file + rename
+                temp_file = registry_file.with_suffix(".tmp")
+                temp_file.write_text(json.dumps(existing_services, indent=2))
+                temp_file.rename(registry_file)
+
+                logger.info(
+                    f"[v95.0] ✅ Registered with service registry: "
+                    f"{registry_file} (port={args.port}, pid={os.getpid()})"
+                )
+            except Exception as e:
+                logger.warning(f"[v95.0] Service registry registration failed (non-fatal): {e}")
+
             init_task = asyncio.create_task(background_initialization())
 
         @app.on_event("shutdown")
         async def on_shutdown():
-            """Clean up on server shutdown."""
+            """
+            v95.0: Clean up on server shutdown with service deregistration.
+
+            Ensures JARVIS Prime is removed from the shared service registry
+            so TrinityIntegrator knows it's no longer available.
+            """
             nonlocal init_task
+
+            # v95.0: Deregister from shared service registry FIRST
+            try:
+                registry_dir = Path(os.getenv(
+                    "JARVIS_REGISTRY_DIR",
+                    str(Path.home() / ".jarvis" / "registry")
+                ))
+                registry_file = registry_dir / "services.json"
+
+                if registry_file.exists():
+                    try:
+                        existing_services = json.loads(registry_file.read_text())
+                        if isinstance(existing_services, dict):
+                            # Remove all JARVIS Prime entries
+                            for name in ["jarvis_prime", "jarvis-prime", "jprime"]:
+                                existing_services.pop(name, None)
+
+                            # Write back atomically
+                            temp_file = registry_file.with_suffix(".tmp")
+                            temp_file.write_text(json.dumps(existing_services, indent=2))
+                            temp_file.rename(registry_file)
+
+                            logger.info("[v95.0] ✅ Deregistered from service registry")
+                    except Exception as e:
+                        logger.debug(f"[v95.0] Service deregistration error: {e}")
+            except Exception as e:
+                logger.debug(f"[v95.0] Registry cleanup error: {e}")
+
             if init_task and not init_task.done():
                 init_task.cancel()
                 try:
