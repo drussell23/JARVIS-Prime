@@ -152,6 +152,209 @@ def _get_machine_id() -> str:
 
 
 # =============================================================================
+# v96.0: ATOMIC SHARED REGISTRY FOR CROSS-PROCESS COORDINATION
+# =============================================================================
+
+import fcntl
+from contextlib import contextmanager
+
+# Registry lock configuration
+_REGISTRY_LOCK_TIMEOUT = 30.0  # Max seconds to wait for lock
+_REGISTRY_LOCK_POLL_INTERVAL = 0.05  # Poll interval when waiting
+
+
+@contextmanager
+def _acquire_registry_lock(lock_path: Path, timeout: float = _REGISTRY_LOCK_TIMEOUT):
+    """
+    v96.0: Acquire exclusive lock on the registry using a separate lock file.
+
+    This is the CRITICAL fix for race conditions - we lock a separate file
+    and hold it for the entire read-modify-write cycle.
+
+    Args:
+        lock_path: Path to the lock file
+        timeout: Max seconds to wait for lock
+
+    Yields:
+        The lock file handle
+
+    Raises:
+        TimeoutError: If lock cannot be acquired within timeout
+    """
+    # Ensure directory exists
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create lock file if it doesn't exist
+    lock_path.touch(exist_ok=True)
+
+    start_time = time.time()
+    lock_fd = None
+
+    try:
+        # Open lock file
+        lock_fd = open(lock_path, 'r+')
+
+        # Try to acquire lock with timeout
+        while True:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Lock acquired!
+                break
+            except (IOError, OSError):
+                # Lock is held by another process
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    lock_fd.close()
+                    raise TimeoutError(
+                        f"Could not acquire registry lock within {timeout}s. "
+                        f"Another process may be holding the lock."
+                    )
+                time.sleep(_REGISTRY_LOCK_POLL_INTERVAL)
+
+        yield lock_fd
+
+    finally:
+        # Release lock
+        if lock_fd:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
+
+
+def _atomic_register_service(
+    service_name: str,
+    service_data: Dict[str, Any],
+    alternate_names: Optional[List[str]] = None,
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v96.0: Register a service with the shared registry atomically.
+
+    This function ensures proper cross-process synchronization by:
+    1. Acquiring an exclusive lock on a separate .lock file
+    2. Reading the current registry state
+    3. Modifying it
+    4. Writing it back atomically
+    5. Releasing the lock
+
+    Args:
+        service_name: Primary service name
+        service_data: Service data dict (pid, port, host, etc.)
+        alternate_names: Optional list of alternate names to also register
+        timeout: Max seconds to wait for lock
+
+    Returns:
+        True if registration succeeded, False otherwise
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            # Read current registry (inside lock)
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                        if not isinstance(existing_services, dict):
+                            existing_services = {}
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(f"[v96.0] Registry read error (will overwrite): {e}")
+                    existing_services = {}
+
+            # Update registry
+            existing_services[service_name] = service_data
+
+            # Register alternate names
+            if alternate_names:
+                for alt_name in alternate_names:
+                    existing_services[alt_name] = service_data
+
+            # Write atomically (inside lock)
+            registry_dir.mkdir(parents=True, exist_ok=True)
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomic rename
+            temp_file.replace(registry_file)
+
+        return True
+
+    except TimeoutError as e:
+        logger.error(f"[v96.0] Registry lock timeout for {service_name}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"[v96.0] Failed to register {service_name}: {e}")
+        return False
+
+
+def _atomic_deregister_service(
+    service_names: List[str],
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v96.0: Deregister services from the shared registry atomically.
+
+    Args:
+        service_names: List of service names to remove
+        timeout: Max seconds to wait for lock
+
+    Returns:
+        True if deregistration succeeded, False otherwise
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            # Read current registry
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                        if not isinstance(existing_services, dict):
+                            return True  # Nothing to deregister
+                except (json.JSONDecodeError, OSError):
+                    return True  # Nothing to deregister
+
+            # Remove services
+            for name in service_names:
+                existing_services.pop(name, None)
+
+            # Write back atomically
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            temp_file.replace(registry_file)
+
+        return True
+
+    except Exception as e:
+        logger.debug(f"[v96.0] Deregistration error: {e}")
+        return False
+
+
+# =============================================================================
 # v84.0: ADVANCED TRINITY INTEGRATION
 # =============================================================================
 
@@ -1175,84 +1378,65 @@ async def main():
             logger.info(f"Health endpoint ready: http://{args.host}:{args.port}/health")
             logger.info("=" * 70)
 
-            # v95.0: Register with shared service registry IMMEDIATELY
+            # v96.0: Register with shared service registry using ATOMIC locking
             # This is CRITICAL for TrinityIntegrator's registration-aware verification
-            try:
-                registry_dir = Path(os.getenv(
-                    "JARVIS_REGISTRY_DIR",
-                    str(Path.home() / ".jarvis" / "registry")
-                ))
-                registry_dir.mkdir(parents=True, exist_ok=True)
-                registry_file = registry_dir / "services.json"
+            # Uses file locking to prevent race conditions between multiple services
 
-                # Read existing registry (atomic)
-                existing_services = {}
-                if registry_file.exists():
-                    try:
-                        existing_services = json.loads(registry_file.read_text())
-                        if not isinstance(existing_services, dict):
-                            existing_services = {}
-                    except (json.JSONDecodeError, Exception):
-                        existing_services = {}
+            # Capture process fingerprint for PID reuse detection
+            fingerprint = _get_process_fingerprint()
+            machine_id = _get_machine_id()
 
-                # Register JARVIS Prime with v96.0 enhanced fields
-                # Capture process fingerprint for PID reuse detection
-                fingerprint = _get_process_fingerprint()
-                machine_id = _get_machine_id()
+            # Determine configured port vs actual port
+            configured_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+            actual_port = args.port
+            is_fallback = actual_port != configured_port
 
-                # Determine configured port vs actual port
-                configured_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
-                actual_port = args.port
-                is_fallback = actual_port != configured_port
+            # Build service data
+            service_data = {
+                "service_name": "jarvis_prime",
+                "pid": os.getpid(),
+                "port": actual_port,
+                "host": args.host,
+                "health_endpoint": "/health",
+                "status": "starting",
+                "registered_at": time.time(),
+                "last_heartbeat": time.time(),
+                "metadata": {
+                    "version": "4.0.0",
+                    "role": "inference",
+                    "gpu": os.getenv("JARVIS_PRIME_GPU", "auto"),
+                },
+                # v96.0: Port fallback tracking (Problem 17 fix)
+                "primary_port": configured_port,
+                "is_fallback_port": is_fallback,
+                "fallback_reason": f"Port {configured_port} unavailable" if is_fallback else "",
+                "ports_tried": [configured_port] if is_fallback else [],
+                "port_allocation_time": time.time(),
+                # v96.0: Process fingerprint for identity validation (Problem 18 fix)
+                "process_name": fingerprint["process_name"],
+                "process_cmdline": fingerprint["process_cmdline"],
+                "process_exe_path": fingerprint["process_exe_path"],
+                "process_cwd": fingerprint["process_cwd"],
+                "parent_pid": fingerprint["parent_pid"],
+                "parent_name": fingerprint["parent_name"],
+                "process_start_time": fingerprint["process_start_time"],
+                # v96.0: Machine ID for distributed environments
+                "machine_id": machine_id,
+            }
 
-                existing_services["jarvis_prime"] = {
-                    "service_name": "jarvis_prime",
-                    "pid": os.getpid(),
-                    "port": actual_port,
-                    "host": args.host,
-                    "health_endpoint": "/health",
-                    "status": "starting",
-                    "registered_at": time.time(),
-                    "last_heartbeat": time.time(),
-                    "metadata": {
-                        "version": "4.0.0",
-                        "role": "inference",
-                        "gpu": os.getenv("JARVIS_PRIME_GPU", "auto"),
-                    },
-                    # v96.0: Port fallback tracking (Problem 17 fix)
-                    "primary_port": configured_port,
-                    "is_fallback_port": is_fallback,
-                    "fallback_reason": f"Port {configured_port} unavailable" if is_fallback else "",
-                    "ports_tried": [configured_port] if is_fallback else [],
-                    "port_allocation_time": time.time(),
-                    # v96.0: Process fingerprint for identity validation (Problem 18 fix)
-                    "process_name": fingerprint["process_name"],
-                    "process_cmdline": fingerprint["process_cmdline"],
-                    "process_exe_path": fingerprint["process_exe_path"],
-                    "process_cwd": fingerprint["process_cwd"],
-                    "parent_pid": fingerprint["parent_pid"],
-                    "parent_name": fingerprint["parent_name"],
-                    "process_start_time": fingerprint["process_start_time"],
-                    # v96.0: Machine ID for distributed environments
-                    "machine_id": machine_id,
-                }
-
-                # Also register under alternate names for compatibility
-                existing_services["jarvis-prime"] = existing_services["jarvis_prime"]
-                existing_services["jprime"] = existing_services["jarvis_prime"]
-
-                # Write atomically using temp file + rename
-                temp_file = registry_file.with_suffix(".tmp")
-                temp_file.write_text(json.dumps(existing_services, indent=2))
-                temp_file.rename(registry_file)
-
+            # Use atomic registration with file locking
+            if _atomic_register_service(
+                service_name="jarvis_prime",
+                service_data=service_data,
+                alternate_names=["jarvis-prime", "jprime"],
+            ):
                 fallback_msg = f" (fallback from {configured_port})" if is_fallback else ""
                 logger.info(
-                    f"[v96.0] ✅ Registered with service registry: "
-                    f"{registry_file} (port={actual_port}{fallback_msg}, pid={os.getpid()})"
+                    f"[v96.0] ✅ Registered with service registry using atomic lock "
+                    f"(port={actual_port}{fallback_msg}, pid={os.getpid()})"
                 )
-            except Exception as e:
-                logger.warning(f"[v95.0] Service registry registration failed (non-fatal): {e}")
+            else:
+                logger.warning("[v96.0] Service registry registration failed (non-fatal)")
 
             init_task = asyncio.create_task(background_initialization())
 
@@ -1266,32 +1450,11 @@ async def main():
             """
             nonlocal init_task
 
-            # v95.0: Deregister from shared service registry FIRST
-            try:
-                registry_dir = Path(os.getenv(
-                    "JARVIS_REGISTRY_DIR",
-                    str(Path.home() / ".jarvis" / "registry")
-                ))
-                registry_file = registry_dir / "services.json"
-
-                if registry_file.exists():
-                    try:
-                        existing_services = json.loads(registry_file.read_text())
-                        if isinstance(existing_services, dict):
-                            # Remove all JARVIS Prime entries
-                            for name in ["jarvis_prime", "jarvis-prime", "jprime"]:
-                                existing_services.pop(name, None)
-
-                            # Write back atomically
-                            temp_file = registry_file.with_suffix(".tmp")
-                            temp_file.write_text(json.dumps(existing_services, indent=2))
-                            temp_file.rename(registry_file)
-
-                            logger.info("[v95.0] ✅ Deregistered from service registry")
-                    except Exception as e:
-                        logger.debug(f"[v95.0] Service deregistration error: {e}")
-            except Exception as e:
-                logger.debug(f"[v95.0] Registry cleanup error: {e}")
+            # v96.0: Deregister from shared service registry using atomic locking
+            if _atomic_deregister_service(["jarvis_prime", "jarvis-prime", "jprime"]):
+                logger.info("[v96.0] ✅ Deregistered from service registry")
+            else:
+                logger.debug("[v96.0] Service deregistration completed (may have already been removed)")
 
             if init_task and not init_task.done():
                 init_task.cancel()
