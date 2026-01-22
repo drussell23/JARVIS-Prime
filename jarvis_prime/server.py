@@ -228,22 +228,27 @@ def _atomic_register_service(
     service_data: Dict[str, Any],
     alternate_names: Optional[List[str]] = None,
     timeout: float = _REGISTRY_LOCK_TIMEOUT,
+    cleanup_stale: bool = True,
+    max_stale_age: float = 300.0,
 ) -> bool:
     """
     v96.0: Register a service with the shared registry atomically.
 
     This function ensures proper cross-process synchronization by:
     1. Acquiring an exclusive lock on a separate .lock file
-    2. Reading the current registry state
-    3. Modifying it
-    4. Writing it back atomically
-    5. Releasing the lock
+    2. Cleaning up stale entries from previous runs
+    3. Reading the current registry state
+    4. Modifying it
+    5. Writing it back atomically
+    6. Releasing the lock
 
     Args:
         service_name: Primary service name
         service_data: Service data dict (pid, port, host, etc.)
         alternate_names: Optional list of alternate names to also register
         timeout: Max seconds to wait for lock
+        cleanup_stale: Whether to clean up stale entries first
+        max_stale_age: Max age in seconds before entry is considered stale
 
     Returns:
         True if registration succeeded, False otherwise
@@ -269,6 +274,43 @@ def _atomic_register_service(
                 except (json.JSONDecodeError, OSError) as e:
                     logger.warning(f"[v96.0] Registry read error (will overwrite): {e}")
                     existing_services = {}
+
+            # v96.0: Clean up stale entries before registration
+            if cleanup_stale and existing_services:
+                current_time = time.time()
+                entries_to_remove = []
+
+                for name, data in list(existing_services.items()):
+                    if not isinstance(data, dict):
+                        entries_to_remove.append(name)
+                        continue
+
+                    # Check age
+                    last_activity = max(
+                        data.get("last_heartbeat", 0),
+                        data.get("registered_at", 0)
+                    )
+                    age = current_time - last_activity
+
+                    if age > max_stale_age:
+                        entries_to_remove.append(name)
+                        logger.debug(f"[v96.0] Removing stale: {name} (age: {age:.0f}s)")
+                    else:
+                        # Check if process is alive
+                        pid = data.get("pid")
+                        if pid and PSUTIL_AVAILABLE:
+                            try:
+                                if not psutil.pid_exists(pid):
+                                    entries_to_remove.append(name)
+                                    logger.debug(f"[v96.0] Removing dead: {name} (pid {pid})")
+                            except Exception:
+                                pass
+
+                for name in entries_to_remove:
+                    existing_services.pop(name, None)
+
+                if entries_to_remove:
+                    logger.info(f"[v96.0] Cleaned {len(entries_to_remove)} stale entries before registration")
 
             # Update registry
             existing_services[service_name] = service_data
