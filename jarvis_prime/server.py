@@ -85,7 +85,7 @@ class TrinityConnectionState(Enum):
 @dataclass
 class TrinityIntegration:
     """
-    v84.0: Advanced Trinity integration for J-Prime.
+    v95.0: Advanced Trinity integration for J-Prime with CONTINUOUS RECONNECTION.
 
     Features:
         - Automatic connection on startup
@@ -93,6 +93,14 @@ class TrinityIntegration:
         - OOM protection before inference
         - Graceful shutdown coordination
         - Heartbeat with guaranteed delivery
+        - v95.0: CONTINUOUS reconnection (never gives up)
+        - v95.0: Exponential backoff with configurable ceiling
+        - v95.0: Lazy reconnection mode for extended disconnections
+
+    CRITICAL FIX (v95.0):
+        Previous versions gave up after max_reconnect_attempts and stayed in
+        PARTITIONED state permanently. Now uses continuous retry with exponential
+        backoff, capping at max_reconnect_interval but NEVER stopping.
     """
     # Configuration from environment (zero hardcoding)
     enabled: bool = field(default_factory=lambda: os.getenv("TRINITY_ENABLED", "true").lower() == "true")
@@ -102,6 +110,13 @@ class TrinityIntegration:
     oom_warning_threshold: float = field(default_factory=lambda: float(os.getenv("OOM_WARNING_THRESHOLD", "0.75")))
     reconnect_interval: float = field(default_factory=lambda: float(os.getenv("TRINITY_RECONNECT_INTERVAL", "5.0")))
     max_reconnect_attempts: int = field(default_factory=lambda: int(os.getenv("TRINITY_MAX_RECONNECT_ATTEMPTS", "10")))
+
+    # v95.0: NEW - Continuous reconnection settings (CRITICAL FIX)
+    # These ensure we NEVER give up trying to reconnect
+    continuous_reconnect: bool = field(default_factory=lambda: os.getenv("TRINITY_CONTINUOUS_RECONNECT", "true").lower() == "true")
+    max_reconnect_interval: float = field(default_factory=lambda: float(os.getenv("TRINITY_MAX_RECONNECT_INTERVAL", "60.0")))
+    lazy_reconnect_threshold: float = field(default_factory=lambda: float(os.getenv("TRINITY_LAZY_RECONNECT_THRESHOLD", "300.0")))
+    lazy_reconnect_interval: float = field(default_factory=lambda: float(os.getenv("TRINITY_LAZY_RECONNECT_INTERVAL", "120.0")))
 
     # State tracking
     state: TrinityConnectionState = TrinityConnectionState.DISCONNECTED
@@ -247,8 +262,18 @@ class TrinityIntegration:
                 await asyncio.sleep(self.heartbeat_interval)
 
     async def _partition_detection_loop(self) -> None:
-        """Detect network partitions via missing heartbeats."""
-        while self.state in (TrinityConnectionState.CONNECTED, TrinityConnectionState.RECONNECTING):
+        """
+        v95.0: Continuous partition detection - runs in ALL active states.
+
+        CRITICAL FIX: Previous versions only ran while CONNECTED or RECONNECTING,
+        meaning the loop would exit when state became PARTITIONED, and would
+        never restart the reconnection task even if it finished.
+
+        Now runs in all states except DISCONNECTED, and ensures reconnection
+        task is always active when partitioned.
+        """
+        # v95.0: Run in ALL states except DISCONNECTED (the shutdown state)
+        while self.state != TrinityConnectionState.DISCONNECTED:
             try:
                 # Check JARVIS heartbeat freshness
                 jarvis_state_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_body.json"
@@ -262,29 +287,88 @@ class TrinityIntegration:
                             heartbeat_age = time.time() - jarvis_timestamp
 
                             if heartbeat_age > self.partition_threshold:
-                                if self.state != TrinityConnectionState.PARTITIONED:
-                                    logger.warning(f"[Trinity] JARVIS heartbeat stale ({heartbeat_age:.1f}s), possible partition")
+                                # Partition detected or continuing
+                                if self.state == TrinityConnectionState.CONNECTED:
+                                    logger.warning(
+                                        f"[Trinity] JARVIS heartbeat stale ({heartbeat_age:.1f}s), "
+                                        f"initiating partition recovery"
+                                    )
                                     self.state = TrinityConnectionState.PARTITIONED
                                     await self._handle_partition()
-                            else:
-                                if self.state == TrinityConnectionState.PARTITIONED:
-                                    logger.info("[Trinity] JARVIS heartbeat recovered, partition resolved")
-                                    self.state = TrinityConnectionState.CONNECTED
-                                self.last_jarvis_heartbeat = jarvis_timestamp
-                    except json.JSONDecodeError:
-                        pass  # File being written
 
-                await asyncio.sleep(5.0)  # Check every 5 seconds
+                                # v95.0: CRITICAL - Ensure reconnection task is ALWAYS running
+                                # when partitioned, even if it somehow finished
+                                elif self.state in (
+                                    TrinityConnectionState.PARTITIONED,
+                                    TrinityConnectionState.RECONNECTING
+                                ):
+                                    if self._reconnect_task is None or self._reconnect_task.done():
+                                        logger.warning(
+                                            "[Trinity] Reconnection task not active - restarting"
+                                        )
+                                        self._reconnect_task = asyncio.create_task(
+                                            self._reconnection_loop()
+                                        )
+                            else:
+                                # Heartbeat is fresh - connection recovered
+                                if self.state in (
+                                    TrinityConnectionState.PARTITIONED,
+                                    TrinityConnectionState.RECONNECTING
+                                ):
+                                    logger.info(
+                                        "[Trinity] ✅ JARVIS heartbeat recovered, "
+                                        f"partition resolved (age: {heartbeat_age:.1f}s)"
+                                    )
+                                    self.state = TrinityConnectionState.CONNECTED
+
+                                    # Cancel reconnection task if running
+                                    if self._reconnect_task and not self._reconnect_task.done():
+                                        self._reconnect_task.cancel()
+                                        try:
+                                            await self._reconnect_task
+                                        except asyncio.CancelledError:
+                                            pass
+
+                                self.last_jarvis_heartbeat = jarvis_timestamp
+
+                    except json.JSONDecodeError:
+                        pass  # File being written atomically
+                else:
+                    # No heartbeat file - JARVIS might not be running
+                    if self.state == TrinityConnectionState.CONNECTED:
+                        logger.warning(
+                            "[Trinity] JARVIS heartbeat file missing - initiating recovery"
+                        )
+                        self.state = TrinityConnectionState.PARTITIONED
+                        await self._handle_partition()
+
+                # v95.0: Adaptive check interval
+                # Check more frequently when partitioned/reconnecting
+                if self.state in (
+                    TrinityConnectionState.PARTITIONED,
+                    TrinityConnectionState.RECONNECTING
+                ):
+                    await asyncio.sleep(2.0)  # Faster checks during recovery
+                else:
+                    await asyncio.sleep(5.0)  # Normal interval when connected
 
             except asyncio.CancelledError:
+                logger.debug("[Trinity] Partition detection loop cancelled")
                 break
             except Exception as e:
                 logger.debug(f"[Trinity] Partition detection error: {e}")
                 await asyncio.sleep(5.0)
 
     async def _handle_partition(self) -> None:
-        """Handle detected network partition."""
-        logger.warning("[Trinity] Network partition detected - starting recovery")
+        """
+        v95.0: Handle detected network partition with GUARANTEED reconnection.
+
+        Key changes from v84.0:
+        - Always ensures reconnection task is running
+        - Doesn't check if already PARTITIONED (reconnection loop handles that)
+        - Logs partition event for debugging
+        """
+        logger.warning("[Trinity] Network partition detected - initiating continuous recovery")
 
         # Notify callbacks
         for callback in self._partition_callbacks:
@@ -296,44 +380,173 @@ class TrinityIntegration:
             except Exception as e:
                 logger.warning(f"[Trinity] Partition callback error: {e}")
 
-        # Start reconnection attempts
+        # v95.0: ALWAYS ensure reconnection task is running
+        # This is the critical fix - previous versions could leave state stuck
         if self._reconnect_task is None or self._reconnect_task.done():
+            logger.info("[Trinity] Starting continuous reconnection loop")
             self._reconnect_task = asyncio.create_task(self._reconnection_loop())
+        else:
+            logger.debug("[Trinity] Reconnection loop already active")
 
     async def _reconnection_loop(self) -> None:
-        """Attempt to reconnect after partition."""
+        """
+        v95.0: CONTINUOUS reconnection after partition - NEVER gives up.
+
+        Previous versions gave up after max_reconnect_attempts, leaving J-Prime
+        permanently disconnected. This version implements:
+
+        1. Exponential backoff with ceiling (caps at max_reconnect_interval)
+        2. Lazy mode after extended disconnection (uses longer intervals)
+        3. NEVER stops trying - continuous retry until success or shutdown
+        4. Immediate retry reset on successful connection
+
+        The key insight: network partitions can be temporary (JARVIS restart,
+        network blip) or extended (JARVIS not running). We handle both:
+        - Short partitions: aggressive retry with exponential backoff
+        - Long partitions: lazy retry to conserve resources
+        """
         self.state = TrinityConnectionState.RECONNECTING
+        partition_start_time = time.time()
+        consecutive_failures = 0
 
-        while self.reconnect_attempts < self.max_reconnect_attempts:
-            self.reconnect_attempts += 1
+        # v95.0: Continuous loop - NEVER exits except on success or shutdown
+        while True:
+            # Check for shutdown signal
+            if self.state == TrinityConnectionState.DISCONNECTED:
+                logger.info("[Trinity] Reconnection loop stopped - shutdown requested")
+                return
 
-            # Exponential backoff with jitter
-            delay = min(self.reconnect_interval * (2 ** (self.reconnect_attempts - 1)), 60.0)
-            jitter = delay * 0.1 * (hash(time.time()) % 10) / 10
-            actual_delay = delay + jitter
+            consecutive_failures += 1
+            partition_duration = time.time() - partition_start_time
 
-            logger.info(f"[Trinity] Reconnect attempt {self.reconnect_attempts}/{self.max_reconnect_attempts} in {actual_delay:.1f}s")
-            await asyncio.sleep(actual_delay)
+            # v95.0: Adaptive delay calculation
+            # Phase 1: Exponential backoff (first max_reconnect_attempts)
+            # Phase 2: Capped at max_reconnect_interval
+            # Phase 3: Lazy mode after lazy_reconnect_threshold
+            if partition_duration > self.lazy_reconnect_threshold:
+                # Lazy mode: extended disconnection, use longer intervals
+                base_delay = self.lazy_reconnect_interval
+                mode = "lazy"
+            elif consecutive_failures <= self.max_reconnect_attempts:
+                # Aggressive mode: exponential backoff
+                base_delay = min(
+                    self.reconnect_interval * (2 ** (consecutive_failures - 1)),
+                    self.max_reconnect_interval
+                )
+                mode = "aggressive"
+            else:
+                # Sustained mode: capped at max interval
+                base_delay = self.max_reconnect_interval
+                mode = "sustained"
 
-            # Check if partition resolved
-            jarvis_state_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_body.json"
-            if jarvis_state_file.exists():
-                try:
-                    import json
-                    with open(jarvis_state_file, 'r') as f:
-                        data = json.load(f)
-                        heartbeat_age = time.time() - data.get("timestamp", 0)
+            # Add jitter to prevent thundering herd (±10%)
+            jitter = base_delay * 0.1 * ((hash(str(time.time())) % 20) - 10) / 10
+            actual_delay = max(1.0, base_delay + jitter)  # Minimum 1 second
 
-                        if heartbeat_age < self.partition_threshold:
-                            logger.info("[Trinity] Reconnection successful - partition resolved")
-                            self.state = TrinityConnectionState.CONNECTED
-                            self.reconnect_attempts = 0
-                            return
-                except Exception:
-                    pass
+            # Log with appropriate verbosity (less frequent logging in lazy mode)
+            if mode == "lazy":
+                if consecutive_failures % 5 == 1:  # Log every 5th attempt in lazy mode
+                    logger.info(
+                        f"[Trinity] Reconnect attempt #{consecutive_failures} ({mode} mode) "
+                        f"in {actual_delay:.1f}s (partition: {partition_duration:.0f}s)"
+                    )
+            else:
+                logger.info(
+                    f"[Trinity] Reconnect attempt #{consecutive_failures} ({mode} mode) "
+                    f"in {actual_delay:.1f}s"
+                )
 
-        logger.error(f"[Trinity] Reconnection failed after {self.max_reconnect_attempts} attempts")
-        self.state = TrinityConnectionState.PARTITIONED
+            try:
+                await asyncio.sleep(actual_delay)
+            except asyncio.CancelledError:
+                logger.info("[Trinity] Reconnection loop cancelled")
+                return
+
+            # v95.0: Multi-source connection check
+            connected = await self._check_jarvis_connection()
+
+            if connected:
+                logger.info(
+                    f"[Trinity] ✅ Reconnection successful after {consecutive_failures} attempts "
+                    f"(partition duration: {partition_duration:.1f}s)"
+                )
+                self.state = TrinityConnectionState.CONNECTED
+                self.reconnect_attempts = 0
+
+                # Notify connection callbacks
+                for callback in self._connection_callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(True)
+                        else:
+                            callback(True)
+                    except Exception as e:
+                        logger.debug(f"[Trinity] Connection callback error: {e}")
+
+                return  # Successfully reconnected
+
+            # v95.0: Still partitioned, continue loop (NEVER give up)
+            self.state = TrinityConnectionState.RECONNECTING
+
+    async def _check_jarvis_connection(self) -> bool:
+        """
+        v95.0: Multi-source JARVIS connection verification.
+
+        Checks multiple sources to determine if JARVIS Body is reachable:
+        1. Heartbeat file freshness (primary)
+        2. HTTP health endpoint (secondary)
+        3. Process liveness via PID file (tertiary)
+
+        Returns:
+            True if JARVIS Body is confirmed reachable
+        """
+        jarvis_state_file = Path.home() / ".jarvis" / "trinity" / "components" / "jarvis_body.json"
+
+        # Method 1: Heartbeat file check
+        if jarvis_state_file.exists():
+            try:
+                import json
+                with open(jarvis_state_file, 'r') as f:
+                    data = json.load(f)
+                    heartbeat_age = time.time() - data.get("timestamp", 0)
+
+                    if heartbeat_age < self.partition_threshold:
+                        self.last_jarvis_heartbeat = data.get("timestamp", 0)
+                        return True
+            except (json.JSONDecodeError, IOError):
+                pass  # File being written or corrupted
+
+        # Method 2: Direct HTTP health check (fallback)
+        try:
+            import aiohttp
+            jarvis_port = int(os.getenv("JARVIS_PORT", "8010"))
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as session:
+                async with session.get(f"http://localhost:{jarvis_port}/health") as resp:
+                    if resp.status == 200:
+                        logger.debug("[Trinity] JARVIS reachable via HTTP health check")
+                        return True
+        except Exception:
+            pass  # Connection failed
+
+        # Method 3: PID file check (last resort)
+        pid_file = Path.home() / ".jarvis" / "jarvis.pid"
+        if pid_file.exists():
+            try:
+                import psutil
+                pid = int(pid_file.read_text().strip())
+                if psutil.pid_exists(pid):
+                    proc = psutil.Process(pid)
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        logger.debug("[Trinity] JARVIS process alive via PID check")
+                        # Process exists but heartbeat stale - might be starting
+                        return False  # Don't confirm yet, wait for heartbeat
+            except Exception:
+                pass
+
+        return False
 
     async def _check_memory_safe(self) -> bool:
         """Check if memory usage is safe for operations."""
