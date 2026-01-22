@@ -46,11 +46,19 @@ import os
 import signal
 import sys
 import time
+import uuid
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from enum import Enum, auto
+
+# v96.0: Process fingerprinting for enhanced service registry
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 # v93.0: Suppress known benign compatibility warnings from external libraries
 # These are informational warnings about version compatibility, not errors
@@ -67,6 +75,80 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v96.0: PROCESS FINGERPRINTING FOR SERVICE REGISTRY
+# =============================================================================
+
+def _get_process_fingerprint() -> Dict[str, Any]:
+    """
+    v96.0: Capture process fingerprint for enhanced service registry.
+
+    This enables PID reuse detection and process identity validation.
+    If the same PID is reused by a different process (after a crash),
+    the fingerprint mismatch will detect this.
+
+    Returns:
+        Dictionary with process fingerprint data
+    """
+    fingerprint = {
+        "pid": os.getpid(),
+        "process_name": "",
+        "process_cmdline": "",
+        "process_exe_path": "",
+        "process_cwd": "",
+        "parent_pid": 0,
+        "parent_name": "",
+        "process_start_time": 0.0,
+    }
+
+    if PSUTIL_AVAILABLE:
+        try:
+            proc = psutil.Process()
+            fingerprint["process_name"] = proc.name()
+            fingerprint["process_cmdline"] = " ".join(proc.cmdline())
+            fingerprint["process_exe_path"] = proc.exe()
+            fingerprint["process_cwd"] = proc.cwd()
+            fingerprint["process_start_time"] = proc.create_time()
+
+            # Parent process info
+            parent = proc.parent()
+            if parent:
+                fingerprint["parent_pid"] = parent.pid
+                fingerprint["parent_name"] = parent.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception) as e:
+            logger.debug(f"[v96.0] Process fingerprint capture partial: {e}")
+
+    return fingerprint
+
+
+def _get_machine_id() -> str:
+    """
+    v96.0: Get unique machine identifier for distributed environments.
+
+    This helps identify which machine owns a lock/registration when
+    multiple machines may have the same PID.
+    """
+    # Try various methods to get machine ID
+    machine_id_paths = [
+        "/etc/machine-id",           # Linux
+        "/var/lib/dbus/machine-id",  # Older Linux
+    ]
+
+    for path in machine_id_paths:
+        try:
+            if Path(path).exists():
+                return Path(path).read_text().strip()
+        except Exception:
+            pass
+
+    # Fallback: use hostname + some system info
+    try:
+        import platform
+        return f"{platform.node()}-{uuid.getnode()}"
+    except Exception:
+        return f"unknown-{uuid.uuid4().hex[:8]}"
 
 
 # =============================================================================
@@ -1113,11 +1195,20 @@ async def main():
                     except (json.JSONDecodeError, Exception):
                         existing_services = {}
 
-                # Register JARVIS Prime
+                # Register JARVIS Prime with v96.0 enhanced fields
+                # Capture process fingerprint for PID reuse detection
+                fingerprint = _get_process_fingerprint()
+                machine_id = _get_machine_id()
+
+                # Determine configured port vs actual port
+                configured_port = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
+                actual_port = args.port
+                is_fallback = actual_port != configured_port
+
                 existing_services["jarvis_prime"] = {
                     "service_name": "jarvis_prime",
                     "pid": os.getpid(),
-                    "port": args.port,
+                    "port": actual_port,
                     "host": args.host,
                     "health_endpoint": "/health",
                     "status": "starting",
@@ -1127,7 +1218,23 @@ async def main():
                         "version": "4.0.0",
                         "role": "inference",
                         "gpu": os.getenv("JARVIS_PRIME_GPU", "auto"),
-                    }
+                    },
+                    # v96.0: Port fallback tracking (Problem 17 fix)
+                    "primary_port": configured_port,
+                    "is_fallback_port": is_fallback,
+                    "fallback_reason": f"Port {configured_port} unavailable" if is_fallback else "",
+                    "ports_tried": [configured_port] if is_fallback else [],
+                    "port_allocation_time": time.time(),
+                    # v96.0: Process fingerprint for identity validation (Problem 18 fix)
+                    "process_name": fingerprint["process_name"],
+                    "process_cmdline": fingerprint["process_cmdline"],
+                    "process_exe_path": fingerprint["process_exe_path"],
+                    "process_cwd": fingerprint["process_cwd"],
+                    "parent_pid": fingerprint["parent_pid"],
+                    "parent_name": fingerprint["parent_name"],
+                    "process_start_time": fingerprint["process_start_time"],
+                    # v96.0: Machine ID for distributed environments
+                    "machine_id": machine_id,
                 }
 
                 # Also register under alternate names for compatibility
@@ -1139,9 +1246,10 @@ async def main():
                 temp_file.write_text(json.dumps(existing_services, indent=2))
                 temp_file.rename(registry_file)
 
+                fallback_msg = f" (fallback from {configured_port})" if is_fallback else ""
                 logger.info(
-                    f"[v95.0] ✅ Registered with service registry: "
-                    f"{registry_file} (port={args.port}, pid={os.getpid()})"
+                    f"[v96.0] ✅ Registered with service registry: "
+                    f"{registry_file} (port={actual_port}{fallback_msg}, pid={os.getpid()})"
                 )
             except Exception as e:
                 logger.warning(f"[v95.0] Service registry registration failed (non-fatal): {e}")
