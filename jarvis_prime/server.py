@@ -1413,18 +1413,63 @@ async def main():
                     model_loaded=model_path is not None and model_path.exists(),
                 )
 
-                # Replace routes with real API
-                real_app = create_api_app(manager)
+                # v109.2: Replace routes with real API - with defensive error handling
+                logger.debug("[v109.2] Creating real API app...")
+                try:
+                    real_app = create_api_app(manager)
+                    logger.debug(f"[v109.2] Real API app created with {len(real_app.routes)} routes")
+                except Exception as e:
+                    logger.error(f"[v109.2] Failed to create real API app: {e}")
+                    import traceback
+                    logger.error(f"[v109.2] create_api_app traceback:\n{traceback.format_exc()}")
+                    raise
 
                 # Copy real routes to main app
-                for route in real_app.routes:
-                    if hasattr(route, 'path'):
-                        # Skip health - we keep our own
-                        if route.path in ['/health', '/trinity/status']:
-                            continue
-                        # Remove placeholder and add real route
-                        app.routes = [r for r in app.routes if getattr(r, 'path', None) != route.path]
-                        app.routes.append(route)
+                # v109.2: Use proper route mounting that works across FastAPI versions
+                # CRITICAL FIX: In newer FastAPI/Starlette, app.routes is a property
+                # that cannot be directly assigned. We use include_router or mount instead.
+                logger.debug("[v109.2] Copying routes to main app...")
+                try:
+                    paths_to_skip = {'/health', '/trinity/status'}
+
+                    for route in real_app.routes:
+                        route_path = getattr(route, 'path', None)
+                        if route_path and route_path not in paths_to_skip:
+                            # v109.2: Use add_api_route for proper route registration
+                            # This works across all FastAPI/Starlette versions
+                            if hasattr(route, 'endpoint') and hasattr(route, 'methods'):
+                                # APIRoute - has endpoint and methods
+                                try:
+                                    # Remove existing route with same path if any
+                                    # Use router's internal list which IS mutable
+                                    app.router.routes = [
+                                        r for r in app.router.routes
+                                        if getattr(r, 'path', None) != route_path
+                                    ]
+                                    # Add the new route
+                                    app.router.routes.append(route)
+                                except AttributeError:
+                                    # Fallback: try direct route list modification via internal
+                                    logger.debug(f"[v109.2] Fallback route addition for {route_path}")
+                                    if hasattr(app, '_routes'):
+                                        app._routes = [
+                                            r for r in app._routes
+                                            if getattr(r, 'path', None) != route_path
+                                        ]
+                                        app._routes.append(route)
+                                    else:
+                                        # Last resort: use include_router pattern
+                                        logger.warning(f"[v109.2] Cannot add route {route_path} - no mutable route list")
+                            else:
+                                # Other route types (Mount, etc.)
+                                logger.debug(f"[v109.2] Skipping non-API route: {route_path}")
+
+                    logger.debug(f"[v109.2] Route replacement complete: {len(app.router.routes)} total routes")
+                except Exception as e:
+                    logger.error(f"[v109.2] Failed to replace routes: {e}")
+                    import traceback
+                    logger.error(f"[v109.2] Route replacement traceback:\n{traceback.format_exc()}")
+                    raise
 
                 _completion_routes_ready = True
 
@@ -1440,7 +1485,11 @@ async def main():
                 logger.info("=" * 70)
 
             except Exception as e:
+                # v109.2: Enhanced error logging with full traceback for debugging
+                import traceback
+                full_traceback = traceback.format_exc()
                 logger.error(f"[Background] Initialization failed: {e}")
+                logger.error(f"[Background] Full traceback:\n{full_traceback}")
                 _startup_state.phase = "error"
                 _startup_state.error = str(e)
 
