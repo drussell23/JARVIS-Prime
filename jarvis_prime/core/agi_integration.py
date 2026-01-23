@@ -475,12 +475,38 @@ class AGIIntegrationHub:
                             f"AGI Hub parallel init timed out after "
                             f"{self._config.parallel_init_timeout}s"
                         )
-                        # Cancel remaining tasks
+                        # v93.15: Cancel remaining tasks and AWAIT them to retrieve CancelledError
+                        # This prevents "_GatheringFuture exception was never retrieved" warnings
+                        cancelled_names = []
                         for name, task in init_tasks.items():
                             if not task.done():
                                 task.cancel()
+                                cancelled_names.append(name)
                                 logger.warning(f"Cancelled hung subsystem: {name}")
+
+                        # CRITICAL: Await cancelled tasks to properly retrieve CancelledError exceptions
+                        # Without this, asyncio complains about unretrieved exceptions
+                        if any(not t.done() for t in init_tasks.values()):
+                            try:
+                                await asyncio.gather(
+                                    *init_tasks.values(),
+                                    return_exceptions=True
+                                )
+                            except Exception:
+                                pass  # Exceptions already handled, just need to await
+
+                        # Collect results for tasks that completed before timeout
                         results = []
+                        for name, task in init_tasks.items():
+                            if task.done() and not task.cancelled():
+                                try:
+                                    results.append(task.result())
+                                except Exception as e:
+                                    results.append(e)
+                            elif task.cancelled():
+                                results.append(asyncio.TimeoutError(f"{name} cancelled"))
+                            else:
+                                results.append(asyncio.TimeoutError(f"{name} incomplete"))
                 else:
                     results = []
 
