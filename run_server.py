@@ -1582,6 +1582,7 @@ async def main():
 
                 try:
                     # v93.7: Model loading with timeout protection
+                    # v108.2: Enhanced exception handling for all failure modes
                     await asyncio.wait_for(
                         _executor.load(model_path),
                         timeout=model_load_timeout
@@ -1605,6 +1606,61 @@ async def main():
                     _startup_state.error = f"Model load timeout after {load_time:.1f}s"
                     _startup_state.model_load_elapsed = load_time
                     progress_task.cancel()
+                    return
+
+                except MemoryError as e:
+                    # v108.2: Handle out-of-memory during model loading
+                    load_time = time.time() - start
+                    logger.error(
+                        f"[Background] MODEL LOAD FAILED - OUT OF MEMORY after {load_time:.1f}s\n"
+                        f"  Model: {model_path.name}\n"
+                        f"  Size: {model_size_mb:.1f}MB\n"
+                        f"  Error: {e}\n"
+                        f"  Suggestion: Try a smaller model or free system memory"
+                    )
+                    _startup_state.phase = "error"
+                    _startup_state.error = f"Out of memory loading model ({model_size_mb:.0f}MB)"
+                    _startup_state.model_load_elapsed = load_time
+                    progress_task.cancel()
+                    return
+
+                except OSError as e:
+                    # v108.2: Handle file system errors (corrupted model, disk full, etc.)
+                    load_time = time.time() - start
+                    logger.error(
+                        f"[Background] MODEL LOAD FAILED - FILE ERROR after {load_time:.1f}s\n"
+                        f"  Model: {model_path}\n"
+                        f"  Error: {e}\n"
+                        f"  Suggestion: Check model file integrity and disk space"
+                    )
+                    _startup_state.phase = "error"
+                    _startup_state.error = f"File error loading model: {e}"
+                    _startup_state.model_load_elapsed = load_time
+                    progress_task.cancel()
+                    return
+
+                except Exception as e:
+                    # v108.2: Catch ALL other exceptions to prevent process crash
+                    load_time = time.time() - start
+                    import traceback
+                    tb_str = traceback.format_exc()
+                    logger.error(
+                        f"[Background] MODEL LOAD FAILED - UNEXPECTED ERROR after {load_time:.1f}s\n"
+                        f"  Model: {model_path}\n"
+                        f"  Error type: {type(e).__name__}\n"
+                        f"  Error: {e}\n"
+                        f"  Traceback:\n{tb_str}"
+                    )
+                    _startup_state.phase = "error"
+                    _startup_state.error = f"Model load failed: {type(e).__name__}: {e}"
+                    _startup_state.model_load_elapsed = load_time
+                    progress_task.cancel()
+                    # v108.2: Don't exit! Continue running in health-check-only mode
+                    # This allows the supervisor to see the error via health endpoint
+                    logger.warning(
+                        "[Background] Server will continue in health-check-only mode. "
+                        "Model loading failed but service remains available for diagnostics."
+                    )
                     return
 
                 finally:
