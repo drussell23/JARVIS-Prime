@@ -996,6 +996,88 @@ class CrossRepoBridge:
                 logger.debug(f"[v100.0] Docker monitor error: {e}")
                 await asyncio.sleep(10.0)
 
+    # =========================================================================
+    # Readiness State Integration (v2.0)
+    # =========================================================================
+
+    async def check_jarvis_body_readiness(self) -> Optional[Dict[str, Any]]:
+        """
+        v2.0: Check jarvis-body readiness state from Trinity Protocol.
+
+        Reads state from ~/.jarvis/trinity/state/jarvis-body_readiness.json
+        which is maintained by the ReadinessStateManager in JARVIS-AI-Agent.
+
+        Returns:
+            Readiness state dict or None if unavailable
+        """
+        try:
+            readiness_dir = Path.home() / ".jarvis" / "trinity" / "state"
+            readiness_file = readiness_dir / "jarvis-body_readiness.json"
+
+            if not readiness_file.exists():
+                return None
+
+            state_data = json.loads(readiness_file.read_text())
+
+            # Check staleness (>30s is stale)
+            timestamp = state_data.get("timestamp", 0)
+            age = time.time() - timestamp
+            if age > 30:
+                logger.debug(f"[v2.0] jarvis-body readiness state is stale ({age:.0f}s)")
+                return None
+
+            return state_data
+
+        except Exception as e:
+            logger.debug(f"[v2.0] Failed to read jarvis-body readiness: {e}")
+            return None
+
+    async def is_jarvis_body_ready(self) -> bool:
+        """
+        v2.0: Check if jarvis-body is ready to accept requests.
+
+        This enables JARVIS-Prime to wait for jarvis-body readiness
+        before attempting to communicate with it.
+        """
+        state = await self.check_jarvis_body_readiness()
+        if state is None:
+            return False
+        return state.get("is_ready", False)
+
+    async def wait_for_jarvis_body(
+        self,
+        timeout: float = 120.0,
+        check_interval: float = 2.0,
+    ) -> bool:
+        """
+        v2.0: Wait for jarvis-body to become ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check
+
+        Returns:
+            True if jarvis-body became ready, False on timeout
+        """
+        start_time = time.time()
+        logged_waiting = False
+
+        while (time.time() - start_time) < timeout:
+            if await self.is_jarvis_body_ready():
+                if logged_waiting:
+                    elapsed = time.time() - start_time
+                    logger.info(f"[v2.0] jarvis-body is now ready ({elapsed:.1f}s wait)")
+                return True
+
+            if not logged_waiting:
+                logger.info("[v2.0] Waiting for jarvis-body to become ready...")
+                logged_waiting = True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"[v2.0] Timeout waiting for jarvis-body readiness ({timeout}s)")
+        return False
+
     def get_docker_status(self) -> Dict[str, Any]:
         """v100.0: Get current Docker status."""
         return {
