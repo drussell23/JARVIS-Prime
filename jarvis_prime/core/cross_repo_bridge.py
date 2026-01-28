@@ -52,6 +52,12 @@ TRINITY_COMMANDS_DIR = TRINITY_DIR / "commands"
 MEMORY_PRESSURE_FILE = BRIDGE_STATE_DIR / "memory_pressure.json"
 MEMORY_PRESSURE_CHECK_INTERVAL = 2.0  # Check every 2 seconds when active
 
+# v100.0: Docker State Integration - coordinate with JARVIS Docker Manager
+DOCKER_STATE_DIR = Path.home() / ".jarvis" / "trinity" / "docker"
+DOCKER_STATE_FILE = DOCKER_STATE_DIR / "state.json"
+DOCKER_EVENTS_FILE = DOCKER_STATE_DIR / "events.json"
+DOCKER_CHECK_INTERVAL = 10.0  # Check Docker state every 10 seconds
+
 
 # ============================================================================
 # Data Classes
@@ -130,6 +136,13 @@ class PrimeState:
     memory_pressure_status: str = "normal"  # normal, elevated, critical, offload_active
     paused_by_memory_defense: bool = False  # True if SIGSTOP'd by main JARVIS
     last_memory_pressure_check: str = ""
+
+    # v100.0: Docker State Integration
+    docker_available: bool = False  # True if Docker is running and healthy
+    docker_status: str = "unknown"  # unknown, starting, running, stopped, error
+    docker_health_score: float = 0.0  # 0.0-1.0 health score
+    last_docker_check: str = ""
+    use_docker_inference: bool = False  # True if using Docker-based inference
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -820,6 +833,177 @@ class CrossRepoBridge:
             "paused_by_memory_defense": self.state.paused_by_memory_defense,
             "last_check": self.state.last_memory_pressure_check,
             "connected_to_jarvis": self.state.connected_to_jarvis,
+        }
+
+    # =========================================================================
+    # Docker State Integration (v100.0)
+    # =========================================================================
+
+    async def check_docker_state(self) -> Optional[Dict[str, Any]]:
+        """
+        v100.0: Check Docker state from JARVIS Docker Manager.
+
+        Reads state from ~/.jarvis/trinity/docker/state.json which is
+        maintained by the Docker Daemon Manager in JARVIS-AI-Agent.
+
+        Returns:
+            Docker state dict or None if unavailable
+        """
+        try:
+            if not DOCKER_STATE_FILE.exists():
+                return None
+
+            state_data = json.loads(DOCKER_STATE_FILE.read_text())
+            docker_state = state_data.get("state", {})
+
+            # Update our local tracking
+            self.state.docker_available = docker_state.get("healthy", False)
+            self.state.docker_status = docker_state.get("status", "unknown")
+            self.state.docker_health_score = docker_state.get("health_score", 0.0)
+            self.state.last_docker_check = datetime.now().isoformat()
+
+            return docker_state
+
+        except Exception as e:
+            logger.debug(f"[v100.0] Failed to read Docker state: {e}")
+            return None
+
+    async def is_docker_available(self) -> bool:
+        """
+        v100.0: Check if Docker is available for container-based operations.
+
+        Used to determine if we can use Docker-based inference or need
+        to fall back to other methods.
+        """
+        docker_state = await self.check_docker_state()
+        return docker_state is not None and docker_state.get("healthy", False)
+
+    async def get_docker_events(self, since_timestamp: Optional[float] = None) -> List[Dict[str, Any]]:
+        """
+        v100.0: Get recent Docker events from the event log.
+
+        Args:
+            since_timestamp: Only get events after this timestamp
+
+        Returns:
+            List of Docker events
+        """
+        try:
+            if not DOCKER_EVENTS_FILE.exists():
+                return []
+
+            events = json.loads(DOCKER_EVENTS_FILE.read_text())
+            if not isinstance(events, list):
+                return []
+
+            if since_timestamp:
+                events = [e for e in events if e.get("timestamp", 0) > since_timestamp]
+
+            return events
+
+        except Exception as e:
+            logger.debug(f"[v100.0] Failed to read Docker events: {e}")
+            return []
+
+    async def request_docker_start(self) -> bool:
+        """
+        v100.0: Request JARVIS to start Docker daemon.
+
+        Sends a request through the Trinity protocol for Docker to be started.
+        """
+        try:
+            # Write request to requests directory
+            request_dir = DOCKER_STATE_DIR / "requests"
+            request_dir.mkdir(parents=True, exist_ok=True)
+
+            import uuid
+            request_id = str(uuid.uuid4())
+            request_file = request_dir / f"{request_id}.json"
+
+            request = {
+                "request_id": request_id,
+                "request_type": "docker.request.start",
+                "source": "jarvis_prime",
+                "timestamp": time.time(),
+                "payload": {},
+            }
+
+            request_file.write_text(json.dumps(request, indent=2))
+
+            # Wait for response
+            response_dir = DOCKER_STATE_DIR / "responses"
+            response_file = response_dir / f"{request_id}.json"
+
+            start_time = time.time()
+            while (time.time() - start_time) < 60.0:  # 60s timeout
+                if response_file.exists():
+                    response = json.loads(response_file.read_text())
+                    response_file.unlink()
+                    return response.get("success", False)
+                await asyncio.sleep(1.0)
+
+            logger.warning("[v100.0] Docker start request timed out")
+            return False
+
+        except Exception as e:
+            logger.error(f"[v100.0] Failed to request Docker start: {e}")
+            return False
+
+    async def start_docker_monitor(self) -> asyncio.Task:
+        """
+        v100.0: Start background task to monitor Docker state.
+
+        Returns the task so it can be cancelled on shutdown.
+        """
+        return asyncio.create_task(self._docker_monitor_loop())
+
+    async def _docker_monitor_loop(self) -> None:
+        """
+        v100.0: Background loop to monitor Docker state changes.
+
+        Updates local state and can trigger routing tier changes
+        based on Docker availability.
+        """
+        last_docker_available = None
+
+        while True:
+            try:
+                docker_state = await self.check_docker_state()
+                current_available = docker_state.get("healthy", False) if docker_state else False
+
+                # Detect state changes
+                if last_docker_available is not None and current_available != last_docker_available:
+                    if current_available:
+                        logger.info("[v100.0] Docker became available - container inference enabled")
+                        await self.notify_jarvis(
+                            event="docker_available",
+                            data={"instance_id": self.instance_id},
+                        )
+                    else:
+                        logger.warning("[v100.0] Docker became unavailable - falling back to local inference")
+                        await self.notify_jarvis(
+                            event="docker_unavailable",
+                            data={"instance_id": self.instance_id},
+                        )
+
+                last_docker_available = current_available
+
+                await asyncio.sleep(DOCKER_CHECK_INTERVAL)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[v100.0] Docker monitor error: {e}")
+                await asyncio.sleep(10.0)
+
+    def get_docker_status(self) -> Dict[str, Any]:
+        """v100.0: Get current Docker status."""
+        return {
+            "docker_available": self.state.docker_available,
+            "docker_status": self.state.docker_status,
+            "docker_health_score": self.state.docker_health_score,
+            "last_check": self.state.last_docker_check,
+            "use_docker_inference": self.state.use_docker_inference,
         }
 
     async def create_ghost_display(self) -> Dict[str, Any]:

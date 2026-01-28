@@ -1336,8 +1336,9 @@ class ContinualLearningEngine:
 
                     # v93.15: Get configuration - increased default timeouts for ML operations
                     # ML model loading can take 30-60s on first load (downloading, compiling)
-                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "30.0"))  # was 10.0
-                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "45.0"))  # was 15.0
+                    # v113.0: Increased to 60s to reduce false timeout warnings
+                    init_timeout = float(os.getenv("RAG_INIT_TIMEOUT", "60.0"))  # was 30.0
+                    vector_store_timeout = float(os.getenv("VECTOR_STORE_INIT_TIMEOUT", "60.0"))  # was 45.0
                     auto_init = os.getenv("RAG_AUTO_INIT", "true").lower() == "true"
                     background_init = os.getenv("LEARNING_BACKGROUND_INIT", "true").lower() == "true"
 
@@ -1395,7 +1396,11 @@ class ContinualLearningEngine:
             await asyncio.wait_for(self.load_state(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
-            logger.warning(f"Loading state timed out after {timeout}s - continuing with fresh state")
+            # v113.0: Softened message - this is expected during cold start/first run
+            logger.info(f"State loading exceeded {timeout}s - starting with fresh state (normal for first run)")
+            return False
+        except asyncio.CancelledError:
+            logger.info("State loading cancelled")
             return False
         except Exception as e:
             logger.warning(f"Could not load state: {e}")
@@ -1411,6 +1416,9 @@ class ContinualLearningEngine:
                 f"Vector store init timed out after {timeout}s - "
                 f"will initialize on-demand later"
             )
+            return False
+        except asyncio.CancelledError:
+            logger.info("Vector store initialization cancelled")
             return False
         except Exception as e:
             logger.warning(f"Vector store init failed: {e}")
