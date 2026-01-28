@@ -1088,6 +1088,148 @@ class CrossRepoBridge:
             "use_docker_inference": self.state.use_docker_inference,
         }
 
+    # =========================================================================
+    # Cloud Offload State Integration (v3.0)
+    # =========================================================================
+
+    async def check_cloud_offload_state(self) -> Optional[Dict[str, Any]]:
+        """
+        v3.0: Check jarvis-body cloud offload state from Trinity Protocol.
+
+        Reads state from ~/.jarvis/trinity/state/cloud_offload_state.json
+        which is published by the DynamicComponentManager when cloud
+        offloading is activated due to memory/CPU pressure.
+
+        Returns:
+            Cloud offload state dict or None if unavailable/inactive
+        """
+        try:
+            state_dir = Path.home() / ".jarvis" / "trinity" / "state"
+            state_file = state_dir / "cloud_offload_state.json"
+
+            if not state_file.exists():
+                return None
+
+            state_data = json.loads(state_file.read_text())
+
+            # Check if cloud offloading is active
+            if not state_data.get("cloud_offload_active", False):
+                return None
+
+            # Check staleness (>60s is stale for cloud state)
+            timestamp = state_data.get("timestamp", 0)
+            age = time.time() - timestamp
+            if age > 60:
+                logger.debug(f"[v3.0] Cloud offload state is stale ({age:.0f}s)")
+                return None
+
+            return state_data
+
+        except Exception as e:
+            logger.debug(f"[v3.0] Failed to read cloud offload state: {e}")
+            return None
+
+    async def is_cloud_offload_active(self) -> bool:
+        """
+        v3.0: Check if jarvis-body has activated cloud offloading.
+
+        This enables JARVIS-Prime to route ML inference requests to
+        cloud endpoints when jarvis-body is under resource pressure.
+
+        Returns:
+            True if cloud offloading is active, False otherwise
+        """
+        state = await self.check_cloud_offload_state()
+        return state is not None and state.get("cloud_offload_active", False)
+
+    async def get_cloud_ml_endpoint(self) -> Optional[str]:
+        """
+        v3.0: Get the cloud ML endpoint if cloud offloading is active.
+
+        Returns:
+            Cloud ML endpoint URL or None if not available
+        """
+        state = await self.check_cloud_offload_state()
+        if state is None:
+            return None
+
+        cloud_ip = state.get("cloud_ip")
+        if cloud_ip:
+            # Return Cloud Run or spot VM endpoint
+            return f"http://{cloud_ip}:8080"
+
+        return None
+
+    async def get_cloud_offload_reason(self) -> Optional[str]:
+        """
+        v3.0: Get the reason why cloud offloading was activated.
+
+        Returns:
+            Reason string or None if cloud offloading is not active
+        """
+        state = await self.check_cloud_offload_state()
+        if state is None:
+            return None
+        return state.get("reason")
+
+    async def should_use_cloud_inference(self) -> bool:
+        """
+        v3.0: Determine if ML inference should use cloud endpoints.
+
+        This combines:
+        - Cloud offload state from jarvis-body
+        - Environment variable overrides
+        - Docker availability
+
+        Returns:
+            True if cloud inference should be used
+        """
+        # Check environment override first
+        if os.environ.get("JARVIS_PREFER_CLOUD_RUN", "").lower() == "true":
+            return True
+
+        if os.environ.get("JARVIS_USE_CLOUD_ML", "").lower() == "true":
+            return True
+
+        # Check cloud offload state from jarvis-body
+        if await self.is_cloud_offload_active():
+            logger.debug("[v3.0] Using cloud inference due to jarvis-body cloud offloading")
+            return True
+
+        return False
+
+    async def wait_for_cloud_ready(
+        self,
+        timeout: float = 60.0,
+        check_interval: float = 2.0,
+    ) -> bool:
+        """
+        v3.0: Wait for cloud offloading to become ready (if active).
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check
+
+        Returns:
+            True if cloud is ready or not needed, False on timeout
+        """
+        # If cloud offloading is not active, we're already "ready" (use local)
+        if not await self.is_cloud_offload_active():
+            return True
+
+        start_time = time.time()
+
+        while (time.time() - start_time) < timeout:
+            state = await self.check_cloud_offload_state()
+            if state and state.get("cloud_ip"):
+                logger.info(f"[v3.0] Cloud offloading ready: {state.get('cloud_ip')}")
+                return True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"[v3.0] Timeout waiting for cloud offloading to be ready ({timeout}s)")
+        return False
+
     async def create_ghost_display(self) -> Dict[str, Any]:
         """Request JARVIS to create a Ghost Display (virtual display)."""
         return await self.send_trinity_command(
