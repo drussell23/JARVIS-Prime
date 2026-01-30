@@ -241,11 +241,34 @@ class StagedInitConfig:
     # Environment variable overrides
     @classmethod
     def from_env(cls) -> "StagedInitConfig":
-        """Create config from environment variables."""
+        """
+        Create config from environment variables.
+        
+        v149.0: Hardware-aware configuration.
+        On SLIM/CLOUD_ONLY profiles, reduces memory requirements since
+        heavy workloads are offloaded to GCP.
+        """
+        # v149.0: Detect hardware profile from supervisor
+        hardware_profile = os.getenv("JARVIS_HARDWARE_PROFILE", "").upper()
+        is_slim_hardware = hardware_profile in ("SLIM", "CLOUD_ONLY")
+        
+        # v149.0: Use relaxed thresholds for SLIM hardware
+        # Since GCP handles heavy work, we don't need as much local headroom
+        if is_slim_hardware:
+            default_min_headroom = "10.0"  # Reduced from 20.0
+            default_slim_threshold = "8.0"  # Reduced from 15.0
+            logger.info(
+                f"[v149.0] SLIM hardware detected ({hardware_profile}) - "
+                f"using relaxed memory thresholds"
+            )
+        else:
+            default_min_headroom = "20.0"
+            default_slim_threshold = "15.0"
+        
         return cls(
-            min_headroom_percent=float(os.getenv("AGI_MIN_HEADROOM_PERCENT", "20.0")),
+            min_headroom_percent=float(os.getenv("AGI_MIN_HEADROOM_PERCENT", default_min_headroom)),
             warning_headroom_percent=float(os.getenv("AGI_WARNING_HEADROOM_PERCENT", "30.0")),
-            slim_mode_threshold=float(os.getenv("AGI_SLIM_MODE_THRESHOLD", "15.0")),
+            slim_mode_threshold=float(os.getenv("AGI_SLIM_MODE_THRESHOLD", default_slim_threshold)),
             stage_timeout=float(os.getenv("AGI_STAGE_TIMEOUT", "45.0")),
             enable_slim_mode=os.getenv("AGI_ENABLE_SLIM_MODE", "true").lower() == "true",
             defer_heavy_on_pressure=os.getenv("AGI_DEFER_HEAVY", "true").lower() == "true",
