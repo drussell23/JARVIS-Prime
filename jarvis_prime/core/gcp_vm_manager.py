@@ -1159,6 +1159,193 @@ class GCPVMManager:
                 return instance.inference_endpoint
         return None
 
+    # =========================================================================
+    # v139.0: ON-DEMAND WAKE FOR ACTIVE HYBRID BRIDGE
+    # =========================================================================
+    # These methods support the Slim Mode Active Hybrid Bridge by providing
+    # automatic VM wake functionality. When a request comes in that needs
+    # cloud processing, these methods ensure the GCP VM is running.
+    # =========================================================================
+
+    async def ensure_instance_running(
+        self,
+        timeout_seconds: float = 180.0,
+        health_check_interval: float = 5.0,
+    ) -> Optional[str]:
+        """
+        v139.0: Ensure at least one VM instance is running and return endpoint.
+
+        This is the core "On-Demand Wake" method for the Active Hybrid Bridge.
+        It will:
+        1. Check if any instance is already running and healthy
+        2. If not, start a stopped instance OR provision a new one
+        3. Wait for the health check to pass
+        4. Return the inference endpoint
+
+        Args:
+            timeout_seconds: Maximum time to wait for VM to be ready
+            health_check_interval: Seconds between health checks
+
+        Returns:
+            Inference endpoint URL, or None if unable to start VM
+        """
+        logger.info("[v139.0] 🌤️ On-Demand Wake: Ensuring VM instance is running...")
+
+        # Step 1: Check for existing healthy instance
+        for name, instance in self._instances.items():
+            if instance.state == VMState.RUNNING and instance.is_healthy:
+                logger.info(f"[v139.0] ✅ Instance {name} already running and healthy")
+                return instance.inference_endpoint
+
+        # Step 2: Try to start a stopped instance first (faster than provisioning)
+        for name, instance in list(self._instances.items()):
+            if instance.state == VMState.STOPPED:
+                logger.info(f"[v139.0] 🚀 Starting stopped instance: {name}")
+                started = await self._client.start_instance(name, instance.zone)
+                if started:
+                    instance.state = VMState.STAGING
+                    instance.started_at = datetime.now()
+
+                    # Wait for instance to become healthy
+                    endpoint = await self._wait_for_healthy_instance(
+                        name, instance, timeout_seconds, health_check_interval
+                    )
+                    if endpoint:
+                        return endpoint
+
+        # Step 3: No stopped instances - provision a new one
+        logger.info("[v139.0] 🆕 No stopped instances - provisioning new VM...")
+        instance = await self.provision_instance()
+        if instance is None:
+            logger.error("[v139.0] ❌ Failed to provision new instance")
+            return None
+
+        # Wait for newly provisioned instance to become healthy
+        return await self._wait_for_healthy_instance(
+            instance.name, instance, timeout_seconds, health_check_interval
+        )
+
+    async def _wait_for_healthy_instance(
+        self,
+        name: str,
+        instance: VMInstance,
+        timeout_seconds: float,
+        health_check_interval: float,
+    ) -> Optional[str]:
+        """
+        v139.0: Wait for an instance to become healthy.
+
+        Args:
+            name: Instance name
+            instance: VMInstance object
+            timeout_seconds: Maximum wait time
+            health_check_interval: Seconds between health checks
+
+        Returns:
+            Endpoint URL if healthy, None if timeout
+        """
+        import aiohttp
+
+        start_time = time.time()
+        logger.info(f"[v139.0] ⏳ Waiting for instance {name} to become healthy...")
+
+        while time.time() - start_time < timeout_seconds:
+            # Refresh instance info
+            fresh_instance = await self._client.get_instance(name, instance.zone)
+            if fresh_instance:
+                instance.state = fresh_instance.state
+                instance.external_ip = fresh_instance.external_ip
+                instance.internal_ip = fresh_instance.internal_ip
+                instance.inference_endpoint = fresh_instance.inference_endpoint
+
+            # Check if instance is running
+            if instance.state != VMState.RUNNING:
+                elapsed = time.time() - start_time
+                logger.debug(
+                    f"[v139.0] Instance {name} state: {instance.state.value} "
+                    f"({elapsed:.1f}s / {timeout_seconds}s)"
+                )
+                await asyncio.sleep(health_check_interval)
+                continue
+
+            # Instance is running - check health endpoint
+            if instance.inference_endpoint:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        health_url = f"{instance.inference_endpoint}/health"
+                        async with session.get(
+                            health_url,
+                            timeout=aiohttp.ClientTimeout(total=5.0),
+                        ) as response:
+                            if response.status == 200:
+                                wake_time = time.time() - start_time
+                                instance.is_healthy = True
+                                instance.last_health_check = datetime.now()
+                                instance.consecutive_failures = 0
+
+                                logger.info(
+                                    f"[v139.0] ✅ Instance {name} healthy after {wake_time:.1f}s\n"
+                                    f"    → Endpoint: {instance.inference_endpoint}"
+                                )
+                                return instance.inference_endpoint
+
+                except Exception as e:
+                    elapsed = time.time() - start_time
+                    logger.debug(
+                        f"[v139.0] Health check failed for {name}: {e} "
+                        f"({elapsed:.1f}s / {timeout_seconds}s)"
+                    )
+
+            await asyncio.sleep(health_check_interval)
+
+        logger.error(f"[v139.0] ❌ Instance {name} health check timeout after {timeout_seconds}s")
+        return None
+
+    async def warm_up_for_slim_mode(
+        self,
+        timeout_seconds: float = 180.0,
+    ) -> bool:
+        """
+        v139.0: Warm up a VM instance for Slim Mode.
+
+        Call this during startup if Slim Mode is detected to pre-warm the
+        GCP VM so it's ready for the first heavy request.
+
+        Args:
+            timeout_seconds: Maximum time to wait for warm-up
+
+        Returns:
+            True if warm-up successful
+        """
+        logger.info("[v139.0] 🔥 Warming up GCP VM for Slim Mode Active Hybrid Bridge...")
+
+        endpoint = await self.ensure_instance_running(timeout_seconds=timeout_seconds)
+        if endpoint:
+            logger.info(f"[v139.0] ✅ GCP VM warmed up and ready: {endpoint}")
+            return True
+        else:
+            logger.warning("[v139.0] ⚠️ GCP VM warm-up failed")
+            return False
+
+    async def get_or_start_endpoint(self) -> Optional[str]:
+        """
+        v139.0: Get inference endpoint, starting VM if needed.
+
+        Convenience method that combines get_inference_endpoint() with
+        ensure_instance_running(). Returns existing healthy endpoint or
+        starts a VM to get one.
+
+        Returns:
+            Inference endpoint URL, or None if unavailable
+        """
+        # First try to get existing healthy endpoint
+        endpoint = await self.get_inference_endpoint()
+        if endpoint:
+            return endpoint
+
+        # No healthy endpoint - ensure one is running
+        return await self.ensure_instance_running()
+
     async def ensure_capacity(self, min_instances: int = 1) -> bool:
         """Ensure minimum capacity is available."""
         running = sum(
