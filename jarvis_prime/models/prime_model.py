@@ -77,12 +77,99 @@ from typing import (
     TypeVar,
     Union,
     runtime_checkable,
+    TYPE_CHECKING,
 )
 
-import torch
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v144.0: HOLLOW CLIENT - STRICT LAZY IMPORTS
+# =============================================================================
+# CRITICAL: torch, transformers, and other heavy ML libraries are NOT imported
+# at module level. They are lazily loaded ONLY when actually needed.
+#
+# This allows jarvis-prime to start in "Hollow Client" mode using only ~300MB
+# RAM, with heavy inference routed to GCP Cloud.
+#
+# The lazy import pattern:
+#   1. Check JARVIS_ENABLE_SLIM_MODE environment variable
+#   2. If SLIM mode: raise ImportError when heavy libs are requested
+#   3. If FULL mode: import the library on first use
+#
+# This is the NUCLEAR OPTION to break the OOM crash loop on systems < 32GB RAM.
+# =============================================================================
+
+# Lazy-loaded module cache
+_torch_module: Optional[Any] = None
+_torch_cuda_available: Optional[bool] = None
+
+
+def _get_torch():
+    """
+    v144.0: Lazy import torch ONLY when actually needed.
+
+    In Slim Mode, this will raise an ImportError to force callers
+    to use GCP instead of local inference.
+    """
+    global _torch_module
+
+    if _torch_module is not None:
+        return _torch_module
+
+    # Check if we're in Slim Mode (heavy imports forbidden)
+    slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "").lower() in ("true", "1", "yes", "on")
+    gcp_offload_active = os.environ.get("JARVIS_GCP_OFFLOAD_ACTIVE", "").lower() in ("true", "1", "yes", "on")
+
+    if slim_mode and gcp_offload_active:
+        raise ImportError(
+            "[v144.0] HOLLOW CLIENT MODE: torch import blocked. "
+            "Heavy inference should be routed to GCP. "
+            "Set JARVIS_GCP_OFFLOAD_ACTIVE=false to enable local inference."
+        )
+
+    # Lazy import torch
+    import torch as _torch
+    _torch_module = _torch
+
+    logger.info(
+        f"[v144.0] Lazy-loaded torch (version: {_torch.__version__}, "
+        f"CUDA: {_torch.cuda.is_available()})"
+    )
+
+    return _torch_module
+
+
+def _is_cuda_available() -> bool:
+    """Check CUDA availability without importing torch if possible."""
+    global _torch_cuda_available
+
+    if _torch_cuda_available is not None:
+        return _torch_cuda_available
+
+    # In Slim Mode, assume no CUDA (will use GCP anyway)
+    slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "").lower() in ("true", "1", "yes", "on")
+    if slim_mode:
+        _torch_cuda_available = False
+        return False
+
+    try:
+        torch = _get_torch()
+        _torch_cuda_available = torch.cuda.is_available()
+        return _torch_cuda_available
+    except ImportError:
+        _torch_cuda_available = False
+        return False
+
+
+# Type hints for torch types (only for type checking, not runtime import)
+if TYPE_CHECKING:
+    import torch
+    TorchDtype = torch.dtype
+else:
+    TorchDtype = Any
 
 # Type variables
 T = TypeVar("T")
@@ -531,8 +618,9 @@ class PrimeModelCache:
         del cached.tokenizer
         gc.collect()
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # v144.0: Use lazy torch import
+        if _is_cuda_available():
+            _get_torch().cuda.empty_cache()
 
         self._evictions += 1
         self._total_memory_bytes -= cached.memory_bytes
@@ -559,8 +647,9 @@ class PrimeModelCache:
             self._cache.clear()
             gc.collect()
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # v144.0: Use lazy torch import
+            if _is_cuda_available():
+                _get_torch().cuda.empty_cache()
 
     def get_loading_lock(self, model_name: str) -> asyncio.Lock:
         """Get or create a loading lock for a model."""
@@ -640,6 +729,8 @@ class PrimeModelLoader:
 
     def _detect_optimal_device(self) -> str:
         """Detect the optimal device for model loading."""
+        # v144.0: Use lazy torch import
+        torch = _get_torch()
         if torch.cuda.is_available():
             return "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -647,8 +738,10 @@ class PrimeModelLoader:
         else:
             return "cpu"
 
-    def _get_torch_dtype(self, config: PrimeModelConfig) -> torch.dtype:
+    def _get_torch_dtype(self, config: PrimeModelConfig) -> TorchDtype:
         """Get torch dtype from config."""
+        # v144.0: Use lazy torch import
+        torch = _get_torch()
         dtype_map = {
             "float32": torch.float32,
             "float16": torch.float16,
@@ -719,7 +812,9 @@ class PrimeModelLoader:
         progress: ModelLoadingProgress,
     ) -> Tuple[Any, Any]:
         """Synchronous model loading (runs in executor)."""
+        # v144.0: Lazy import transformers ONLY when actually loading a model
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        torch = _get_torch()  # v144.0: Lazy torch
 
         progress.update("initializing", 0.0, f"Loading {spec.name}...")
 
@@ -1132,6 +1227,9 @@ class PrimeModel:
 
     def _generate_sync(self, prompt: str, gen_kwargs: Dict[str, Any]) -> Tuple[str, int]:
         """Synchronous generation (runs in executor)."""
+        # v144.0: Lazy torch import for inference
+        torch = _get_torch()
+
         # Tokenize
         inputs = self.tokenizer(
             prompt,
