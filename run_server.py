@@ -296,6 +296,251 @@ def _atomic_deregister_service(
 _registry_heartbeat_task: Optional[asyncio.Task] = None
 
 
+# =============================================================================
+# v138.0: HARDWARE-AWARE STARTUP STRATEGY
+# =============================================================================
+# Detects system memory and configures AGI Hub appropriately:
+# - < 16GB:  CLOUD ONLY mode (skip local AGI Hub entirely)
+# - 16-30GB: SLIM MODE (staged init with deferred heavy subsystems)
+# - 30-64GB: FULL MODE (all subsystems but with memory gates)
+# - 64GB+:   UNLIMITED MODE (full parallel initialization)
+# =============================================================================
+
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import Tuple
+
+
+class HardwareProfile(Enum):
+    """
+    v138.0: Hardware profile classification based on available resources.
+    """
+    CLOUD_ONLY = auto()      # < 16GB RAM - skip local AGI, use cloud
+    SLIM = auto()            # 16-30GB RAM - staged init, defer heavy
+    FULL = auto()            # 30-64GB RAM - full with memory gates
+    UNLIMITED = auto()       # 64GB+ RAM - full parallel init
+
+
+@dataclass
+class HardwareAssessment:
+    """
+    v138.0: Complete hardware assessment for startup decisions.
+    """
+    profile: HardwareProfile
+    total_ram_gb: float
+    available_ram_gb: float
+    cpu_count: int
+    is_apple_silicon: bool
+    has_gpu: bool
+    gpu_name: str
+    recommended_gpu_layers: int
+    recommended_context_size: int
+    skip_agi_hub: bool
+    enable_slim_mode: bool
+    defer_heavy_subsystems: bool
+    reason: str
+
+
+def _assess_hardware() -> HardwareAssessment:
+    """
+    v138.0: Perform comprehensive hardware assessment for startup decisions.
+
+    First checks for environment variables passed from the supervisor (JARVIS_HARDWARE_PROFILE, etc.)
+    which allows the orchestrator to coordinate the hardware profile decision across repos.
+    If not present, falls back to local hardware detection.
+
+    Returns:
+        HardwareAssessment with profile and recommendations.
+    """
+    import platform
+
+    # =========================================================================
+    # v138.0: CHECK FOR SUPERVISOR-PROVIDED HARDWARE PROFILE
+    # =========================================================================
+    # The supervisor (cross_repo_startup_orchestrator) may have already assessed
+    # hardware and passed the profile via environment variables. This ensures
+    # consistent profile decisions across all repos in the JARVIS ecosystem.
+    # =========================================================================
+    supervisor_profile = os.environ.get("JARVIS_HARDWARE_PROFILE")
+    if supervisor_profile:
+        logger.info(f"[v138.0] 📡 Hardware profile received from supervisor: {supervisor_profile}")
+        try:
+            # Parse profile from environment
+            profile = HardwareProfile[supervisor_profile]
+
+            # Read other environment variables from supervisor
+            total_ram_gb = float(os.environ.get("JARVIS_TOTAL_RAM_GB", "16.0"))
+            available_ram_gb = float(os.environ.get("JARVIS_AVAILABLE_RAM_GB", "8.0"))
+            cpu_count = int(os.environ.get("JARVIS_CPU_COUNT", "4"))
+            is_apple_silicon = os.environ.get("JARVIS_IS_APPLE_SILICON", "false").lower() == "true"
+            skip_agi_hub = os.environ.get("JARVIS_SKIP_AGI_HUB", "false").lower() == "true"
+            enable_slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "false").lower() == "true"
+            defer_heavy_subsystems = os.environ.get("JARVIS_DEFER_HEAVY_SUBSYSTEMS", "false").lower() == "true"
+            has_gpu = os.environ.get("JARVIS_HAS_GPU", "false").lower() == "true"
+            gpu_name = os.environ.get("JARVIS_GPU_NAME", "Unknown")
+            recommended_gpu_layers = int(os.environ.get("JARVIS_GPU_LAYERS", "0"))
+            recommended_context_size = int(os.environ.get("JARVIS_CONTEXT_SIZE", "2048"))
+
+            reason = f"Profile received from supervisor: {supervisor_profile} ({total_ram_gb:.1f}GB RAM)"
+
+            logger.info(f"[v138.0] ✅ Using supervisor-provided hardware profile: {profile.name}")
+            return HardwareAssessment(
+                profile=profile,
+                total_ram_gb=total_ram_gb,
+                available_ram_gb=available_ram_gb,
+                cpu_count=cpu_count,
+                is_apple_silicon=is_apple_silicon,
+                has_gpu=has_gpu,
+                gpu_name=gpu_name,
+                recommended_gpu_layers=recommended_gpu_layers,
+                recommended_context_size=recommended_context_size,
+                skip_agi_hub=skip_agi_hub,
+                enable_slim_mode=enable_slim_mode,
+                defer_heavy_subsystems=defer_heavy_subsystems,
+                reason=reason,
+            )
+        except (KeyError, ValueError) as e:
+            logger.warning(f"[v138.0] ⚠️ Invalid supervisor profile '{supervisor_profile}': {e}. Falling back to local detection.")
+
+    # =========================================================================
+    # v138.0: LOCAL HARDWARE DETECTION (Fallback)
+    # =========================================================================
+    # If supervisor didn't provide profile, or if running standalone, detect
+    # hardware locally.
+    # =========================================================================
+    logger.info("[v138.0] 🔍 Performing local hardware detection...")
+
+    # Default values if psutil not available
+    total_ram_gb = 8.0
+    available_ram_gb = 4.0
+    cpu_count = 4
+    is_apple_silicon = False
+    has_gpu = False
+    gpu_name = "Unknown"
+
+    # Detect Apple Silicon
+    machine = platform.machine().lower()
+    is_apple_silicon = machine in ("arm64", "aarch64") and platform.system() == "Darwin"
+
+    # Try to get accurate hardware info via psutil
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        total_ram_gb = mem.total / (1024 ** 3)
+        available_ram_gb = mem.available / (1024 ** 3)
+        cpu_count = psutil.cpu_count(logical=True) or 4
+    except ImportError:
+        logger.warning("[v138.0] psutil not available - using conservative defaults")
+    except Exception as e:
+        logger.warning(f"[v138.0] Hardware detection error: {e}")
+
+    # Detect GPU
+    if is_apple_silicon:
+        has_gpu = True
+        # Detect specific Apple Silicon chip
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5
+            )
+            chip_info = result.stdout.strip()
+            if "M1" in chip_info:
+                gpu_name = "Apple M1 GPU"
+            elif "M2" in chip_info:
+                gpu_name = "Apple M2 GPU"
+            elif "M3" in chip_info:
+                gpu_name = "Apple M3 GPU"
+            elif "M4" in chip_info:
+                gpu_name = "Apple M4 GPU"
+            else:
+                gpu_name = f"Apple Silicon GPU ({chip_info})"
+        except Exception:
+            gpu_name = "Apple Silicon GPU"
+
+    # Classify hardware profile
+    if total_ram_gb < 16:
+        profile = HardwareProfile.CLOUD_ONLY
+        skip_agi_hub = True
+        enable_slim_mode = True
+        defer_heavy_subsystems = True
+        reason = f"Insufficient RAM ({total_ram_gb:.1f}GB < 16GB) - CLOUD ONLY mode"
+        recommended_gpu_layers = 0  # Don't use GPU for model on low-memory systems
+        recommended_context_size = 1024
+
+    elif total_ram_gb < 30:
+        profile = HardwareProfile.SLIM
+        skip_agi_hub = False
+        enable_slim_mode = True
+        defer_heavy_subsystems = True
+        reason = f"Moderate RAM ({total_ram_gb:.1f}GB) - SLIM MODE with staged initialization"
+        recommended_gpu_layers = -1 if is_apple_silicon else 0
+        recommended_context_size = 2048
+
+    elif total_ram_gb < 64:
+        profile = HardwareProfile.FULL
+        skip_agi_hub = False
+        enable_slim_mode = False
+        defer_heavy_subsystems = False
+        reason = f"Adequate RAM ({total_ram_gb:.1f}GB) - FULL MODE with memory gates"
+        recommended_gpu_layers = -1 if is_apple_silicon else 32
+        recommended_context_size = 4096
+
+    else:
+        profile = HardwareProfile.UNLIMITED
+        skip_agi_hub = False
+        enable_slim_mode = False
+        defer_heavy_subsystems = False
+        reason = f"Abundant RAM ({total_ram_gb:.1f}GB) - UNLIMITED MODE"
+        recommended_gpu_layers = -1
+        recommended_context_size = 8192
+
+    return HardwareAssessment(
+        profile=profile,
+        total_ram_gb=total_ram_gb,
+        available_ram_gb=available_ram_gb,
+        cpu_count=cpu_count,
+        is_apple_silicon=is_apple_silicon,
+        has_gpu=has_gpu,
+        gpu_name=gpu_name,
+        recommended_gpu_layers=recommended_gpu_layers,
+        recommended_context_size=recommended_context_size,
+        skip_agi_hub=skip_agi_hub,
+        enable_slim_mode=enable_slim_mode,
+        defer_heavy_subsystems=defer_heavy_subsystems,
+        reason=reason,
+    )
+
+
+def _log_hardware_assessment(assessment: HardwareAssessment) -> None:
+    """Log hardware assessment with formatted output."""
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("🔧 v138.0: HARDWARE-AWARE STARTUP STRATEGY")
+    logger.info("=" * 70)
+    logger.info(f"   Profile: {assessment.profile.name}")
+    logger.info(f"   Total RAM: {assessment.total_ram_gb:.1f} GB")
+    logger.info(f"   Available RAM: {assessment.available_ram_gb:.1f} GB")
+    logger.info(f"   CPU Cores: {assessment.cpu_count}")
+    logger.info(f"   Apple Silicon: {assessment.is_apple_silicon}")
+    logger.info(f"   GPU: {assessment.gpu_name}")
+    logger.info(f"   Decision: {assessment.reason}")
+
+    if assessment.skip_agi_hub:
+        logger.warning("   ⚠️ AGI Hub will be SKIPPED - using cloud bridge only")
+    elif assessment.enable_slim_mode:
+        logger.info("   💡 SLIM MODE active - staged initialization with deferred subsystems")
+    else:
+        logger.info("   ✅ FULL MODE active - all subsystems will initialize")
+
+    logger.info("=" * 70)
+    logger.info("")
+
+
+# Global hardware assessment (populated during startup)
+_hardware_assessment: Optional[HardwareAssessment] = None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="JARVIS-Prime Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
@@ -1341,49 +1586,149 @@ async def main():
                 logger.warning(f"   ⚠️ Trinity init failed ({e})")
 
             # -----------------------------------------------------------------
-            # STEP 4: Initialize AGI Hub
+            # STEP 4: Initialize AGI Hub (with Hardware-Aware Configuration)
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("initializing_agi_hub", 4)
-            try:
-                from jarvis_prime.core.agi_integration import (
-                    AGIIntegrationHub,
-                    AGIHubConfig,
-                    get_agi_hub,
-                    shutdown_agi_hub,
-                    AGIEnhancedInference,
-                )
 
-                # v93.12: Configure AGI Hub with sensible timeouts
-                # These can be overridden via environment variables
-                agi_config = AGIHubConfig(
-                    enable_orchestrator=True,
-                    enable_reasoning=True,
-                    enable_learning=True,
-                    enable_multimodal=True,
-                    enable_hardware_optimization=True,
-                    enable_auto_reasoning=True,
-                    enable_experience_recording=True,
-                    # v93.12: Timeout configuration (prevents hanging)
-                    enable_agi_models_v80=os.getenv("ENABLE_AGI_MODELS_V80", "true").lower() == "true",
-                    agi_models_v80_timeout=float(os.getenv("AGI_MODELS_V80_TIMEOUT", "30.0")),
-                    agi_models_v80_graceful_degradation=True,  # Don't fail startup if v80.0 models fail
-                    subsystem_init_timeout=float(os.getenv("SUBSYSTEM_INIT_TIMEOUT", "60.0")),
-                    parallel_init_timeout=float(os.getenv("PARALLEL_INIT_TIMEOUT", "120.0")),
-                )
+            # v138.0: Perform hardware assessment BEFORE AGI Hub initialization
+            global _hardware_assessment
+            _hardware_assessment = _assess_hardware()
+            _log_hardware_assessment(_hardware_assessment)
 
-                _agi_hub = await get_agi_hub(agi_config)
-                log_step_complete("AGI Integration Hub", time.time() - step_start)
-            except asyncio.TimeoutError:
-                # v93.12: Handle timeout gracefully - don't block startup
-                logger.warning(f"   ⏱️ AGI Hub init timed out - continuing without it")
+            # Store assessment in startup state for health endpoint
+            _startup_state.details["hardware"] = {
+                "profile": _hardware_assessment.profile.name,
+                "total_ram_gb": _hardware_assessment.total_ram_gb,
+                "available_ram_gb": _hardware_assessment.available_ram_gb,
+                "is_apple_silicon": _hardware_assessment.is_apple_silicon,
+                "gpu": _hardware_assessment.gpu_name,
+                "slim_mode": _hardware_assessment.enable_slim_mode,
+                "skip_agi_hub": _hardware_assessment.skip_agi_hub,
+            }
+
+            # v138.0: Skip AGI Hub entirely if insufficient memory (CLOUD ONLY mode)
+            if _hardware_assessment.skip_agi_hub:
+                logger.warning("")
+                logger.warning("=" * 70)
+                logger.warning("⚠️ v138.0: SKIPPING LOCAL AGI HUB (CLOUD ONLY MODE)")
+                logger.warning("=" * 70)
+                logger.warning(f"   Reason: {_hardware_assessment.reason}")
+                logger.warning("   JARVIS Prime will operate as a thin client,")
+                logger.warning("   forwarding complex requests to the cloud AGI service.")
+                logger.warning("=" * 70)
+                logger.warning("")
                 _agi_hub = None
-            except ImportError as e:
-                logger.warning(f"   ⚠️ AGI Hub not available: {e}")
-            except Exception as e:
-                logger.warning(f"   ⚠️ AGI Hub init failed: {e}")
-                import traceback
-                traceback.print_exc()
+                log_step_complete("AGI Hub (SKIPPED - Cloud Only)", time.time() - step_start)
+            else:
+                try:
+                    from jarvis_prime.core.agi_integration import (
+                        AGIIntegrationHub,
+                        AGIHubConfig,
+                        get_agi_hub,
+                        shutdown_agi_hub,
+                        AGIEnhancedInference,
+                        SubsystemPriority,
+                    )
+
+                    # v138.0: Configure AGI Hub based on hardware assessment
+                    # The v138.0 Memory-Aware Staged Initialization handles the rest
+                    agi_config = AGIHubConfig(
+                        # Core subsystem enablement
+                        enable_orchestrator=True,
+                        enable_reasoning=True,
+                        enable_learning=not _hardware_assessment.enable_slim_mode,  # Defer in slim mode
+                        enable_multimodal=not _hardware_assessment.defer_heavy_subsystems,  # Defer heavy
+                        enable_hardware_optimization=True,
+                        enable_auto_reasoning=True,
+                        enable_experience_recording=not _hardware_assessment.enable_slim_mode,
+
+                        # v93.12: Timeout configuration (prevents hanging)
+                        enable_agi_models_v80=(
+                            os.getenv("ENABLE_AGI_MODELS_V80", "true").lower() == "true"
+                            and not _hardware_assessment.defer_heavy_subsystems
+                        ),
+                        agi_models_v80_timeout=float(os.getenv("AGI_MODELS_V80_TIMEOUT", "30.0")),
+                        agi_models_v80_graceful_degradation=True,
+                        subsystem_init_timeout=float(os.getenv("SUBSYSTEM_INIT_TIMEOUT", "60.0")),
+                        parallel_init_timeout=float(os.getenv("PARALLEL_INIT_TIMEOUT", "120.0")),
+
+                        # v138.0: Memory-Aware Staged Initialization configuration
+                        enable_staged_init=True,  # Always use staged init
+                        enable_slim_mode=_hardware_assessment.enable_slim_mode,
+                        enable_lazy_loading=_hardware_assessment.enable_slim_mode,
+                        defer_heavy_subsystems=_hardware_assessment.defer_heavy_subsystems,
+                        gc_between_stages=True,
+
+                        # Memory thresholds based on hardware profile
+                        min_memory_headroom_percent=(
+                            30.0 if _hardware_assessment.profile == HardwareProfile.SLIM else 20.0
+                        ),
+                        slim_mode_threshold_percent=(
+                            20.0 if _hardware_assessment.profile == HardwareProfile.SLIM else 15.0
+                        ),
+
+                        # OOM Protection (critical for low-memory systems)
+                        enable_oom_protection=True,
+                        oom_warning_threshold=(
+                            75.0 if _hardware_assessment.profile == HardwareProfile.SLIM else 85.0
+                        ),
+                        oom_critical_threshold=(
+                            85.0 if _hardware_assessment.profile == HardwareProfile.SLIM else 95.0
+                        ),
+
+                        # Subsystem priority based on hardware
+                        subsystem_priorities={
+                            "hardware": SubsystemPriority.CRITICAL,
+                            "orchestrator": SubsystemPriority.CRITICAL,
+                            "reasoning": (
+                                SubsystemPriority.IMPORTANT
+                                if not _hardware_assessment.enable_slim_mode
+                                else SubsystemPriority.OPTIONAL
+                            ),
+                            "learning": (
+                                SubsystemPriority.IMPORTANT
+                                if not _hardware_assessment.enable_slim_mode
+                                else SubsystemPriority.OPTIONAL
+                            ),
+                            "multimodal": SubsystemPriority.OPTIONAL,
+                            "agi_models_v80": SubsystemPriority.OPTIONAL,
+                        },
+                    )
+
+                    logger.info(f"   [v138.0] AGI Hub Config: staged_init=True, "
+                               f"slim_mode={_hardware_assessment.enable_slim_mode}, "
+                               f"defer_heavy={_hardware_assessment.defer_heavy_subsystems}")
+
+                    _agi_hub = await get_agi_hub(agi_config)
+                    log_step_complete("AGI Integration Hub", time.time() - step_start)
+
+                    # Log final AGI Hub status
+                    if _agi_hub:
+                        status = _agi_hub.get_status()
+                        staged_info = status.get("staged_init", {})
+                        logger.info(f"   [v138.0] AGI Hub Status: "
+                                   f"stage={staged_info.get('current_stage', 'UNKNOWN')}, "
+                                   f"slim_mode={staged_info.get('slim_mode', False)}, "
+                                   f"deferred={staged_info.get('deferred_subsystems', [])}")
+
+                except asyncio.TimeoutError:
+                    # v93.12: Handle timeout gracefully - don't block startup
+                    logger.warning(f"   ⏱️ AGI Hub init timed out - continuing without it")
+                    _agi_hub = None
+                except ImportError as e:
+                    logger.warning(f"   ⚠️ AGI Hub not available: {e}")
+                    _agi_hub = None
+                except MemoryError as e:
+                    # v138.0: Handle OOM during initialization
+                    logger.error(f"   ❌ AGI Hub OOM during initialization: {e}")
+                    logger.warning("   Falling back to CLOUD ONLY mode")
+                    _agi_hub = None
+                except Exception as e:
+                    logger.warning(f"   ⚠️ AGI Hub init failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    _agi_hub = None
 
             # -----------------------------------------------------------------
             # STEP 5: Initialize Neural Orchestrator

@@ -90,6 +90,92 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# v139.0: ACTIVE HYBRID BRIDGE - SLIM MODE FORCE-ROUTING
+# =============================================================================
+# When running on a low-memory system (SLIM mode), this bridge FORCES all heavy
+# reasoning tasks to be routed to the GCP cloud instead of local models.
+#
+# This is NOT a fallback - it's an ACTIVE INTERCEPTION that:
+# 1. Detects Slim Mode from environment variable (set by supervisor)
+# 2. Intercepts ALL heavy tasks (reasoning, coding, analysis, creative)
+# 3. BYPASSES local model loading entirely (prevents OOM)
+# 4. Forces routing to GCP Prime endpoint
+# 5. Auto-starts GCP VM if stopped (On-Demand Wake)
+#
+# Result: Your local 16GB Mac stays cool while the 64GB GCP VM does the work.
+# =============================================================================
+
+# Heavy task types that should ALWAYS go to cloud in Slim Mode
+SLIM_MODE_FORCE_CLOUD_TASKS = frozenset({
+    "reasoning",
+    "reason",
+    "coding",
+    "code_complex",
+    "code_architect",
+    "analysis",
+    "analyze",
+    "creative",
+    "creative_writing",
+    "paper_analysis",
+    "math",
+    "multimodal",
+    "code_review",
+    "architecture",
+    "design",
+    "research",
+})
+
+# Minimum complexity score that triggers cloud routing in Slim Mode
+SLIM_MODE_COMPLEXITY_THRESHOLD = 0.35
+
+
+@dataclass
+class SlimModeConfig:
+    """Configuration for Slim Mode Active Hybrid Bridge."""
+    enabled: bool = False
+    gcp_prime_endpoint: str = ""
+    force_cloud_tasks: Set[str] = field(default_factory=lambda: set(SLIM_MODE_FORCE_CLOUD_TASKS))
+    complexity_threshold: float = SLIM_MODE_COMPLEXITY_THRESHOLD
+    auto_wake_gcp: bool = True
+    warm_up_on_start: bool = True
+    max_wake_timeout_seconds: float = 180.0
+    health_check_interval_seconds: float = 5.0
+
+    @classmethod
+    def from_env(cls) -> "SlimModeConfig":
+        """Create config from environment variables."""
+        return cls(
+            enabled=os.environ.get("JARVIS_ENABLE_SLIM_MODE", "false").lower() == "true",
+            gcp_prime_endpoint=os.environ.get("JARVIS_GCP_PRIME_ENDPOINT", os.environ.get("GCP_PRIME_ENDPOINT", "")),
+            complexity_threshold=float(os.environ.get("JARVIS_SLIM_MODE_COMPLEXITY_THRESHOLD", "0.35")),
+            auto_wake_gcp=os.environ.get("JARVIS_AUTO_WAKE_GCP", "true").lower() == "true",
+            warm_up_on_start=os.environ.get("JARVIS_WARM_UP_GCP_ON_START", "true").lower() == "true",
+            max_wake_timeout_seconds=float(os.environ.get("JARVIS_GCP_WAKE_TIMEOUT", "180")),
+        )
+
+
+# Global Slim Mode config (populated on router init)
+_slim_mode_config: Optional[SlimModeConfig] = None
+
+
+def _get_slim_mode_config() -> SlimModeConfig:
+    """Get or create Slim Mode configuration."""
+    global _slim_mode_config
+    if _slim_mode_config is None:
+        _slim_mode_config = SlimModeConfig.from_env()
+        if _slim_mode_config.enabled:
+            logger.info(
+                f"[v139.0] ☁️ SLIM MODE ACTIVE HYBRID BRIDGE ENABLED\n"
+                f"    → Force-routing heavy tasks to: {_slim_mode_config.gcp_prime_endpoint or 'GCP (auto-detect)'}\n"
+                f"    → Task types: {len(_slim_mode_config.force_cloud_tasks)} categories\n"
+                f"    → Complexity threshold: {_slim_mode_config.complexity_threshold}\n"
+                f"    → Auto-wake GCP: {_slim_mode_config.auto_wake_gcp}"
+            )
+    return _slim_mode_config
+
+
 # =============================================================================
 # v95.0: GCP IMPORT BRIDGE - Access JARVIS infrastructure without duplication
 # =============================================================================
@@ -98,6 +184,40 @@ logger = logging.getLogger(__name__)
 _gcp_bridge_available: Optional[bool] = None
 _neural_orchestrator_available: Optional[bool] = None
 _neural_orchestrator_instance: Optional[Any] = None
+_gcp_vm_manager_available: Optional[bool] = None
+_gcp_vm_manager_instance: Optional[Any] = None
+
+
+async def _get_gcp_vm_manager():
+    """
+    v139.0: Lazily get the GCP VM Manager for on-demand wake.
+
+    This enables the Active Hybrid Bridge to auto-start the GCP VM
+    when it's stopped, ensuring seamless cloud inference even when
+    the Spot Instance has been terminated to save costs.
+    """
+    global _gcp_vm_manager_available, _gcp_vm_manager_instance
+
+    if _gcp_vm_manager_available is False:
+        return None
+
+    if _gcp_vm_manager_instance is not None:
+        return _gcp_vm_manager_instance
+
+    try:
+        from jarvis_prime.core.gcp_vm_manager import get_gcp_manager
+        _gcp_vm_manager_instance = await get_gcp_manager()
+        _gcp_vm_manager_available = True
+        logger.info("[v139.0] HybridTieredRouter: Connected to GCPVMManager for on-demand wake")
+        return _gcp_vm_manager_instance
+    except ImportError as e:
+        logger.debug(f"GCP VM Manager not available: {e}")
+        _gcp_vm_manager_available = False
+        return None
+    except Exception as e:
+        logger.debug(f"GCP VM Manager initialization failed: {e}")
+        _gcp_vm_manager_available = False
+        return None
 
 
 def _get_gcp_bridge():
@@ -1173,6 +1293,27 @@ class HybridTieredRouter:
         context = context or {}
         self._total_routes += 1
 
+        # =====================================================================
+        # v139.0: ACTIVE HYBRID BRIDGE - SLIM MODE FORCE-ROUTING
+        # =====================================================================
+        # This is the CRITICAL INTERCEPTION POINT. When running in Slim Mode,
+        # we FORCE all heavy tasks to be routed to the GCP cloud, bypassing
+        # local model loading entirely. This prevents OOM crashes on low-memory
+        # systems while providing FULL POWER via the cloud.
+        #
+        # This is NOT a fallback - it's an ACTIVE INTERCEPTION that ensures:
+        # - Your local Mac stays cool and responsive
+        # - The heavy lifting happens on the 64GB GCP Spot Instance
+        # - To you, JARVIS feels like it has infinite memory
+        # =====================================================================
+        slim_mode_result = await self._check_slim_mode_force_route(prompt, context)
+        if slim_mode_result is not None:
+            # Slim Mode intercepted this request - route to cloud
+            self._route_history.append(slim_mode_result)
+            if len(self._route_history) > 1000:
+                self._route_history = self._route_history[-500:]
+            return slim_mode_result
+
         # v100.0: Try Neural Orchestrator first (unified intelligent routing)
         use_neural = context.get("use_neural_orchestrator", True)
         if use_neural:
@@ -1448,6 +1589,263 @@ class HybridTieredRouter:
             return "tier_1_cloud_intelligent"
         else:
             return "tier_2_deep_reasoning"
+
+    # =========================================================================
+    # v139.0: ACTIVE HYBRID BRIDGE - SLIM MODE FORCE-ROUTING
+    # =========================================================================
+
+    async def _check_slim_mode_force_route(
+        self,
+        prompt: str,
+        context: Dict[str, Any],
+    ) -> Optional[RoutingResult]:
+        """
+        v139.0: Check if request should be force-routed to cloud in Slim Mode.
+
+        This is the CRITICAL INTERCEPTION POINT for the Active Hybrid Bridge.
+        When Slim Mode is active, we intercept heavy tasks and route them to
+        the GCP cloud, completely bypassing local model loading.
+
+        Args:
+            prompt: The user's prompt
+            context: Request context
+
+        Returns:
+            RoutingResult if force-routed to cloud, None to continue normal routing
+        """
+        slim_config = _get_slim_mode_config()
+
+        # Check if Slim Mode is enabled
+        if not slim_config.enabled:
+            return None
+
+        # Quick complexity analysis to determine if this is a heavy task
+        analysis = await self._analyzer.analyze(prompt, context)
+
+        # Check if task type requires cloud routing
+        task_type = analysis.task_type
+        complexity = analysis.score
+
+        # Determine if this should be force-routed to cloud
+        should_force_route = False
+        force_reason = ""
+
+        if task_type in slim_config.force_cloud_tasks:
+            should_force_route = True
+            force_reason = f"Task type '{task_type}' requires cloud processing"
+        elif complexity >= slim_config.complexity_threshold:
+            should_force_route = True
+            force_reason = f"Complexity {complexity:.2f} >= {slim_config.complexity_threshold} threshold"
+        elif any(cap in slim_config.force_cloud_tasks for cap in analysis.detected_capabilities):
+            should_force_route = True
+            detected = [cap for cap in analysis.detected_capabilities if cap in slim_config.force_cloud_tasks]
+            force_reason = f"Detected heavy capabilities: {detected}"
+
+        if not should_force_route:
+            # Allow normal routing for simple tasks
+            return None
+
+        # =====================================================================
+        # FORCE-ROUTE TO CLOUD - This is the Active Hybrid Bridge in action
+        # =====================================================================
+        logger.info(
+            f"☁️ [v139.0] SLIM MODE ACTIVE: Force-routing to GCP Hybrid Brain\n"
+            f"    → Reason: {force_reason}\n"
+            f"    → Task type: {task_type}\n"
+            f"    → Complexity: {complexity:.3f}\n"
+            f"    → LOCAL MODEL LOADING BYPASSED"
+        )
+
+        # Get GCP endpoint (with auto-wake if needed)
+        gcp_endpoint = await self._get_gcp_endpoint_with_wake(slim_config)
+
+        if gcp_endpoint is None:
+            # GCP not available - fall back to normal routing with warning
+            logger.warning(
+                "[v139.0] ⚠️ GCP endpoint not available in Slim Mode. "
+                "Falling back to local routing (OOM risk!)."
+            )
+            return None
+
+        # Get cloud tier config (tier_1_cloud_intelligent)
+        cloud_tier = self._tiers.get("tier_1_cloud_intelligent")
+        if cloud_tier is None:
+            # Create a default cloud tier config
+            cloud_tier = TierConfig(
+                tier_id="tier_1_cloud_intelligent",
+                name="GCP Cloud Intelligent (Slim Mode)",
+                description="Force-routed via Active Hybrid Bridge",
+                tier_level=1,
+                priority=1,
+                enabled=True,
+                endpoint=gcp_endpoint,
+                model_type="vllm",
+                tokens_per_second=45,
+                max_context_tokens=32768,
+                average_latency_ms=1500.0,
+            )
+
+        # Update tier stats
+        self._tier_usage["tier_1_cloud_intelligent"] = self._tier_usage.get("tier_1_cloud_intelligent", 0) + 1
+
+        # Create force-routed result
+        return RoutingResult(
+            tier_id="tier_1_cloud_intelligent",
+            tier_name="GCP Cloud (Slim Mode Force-Route)",
+            tier_level=1,
+            model_name=cloud_tier.primary_model.get("name", "Llama-3.3-70B-Instruct"),
+            endpoint=gcp_endpoint,
+            complexity_score=complexity,
+            confidence=0.95,  # High confidence in force-routing decision
+            reasoning=f"[v139.0 SLIM MODE ACTIVE] {force_reason} → Force-routed to GCP Hybrid Brain",
+            estimated_latency_ms=cloud_tier.average_latency_ms,
+            estimated_cost_usd=0.01,  # Rough estimate
+            estimated_tokens_per_second=cloud_tier.tokens_per_second,
+            was_fallback=False,  # This is NOT a fallback - it's intentional force-routing
+            fallback_reason=None,
+            fallback_chain=[],
+            available_tiers=["tier_1_cloud_intelligent"],
+            unavailable_tiers={"tier_0_local_fast": "Slim Mode active - local bypassed"},
+        )
+
+    async def _get_gcp_endpoint_with_wake(
+        self,
+        slim_config: SlimModeConfig,
+    ) -> Optional[str]:
+        """
+        v139.0: Get GCP endpoint, with on-demand wake if VM is stopped.
+
+        This implements the "Auto-Starter" functionality. If the Spot Instance
+        is stopped (to save money), this method will:
+        1. Start the VM
+        2. Wait for health check (HTTP 200 on port 8000)
+        3. Return the endpoint when ready
+
+        Args:
+            slim_config: Slim Mode configuration
+
+        Returns:
+            GCP endpoint URL, or None if unavailable
+        """
+        # First, check if we have a pre-configured endpoint
+        if slim_config.gcp_prime_endpoint:
+            # Verify it's actually reachable
+            if await self._check_endpoint_health(slim_config.gcp_prime_endpoint):
+                return slim_config.gcp_prime_endpoint
+
+            # Endpoint configured but not healthy - try to wake if auto-wake enabled
+            if not slim_config.auto_wake_gcp:
+                logger.warning(
+                    f"[v139.0] GCP endpoint {slim_config.gcp_prime_endpoint} not healthy "
+                    "and auto-wake disabled"
+                )
+                return None
+
+        # Try to get endpoint from GCP VM Manager (with auto-wake)
+        vm_manager = await _get_gcp_vm_manager()
+        if vm_manager is None:
+            logger.warning("[v139.0] GCP VM Manager not available for auto-wake")
+            return slim_config.gcp_prime_endpoint if slim_config.gcp_prime_endpoint else None
+
+        # Ensure VM is running (this is the "On-Demand Wake")
+        endpoint = await self._ensure_gcp_vm_running(vm_manager, slim_config)
+        return endpoint
+
+    async def _ensure_gcp_vm_running(
+        self,
+        vm_manager: Any,
+        slim_config: SlimModeConfig,
+    ) -> Optional[str]:
+        """
+        v139.0: Ensure GCP VM is running and return inference endpoint.
+
+        Implements on-demand wake with health check polling.
+        """
+        logger.info("[v139.0] 🌤️ Ensuring GCP VM is running for Slim Mode offload...")
+
+        try:
+            # First, check if we already have a running instance
+            endpoint = await vm_manager.get_inference_endpoint()
+            if endpoint and await self._check_endpoint_health(endpoint):
+                logger.info(f"[v139.0] ✅ GCP VM already running: {endpoint}")
+                return endpoint
+
+            # No running instance - need to start one
+            logger.info("[v139.0] 🚀 Starting GCP VM for on-demand wake...")
+
+            # Ensure at least one instance is running
+            success = await vm_manager.ensure_capacity(min_instances=1)
+            if not success:
+                logger.error("[v139.0] ❌ Failed to ensure GCP VM capacity")
+                return None
+
+            # Wait for endpoint to become healthy
+            start_time = time.time()
+            while time.time() - start_time < slim_config.max_wake_timeout_seconds:
+                endpoint = await vm_manager.get_inference_endpoint()
+                if endpoint and await self._check_endpoint_health(endpoint):
+                    wake_time = time.time() - start_time
+                    logger.info(
+                        f"[v139.0] ✅ GCP VM woke up and healthy in {wake_time:.1f}s: {endpoint}"
+                    )
+                    return endpoint
+
+                # Wait before next check
+                await asyncio.sleep(slim_config.health_check_interval_seconds)
+                logger.debug(
+                    f"[v139.0] Waiting for GCP VM health... "
+                    f"({time.time() - start_time:.1f}s / {slim_config.max_wake_timeout_seconds}s)"
+                )
+
+            logger.error(
+                f"[v139.0] ❌ GCP VM wake timeout after {slim_config.max_wake_timeout_seconds}s"
+            )
+            return None
+
+        except Exception as e:
+            logger.error(f"[v139.0] ❌ Error ensuring GCP VM running: {e}")
+            return None
+
+    async def _check_endpoint_health(self, endpoint: str) -> bool:
+        """Check if an endpoint is healthy."""
+        try:
+            import aiohttp
+            health_url = f"{endpoint.rstrip('/')}/health"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    health_url,
+                    timeout=aiohttp.ClientTimeout(total=5.0),
+                ) as response:
+                    return response.status == 200
+
+        except Exception:
+            return False
+
+    async def warm_up_gcp_for_slim_mode(self) -> bool:
+        """
+        v139.0: Optional warm-up of GCP VM on startup.
+
+        Call this during initialization if Slim Mode is detected to pre-warm
+        the GCP VM so it's ready for the first interaction.
+
+        Returns:
+            True if warm-up successful or not needed
+        """
+        slim_config = _get_slim_mode_config()
+
+        if not slim_config.enabled or not slim_config.warm_up_on_start:
+            return True
+
+        logger.info("[v139.0] 🔥 Warming up GCP VM for Slim Mode...")
+
+        endpoint = await self._get_gcp_endpoint_with_wake(slim_config)
+        if endpoint:
+            logger.info(f"[v139.0] ✅ GCP VM warm and ready: {endpoint}")
+            return True
+        else:
+            logger.warning("[v139.0] ⚠️ GCP VM warm-up failed - will wake on first request")
+            return False
 
     # =========================================================================
     # v95.0: ELASTIC CLOUD BURST - GCP Integration
