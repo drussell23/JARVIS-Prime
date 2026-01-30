@@ -1001,7 +1001,12 @@ class AppleSiliconOptimizer:
         self._initialized = False
 
     async def initialize(self) -> bool:
-        """Initialize all optimization backends."""
+        """
+        Initialize all optimization backends.
+        
+        v149.0: Always succeeds - falls back to CPU-only mode if MPS/CoreML
+        are not available. This prevents Stage 1 failures on SLIM hardware.
+        """
         logger.info("=" * 60)
         logger.info("Apple Silicon Optimizer - Initializing")
         logger.info("=" * 60)
@@ -1010,7 +1015,7 @@ class AppleSiliconOptimizer:
         logger.info(f"GPU Cores: {self._platform.gpu_cores}")
         logger.info(f"Neural Engine Cores: {self._platform.neural_engine_cores}")
 
-        # Initialize backends
+        # Initialize backends (may fail on SLIM hardware - that's OK)
         results = await asyncio.gather(
             self._mps.initialize(),
             self._coreml.initialize(),
@@ -1023,10 +1028,21 @@ class AppleSiliconOptimizer:
         logger.info(f"MPS Backend: {'Enabled' if mps_ok else 'Disabled'}")
         logger.info(f"CoreML Backend: {'Enabled' if coreml_ok else 'Disabled'}")
         logger.info(f"Optimal Backend: {self._platform.get_optimal_backend().value}")
+        
+        # v149.0: Always succeed - CPU fallback is always available
+        # On SLIM hardware, this allows startup to continue even without
+        # GPU acceleration. GCP offloading handles heavy computation.
+        if not mps_ok and not coreml_ok:
+            logger.warning(
+                "[v149.0] No GPU acceleration available - using CPU-only mode. "
+                "Heavy workloads will be offloaded to GCP."
+            )
+        
         logger.info("=" * 60)
 
-        self._initialized = mps_ok or coreml_ok
-        return self._initialized
+        # v149.0: Always mark as initialized - CPU fallback is always available
+        self._initialized = True
+        return True
 
     def get_optimal_backend(self) -> AccelerationBackend:
         """Get optimal acceleration backend."""
