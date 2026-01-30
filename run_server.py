@@ -11,40 +11,38 @@ Runs JARVIS-Prime with llama-cpp-python backend.
 Integrates with main JARVIS infrastructure for unified cost tracking.
 
 Usage:
-    # Default (TinyLlama on port 8000)
-    python run_server.py
-
-    # Custom model
-    python run_server.py --model models/mistral-7b.gguf --port 8080
-
-    # With Metal GPU (M1/M2/M3)
-    python run_server.py --gpu-layers -1
-
-    # Connect to JARVIS infrastructure (default: auto-detect)
-    python run_server.py --bridge-enabled
+    python run_server.py                        # Default
+    python run_server.py --model foo.gguf       # Custom model
+    python run_server.py --gpu-layers -1        # Metal GPU
 
 Endpoints:
     POST /v1/chat/completions  - OpenAI-compatible chat
     POST /generate             - Simple text generation
-    GET  /health               - Health check (IMMEDIATE response)
-    GET  /metrics              - Cost tracking & inference metrics
+    GET  /health               - Health check (IMMEDIATE)
+    GET  /metrics              - Cost/inference metrics
 """
 
 # =============================================================================
-# v93.16: COMPREHENSIVE Warning Suppression - BEFORE any imports
+# v93.16: Warning Suppression - BEFORE any imports
 # =============================================================================
-# Set environment variable FIRST to suppress warnings at the interpreter level
 import os
 os.environ.setdefault('PYTHONWARNINGS', 'ignore::UserWarning,ignore::DeprecationWarning,ignore::FutureWarning')
-# Also set TF and other library-specific environment variables
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')  # Suppress TensorFlow warnings
-os.environ.setdefault('TRANSFORMERS_VERBOSITY', 'error')  # Suppress transformers warnings
-os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')  # Suppress tokenizers warning
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+os.environ.setdefault('TRANSFORMERS_VERBOSITY', 'error')
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
+# =============================================================================
+# v149.0: HOLLOW CLIENT GUARD - MUST BE BEFORE ANY ML IMPORTS
+# =============================================================================
+try:
+    from jarvis_prime.core.hollow_client_guard import install_hollow_guard
+    _hollow_installed, _hollow_reason = install_hollow_guard()
+except (ImportError, Exception):
+    pass  # Guard not available
 
 import warnings
 import sys
 
-# v93.16: Use simplefilter FIRST to catch everything, then add specific filters
 warnings.simplefilter('ignore', category=UserWarning)
 warnings.simplefilter('ignore', category=DeprecationWarning)
 warnings.simplefilter('ignore', category=FutureWarning)
