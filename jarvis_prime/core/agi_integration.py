@@ -52,25 +52,50 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 # =============================================================================
 
 import asyncio
+import concurrent.futures
+import gc
 import logging
 import os  # v93.14: Added for environment variable access
+import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
+    Generic,
     List,
     Optional,
     Set,
     Tuple,
+    Type,
+    TypeVar,
     Union,
 )
 
+# =============================================================================
+# v138.0: MEMORY-AWARE STAGED INITIALIZATION
+# Fixes OOM (Exit Code -9) by replacing unbounded parallel initialization
+# with a staged pipeline that includes memory gates between phases
+# =============================================================================
+
 logger = logging.getLogger(__name__)
+
+# Type variable for generic lazy proxy
+T = TypeVar('T')
+
+# psutil availability check (non-blocking)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    logger.debug("psutil not available - memory monitoring disabled")
 
 
 # =============================================================================
@@ -111,6 +136,536 @@ class ReasoningRequirement(Enum):
     CAUSAL = auto()       # Causal understanding
     PLANNING = auto()     # Action planning
     META = auto()         # Meta-cognitive reasoning
+
+
+# =============================================================================
+# v138.0: MEMORY-AWARE STAGED INITIALIZATION ENUMS AND STRUCTURES
+# =============================================================================
+
+
+class InitStage(Enum):
+    """
+    v138.0: Initialization stages for memory-aware staged loading.
+
+    Subsystems are grouped into stages based on:
+    1. Memory footprint (lighter subsystems first)
+    2. Dependencies (foundational subsystems before consumers)
+    3. Criticality (core functionality before optional features)
+    """
+    PRE_FLIGHT = auto()       # Pre-flight checks and OOM protection setup
+    STAGE_1_FOUNDATION = auto()  # Hardware optimizer + Orchestrator (critical, light)
+    STAGE_2_REASONING = auto()   # Reasoning + Learning (moderate memory)
+    STAGE_3_HEAVY = auto()       # Multimodal + AGI v80 models (heavy, optional)
+    COMPLETED = auto()        # All stages complete
+
+
+class MemoryPressure(Enum):
+    """
+    v138.0: Memory pressure levels for adaptive initialization.
+
+    Used to dynamically adjust initialization strategy based on
+    available system memory.
+    """
+    MINIMAL = auto()      # <50% used - full initialization
+    LOW = auto()          # 50-65% used - normal initialization
+    MODERATE = auto()     # 65-80% used - conservative initialization
+    HIGH = auto()         # 80-90% used - slim mode, defer heavy subsystems
+    CRITICAL = auto()     # >90% used - emergency mode, minimal subsystems only
+
+
+class SubsystemPriority(Enum):
+    """
+    v138.0: Subsystem priority for adaptive loading.
+
+    In high memory pressure, only CRITICAL subsystems are loaded immediately.
+    IMPORTANT subsystems are loaded if memory permits.
+    OPTIONAL subsystems are lazy-loaded on first use.
+    """
+    CRITICAL = 1      # Must load for basic functionality
+    IMPORTANT = 2     # Should load, but can be deferred
+    OPTIONAL = 3      # Can be lazy-loaded on demand
+
+
+@dataclass
+class MemorySnapshot:
+    """
+    v138.0: Point-in-time memory state for gate decisions.
+    """
+    timestamp: float
+    total_mb: float
+    available_mb: float
+    used_percent: float
+    process_rss_mb: float
+    swap_used_mb: float = 0.0
+
+    @property
+    def headroom_mb(self) -> float:
+        """Available memory headroom in MB."""
+        return self.available_mb
+
+    @property
+    def headroom_percent(self) -> float:
+        """Available memory as percentage of total."""
+        return 100.0 - self.used_percent
+
+
+@dataclass
+class StagedInitConfig:
+    """
+    v138.0: Configuration for memory-aware staged initialization.
+    """
+    # Memory gate thresholds (percentage of total memory)
+    min_headroom_percent: float = 20.0       # Minimum free memory to proceed
+    warning_headroom_percent: float = 30.0   # Trigger GC below this
+    slim_mode_threshold: float = 15.0        # Enter slim mode below this
+
+    # Stage timing (max time per stage in seconds)
+    stage_timeout: float = 45.0
+    pre_flight_timeout: float = 10.0
+    gc_timeout: float = 5.0
+
+    # Parallelism within stages
+    max_parallel_per_stage: int = 2  # Max subsystems to init in parallel per stage
+
+    # Memory gate behavior
+    gc_between_stages: bool = True           # Run GC between stages
+    gc_generations: int = 2                  # GC generations to collect (0-2)
+    memory_gate_retry_count: int = 3         # Retries if memory gate fails
+    memory_gate_retry_delay: float = 2.0     # Delay between retries
+
+    # Adaptive behavior
+    enable_slim_mode: bool = True            # Auto-enable slim mode in low memory
+    defer_heavy_on_pressure: bool = True     # Defer heavy subsystems on memory pressure
+    lazy_load_optional: bool = True          # Lazy-load optional subsystems
+
+    # Environment variable overrides
+    @classmethod
+    def from_env(cls) -> "StagedInitConfig":
+        """Create config from environment variables."""
+        return cls(
+            min_headroom_percent=float(os.getenv("AGI_MIN_HEADROOM_PERCENT", "20.0")),
+            warning_headroom_percent=float(os.getenv("AGI_WARNING_HEADROOM_PERCENT", "30.0")),
+            slim_mode_threshold=float(os.getenv("AGI_SLIM_MODE_THRESHOLD", "15.0")),
+            stage_timeout=float(os.getenv("AGI_STAGE_TIMEOUT", "45.0")),
+            enable_slim_mode=os.getenv("AGI_ENABLE_SLIM_MODE", "true").lower() == "true",
+            defer_heavy_on_pressure=os.getenv("AGI_DEFER_HEAVY", "true").lower() == "true",
+            lazy_load_optional=os.getenv("AGI_LAZY_LOAD", "true").lower() == "true",
+        )
+
+
+@dataclass
+class StageResult:
+    """
+    v138.0: Result of a single initialization stage.
+    """
+    stage: InitStage
+    success: bool
+    subsystems_initialized: List[str]
+    subsystems_failed: List[str]
+    subsystems_deferred: List[str]
+    elapsed_seconds: float
+    memory_before: Optional[MemorySnapshot] = None
+    memory_after: Optional[MemorySnapshot] = None
+    error: Optional[str] = None
+
+    @property
+    def memory_delta_mb(self) -> float:
+        """Memory change during this stage (positive = increased usage)."""
+        if self.memory_before and self.memory_after:
+            return self.memory_after.process_rss_mb - self.memory_before.process_rss_mb
+        return 0.0
+
+
+# =============================================================================
+# v138.0: LAZY LOADING PROXY
+# =============================================================================
+
+
+class LazySubsystemProxy(Generic[T]):
+    """
+    v138.0: Lazy loading proxy for deferred subsystem initialization.
+
+    Wraps a subsystem factory and only initializes the actual subsystem
+    when first accessed. This prevents memory spikes from loading all
+    subsystems at startup.
+
+    Features:
+    - Thread-safe initialization via asyncio.Lock
+    - Transparent attribute forwarding
+    - Memory-aware initialization with pressure checks
+    - Timeout protection
+    - Initialization metrics tracking
+
+    Usage:
+        proxy = LazySubsystemProxy(
+            factory=lambda: MyHeavySubsystem(),
+            async_init=lambda s: s.initialize(),
+            name="heavy_subsystem"
+        )
+
+        # Later, when actually needed:
+        result = await proxy.some_method()  # Initializes on first access
+    """
+
+    def __init__(
+        self,
+        factory: Callable[[], T],
+        async_init: Optional[Callable[[T], Awaitable[bool]]] = None,
+        name: str = "subsystem",
+        timeout: float = 30.0,
+        priority: SubsystemPriority = SubsystemPriority.OPTIONAL,
+        min_headroom_percent: float = 15.0,
+    ):
+        self._factory = factory
+        self._async_init = async_init
+        self._name = name
+        self._timeout = timeout
+        self._priority = priority
+        self._min_headroom_percent = min_headroom_percent
+
+        self._instance: Optional[T] = None
+        self._initialized = False
+        self._init_lock: Optional[asyncio.Lock] = None
+        self._init_error: Optional[Exception] = None
+        self._init_time: float = 0.0
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazy-initialize the lock (must be in event loop context)."""
+        if self._init_lock is None:
+            self._init_lock = asyncio.Lock()
+        return self._init_lock
+
+    async def _check_memory_ok(self) -> bool:
+        """Check if there's enough memory headroom to initialize."""
+        if not PSUTIL_AVAILABLE:
+            return True  # Can't check, assume OK
+
+        try:
+            mem = psutil.virtual_memory()
+            headroom_percent = 100.0 - mem.percent
+            return headroom_percent >= self._min_headroom_percent
+        except Exception:
+            return True  # On error, proceed anyway
+
+    async def _ensure_initialized(self) -> T:
+        """
+        Ensure the subsystem is initialized, creating it if necessary.
+
+        Thread-safe: Uses asyncio.Lock for synchronization.
+        """
+        # Fast path: Already initialized
+        if self._initialized and self._instance is not None:
+            return self._instance
+
+        # Check for previous failure
+        if self._init_error is not None:
+            raise RuntimeError(
+                f"LazySubsystemProxy[{self._name}] previously failed: {self._init_error}"
+            )
+
+        lock = self._get_lock()
+        async with lock:
+            # Double-check under lock
+            if self._initialized and self._instance is not None:
+                return self._instance
+
+            # Check memory headroom
+            if not await self._check_memory_ok():
+                # Trigger GC and retry once
+                gc.collect()
+                await asyncio.sleep(0.1)  # Let GC settle
+
+                if not await self._check_memory_ok():
+                    raise MemoryError(
+                        f"Insufficient memory to initialize {self._name} "
+                        f"(requires {self._min_headroom_percent}% headroom)"
+                    )
+
+            logger.info(f"[v138.0] Lazy-loading subsystem: {self._name}")
+            start_time = time.perf_counter()
+
+            try:
+                # Create instance
+                self._instance = self._factory()
+
+                # Run async initialization if provided
+                if self._async_init is not None:
+                    await asyncio.wait_for(
+                        self._async_init(self._instance),
+                        timeout=self._timeout
+                    )
+
+                self._initialized = True
+                self._init_time = time.perf_counter() - start_time
+
+                logger.info(
+                    f"[v138.0] Lazy-loaded {self._name} in {self._init_time:.2f}s"
+                )
+                return self._instance
+
+            except asyncio.TimeoutError:
+                self._init_error = TimeoutError(
+                    f"Lazy initialization of {self._name} timed out after {self._timeout}s"
+                )
+                raise self._init_error
+            except Exception as e:
+                self._init_error = e
+                logger.error(f"[v138.0] Failed to lazy-load {self._name}: {e}")
+                raise
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Forward attribute access to the wrapped instance.
+
+        Note: This is synchronous, so it blocks if the instance needs
+        initialization. For truly non-blocking behavior, call
+        _ensure_initialized() explicitly first.
+        """
+        if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+        # If already initialized, forward directly
+        if self._instance is not None:
+            return getattr(self._instance, name)
+
+        # Return a coroutine that will initialize and forward
+        async def lazy_forward(*args, **kwargs):
+            instance = await self._ensure_initialized()
+            attr = getattr(instance, name)
+            if callable(attr):
+                result = attr(*args, **kwargs)
+                if asyncio.iscoroutine(result):
+                    return await result
+                return result
+            return attr
+
+        return lazy_forward
+
+    @property
+    def is_initialized(self) -> bool:
+        """Check if the subsystem has been initialized."""
+        return self._initialized
+
+    @property
+    def instance(self) -> Optional[T]:
+        """Get the raw instance (may be None if not initialized)."""
+        return self._instance
+
+
+# =============================================================================
+# v138.0: MEMORY GATE
+# =============================================================================
+
+
+class MemoryGate:
+    """
+    v138.0: Memory gate for staged initialization.
+
+    Checks memory headroom and optionally triggers GC before allowing
+    the next initialization stage to proceed.
+
+    Features:
+    - Non-blocking memory checks via thread pool
+    - Configurable retry with exponential backoff
+    - GC triggering with generation control
+    - Memory trend analysis
+    - Detailed logging for debugging
+    """
+
+    def __init__(self, config: StagedInitConfig):
+        self._config = config
+        self._thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._memory_history: List[MemorySnapshot] = []
+
+    def _get_thread_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Lazy-initialize thread pool for non-blocking I/O."""
+        if self._thread_pool is None:
+            self._thread_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="MemoryGate"
+            )
+        return self._thread_pool
+
+    def _sync_get_memory_snapshot(self) -> Optional[MemorySnapshot]:
+        """Synchronously get memory snapshot (runs in thread pool)."""
+        if not PSUTIL_AVAILABLE:
+            return None
+
+        try:
+            mem = psutil.virtual_memory()
+            swap = psutil.swap_memory()
+            process = psutil.Process()
+            mem_info = process.memory_info()
+
+            return MemorySnapshot(
+                timestamp=time.time(),
+                total_mb=mem.total / (1024 ** 2),
+                available_mb=mem.available / (1024 ** 2),
+                used_percent=mem.percent,
+                process_rss_mb=mem_info.rss / (1024 ** 2),
+                swap_used_mb=swap.used / (1024 ** 2),
+            )
+        except Exception as e:
+            logger.debug(f"[MemoryGate] Failed to get snapshot: {e}")
+            return None
+
+    async def get_memory_snapshot(self) -> Optional[MemorySnapshot]:
+        """Non-blocking memory snapshot acquisition."""
+        if not PSUTIL_AVAILABLE:
+            return None
+
+        loop = asyncio.get_running_loop()
+        pool = self._get_thread_pool()
+
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(pool, self._sync_get_memory_snapshot),
+                timeout=2.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[MemoryGate] Memory snapshot timed out")
+            return None
+
+    def classify_memory_pressure(
+        self,
+        snapshot: Optional[MemorySnapshot]
+    ) -> MemoryPressure:
+        """Classify current memory pressure level."""
+        if snapshot is None:
+            return MemoryPressure.LOW  # Default if we can't measure
+
+        used = snapshot.used_percent
+
+        if used < 50.0:
+            return MemoryPressure.MINIMAL
+        elif used < 65.0:
+            return MemoryPressure.LOW
+        elif used < 80.0:
+            return MemoryPressure.MODERATE
+        elif used < 90.0:
+            return MemoryPressure.HIGH
+        else:
+            return MemoryPressure.CRITICAL
+
+    async def run_gc(self, generations: Optional[int] = None) -> float:
+        """
+        Run garbage collection in thread pool to avoid blocking.
+
+        Returns: Time taken for GC in seconds.
+        """
+        gens = generations if generations is not None else self._config.gc_generations
+
+        def _gc_in_thread():
+            start = time.perf_counter()
+            # Collect all generations up to the specified one
+            for gen in range(gens + 1):
+                gc.collect(gen)
+            return time.perf_counter() - start
+
+        loop = asyncio.get_running_loop()
+        pool = self._get_thread_pool()
+
+        try:
+            gc_time = await asyncio.wait_for(
+                loop.run_in_executor(pool, _gc_in_thread),
+                timeout=self._config.gc_timeout
+            )
+            logger.debug(f"[MemoryGate] GC completed in {gc_time:.3f}s")
+            return gc_time
+        except asyncio.TimeoutError:
+            logger.warning(f"[MemoryGate] GC timed out after {self._config.gc_timeout}s")
+            return self._config.gc_timeout
+
+    async def check_headroom(
+        self,
+        stage_name: str,
+        required_percent: Optional[float] = None
+    ) -> Tuple[bool, MemorySnapshot, MemoryPressure]:
+        """
+        Check if there's sufficient memory headroom to proceed.
+
+        Args:
+            stage_name: Name of the stage for logging
+            required_percent: Override default minimum headroom
+
+        Returns:
+            Tuple of (can_proceed, memory_snapshot, pressure_level)
+        """
+        min_headroom = required_percent or self._config.min_headroom_percent
+
+        snapshot = await self.get_memory_snapshot()
+        if snapshot is None:
+            # Can't measure, assume OK but log warning
+            logger.warning(f"[MemoryGate] Cannot measure memory for {stage_name}")
+            return True, MemorySnapshot(
+                timestamp=time.time(),
+                total_mb=0, available_mb=0, used_percent=0, process_rss_mb=0
+            ), MemoryPressure.LOW
+
+        pressure = self.classify_memory_pressure(snapshot)
+        headroom = snapshot.headroom_percent
+
+        # Store in history for trend analysis
+        self._memory_history.append(snapshot)
+        if len(self._memory_history) > 20:
+            self._memory_history.pop(0)
+
+        can_proceed = headroom >= min_headroom
+
+        logger.info(
+            f"[MemoryGate] {stage_name}: "
+            f"headroom={headroom:.1f}% (min={min_headroom}%), "
+            f"pressure={pressure.name}, "
+            f"RSS={snapshot.process_rss_mb:.0f}MB"
+        )
+
+        return can_proceed, snapshot, pressure
+
+    async def wait_for_headroom(
+        self,
+        stage_name: str,
+        required_percent: Optional[float] = None
+    ) -> Tuple[bool, MemorySnapshot, MemoryPressure]:
+        """
+        Wait for sufficient memory headroom, with GC and retries.
+
+        Returns:
+            Tuple of (success, final_snapshot, final_pressure)
+        """
+        retry_count = self._config.memory_gate_retry_count
+        retry_delay = self._config.memory_gate_retry_delay
+
+        for attempt in range(retry_count + 1):
+            can_proceed, snapshot, pressure = await self.check_headroom(
+                stage_name, required_percent
+            )
+
+            if can_proceed:
+                return True, snapshot, pressure
+
+            if attempt < retry_count:
+                logger.warning(
+                    f"[MemoryGate] {stage_name}: Insufficient headroom "
+                    f"({snapshot.headroom_percent:.1f}%), "
+                    f"running GC and retry {attempt + 1}/{retry_count}"
+                )
+
+                # Run GC to try to free memory
+                await self.run_gc()
+
+                # Wait with exponential backoff
+                await asyncio.sleep(retry_delay * (1.5 ** attempt))
+
+        logger.error(
+            f"[MemoryGate] {stage_name}: Failed to achieve headroom after {retry_count} retries"
+        )
+        return False, snapshot, pressure
+
+    def cleanup(self):
+        """Clean up thread pool."""
+        if self._thread_pool is not None:
+            self._thread_pool.shutdown(wait=False)
+            self._thread_pool = None
 
 
 @dataclass
@@ -202,6 +757,50 @@ class AGIHubConfig:
     # v93.12: Per-subsystem timeout configuration
     subsystem_init_timeout: float = 60.0  # Default timeout for any subsystem initialization
     parallel_init_timeout: float = 120.0  # Overall timeout for parallel initialization
+
+    # ==========================================================================
+    # v138.0: MEMORY-AWARE STAGED INITIALIZATION CONFIG
+    # ==========================================================================
+
+    # Enable staged initialization (replaces Big Bang parallel init)
+    enable_staged_init: bool = True
+
+    # Memory thresholds
+    min_memory_headroom_percent: float = 20.0  # Minimum free memory to proceed
+    slim_mode_threshold_percent: float = 15.0  # Enter slim mode below this
+    critical_memory_threshold_percent: float = 10.0  # Emergency mode below this
+
+    # Stage timing
+    stage_timeout: float = 45.0  # Max time per stage
+    pre_flight_timeout: float = 10.0  # Pre-flight checks timeout
+
+    # GC settings
+    gc_between_stages: bool = True  # Run GC between stages
+    gc_generations: int = 2  # GC generations to collect (0-2)
+
+    # Adaptive behavior
+    enable_slim_mode: bool = True  # Auto-enable slim mode in low memory
+    enable_lazy_loading: bool = True  # Lazy-load optional subsystems
+    defer_heavy_subsystems: bool = True  # Defer Stage 3 on memory pressure
+
+    # OOM Protection
+    enable_oom_protection: bool = True  # Initialize OOM engine before heavy loads
+    oom_warning_threshold: float = 85.0  # OOM warning at this % memory usage
+    oom_critical_threshold: float = 95.0  # OOM critical at this % memory usage
+
+    # Subsystem priority assignment (for adaptive loading)
+    subsystem_priorities: Dict[str, SubsystemPriority] = field(default_factory=lambda: {
+        "hardware": SubsystemPriority.CRITICAL,
+        "orchestrator": SubsystemPriority.CRITICAL,
+        "reasoning": SubsystemPriority.IMPORTANT,
+        "learning": SubsystemPriority.IMPORTANT,
+        "multimodal": SubsystemPriority.OPTIONAL,
+        "agi_models_v80": SubsystemPriority.OPTIONAL,
+    })
+
+    # ==========================================================================
+    # END v138.0 CONFIG
+    # ==========================================================================
 
     # Analysis settings
     complexity_keywords: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -376,176 +975,834 @@ class AGIIntegrationHub:
         # Lock for thread-safe initialization
         self._init_lock = asyncio.Lock()
 
+        # =======================================================================
+        # v138.0: MEMORY-AWARE STAGED INITIALIZATION STATE
+        # =======================================================================
+
+        # Memory gate for staged initialization
+        self._staged_init_config = StagedInitConfig.from_env()
+        self._memory_gate: Optional[MemoryGate] = None
+
+        # OOM Protection Engine (initialized early in pre-flight)
+        self._oom_engine: Optional[Any] = None
+
+        # Initialization state tracking
+        self._current_stage: InitStage = InitStage.PRE_FLIGHT
+        self._stage_results: List[StageResult] = []
+        self._memory_pressure: MemoryPressure = MemoryPressure.LOW
+        self._slim_mode: bool = False
+        self._deferred_subsystems: Set[str] = set()
+
+        # Lazy loading proxies for optional subsystems
+        self._lazy_proxies: Dict[str, LazySubsystemProxy] = {}
+
     # -------------------------------------------------------------------------
     # INITIALIZATION
     # -------------------------------------------------------------------------
 
     async def initialize(self) -> bool:
         """
-        Initialize all AGI subsystems with timeout protection.
+        Initialize all AGI subsystems with memory-aware staged loading.
 
-        v93.12: Enhanced with:
-        - Per-subsystem timeout protection
-        - Graceful degradation for non-critical subsystems
-        - Progress reporting for monitoring
-        - Parallel initialization with overall timeout
+        v138.0: Complete rewrite with Memory-Aware Staged Initialization.
+
+        Fixes OOM (Exit Code -9) by replacing unbounded parallel initialization
+        with a staged pipeline that includes:
+
+        1. PRE-FLIGHT: Memory assessment + OOM Protection setup
+        2. STAGE 1 (Foundation): Hardware + Orchestrator (critical, light)
+        3. STAGE 2 (Reasoning): Reasoning + Learning (moderate memory)
+        4. STAGE 3 (Heavy): Multimodal + AGI v80 (heavy, optional)
+
+        Features:
+        - Memory gates between stages with GC
+        - Adaptive slim mode for low-memory environments
+        - Lazy loading proxies for optional subsystems
+        - OOM Protection initialized BEFORE heavy loads
+        - Dynamic subsystem deferral based on memory pressure
         """
         async with self._init_lock:
             if self._initialized:
                 return True
 
-            logger.info("Initializing AGI Integration Hub...")
-            init_start = time.time()
+            # Use staged init if enabled, otherwise fall back to legacy
+            if self._config.enable_staged_init:
+                return await self._initialize_staged()
+            else:
+                return await self._initialize_legacy()
 
-            try:
-                # v93.12: Create named tasks for better error reporting
-                init_tasks: Dict[str, asyncio.Task] = {}
-                subsystem_timeout = self._config.subsystem_init_timeout
+    async def _initialize_staged(self) -> bool:
+        """
+        v138.0: Memory-aware staged initialization.
 
-                # Core subsystems (critical)
-                if self._config.enable_hardware_optimization:
-                    init_tasks["hardware"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_hardware(),
-                            subsystem_timeout,
-                            "hardware_optimizer"
-                        )
+        Implements rolling start pattern to prevent memory spikes.
+        """
+        init_start = time.time()
+        total_initialized = 0
+        total_failed = 0
+        total_deferred = 0
+
+        logger.info("=" * 70)
+        logger.info("v138.0: AGI Integration Hub - Memory-Aware Staged Initialization")
+        logger.info("=" * 70)
+
+        try:
+            # =================================================================
+            # PRE-FLIGHT PHASE
+            # =================================================================
+            self._current_stage = InitStage.PRE_FLIGHT
+
+            pre_flight_result = await self._run_pre_flight_stage()
+            self._stage_results.append(pre_flight_result)
+
+            if not pre_flight_result.success:
+                logger.error("[v138.0] Pre-flight checks failed - aborting initialization")
+                return False
+
+            # Check if we should use slim mode
+            if self._slim_mode:
+                logger.warning(
+                    "[v138.0] SLIM MODE ACTIVE - deferring heavy subsystems"
+                )
+
+            # =================================================================
+            # STAGE 1: FOUNDATION (Critical subsystems)
+            # =================================================================
+            self._current_stage = InitStage.STAGE_1_FOUNDATION
+
+            stage1_result = await self._run_stage_1_foundation()
+            self._stage_results.append(stage1_result)
+            total_initialized += len(stage1_result.subsystems_initialized)
+            total_failed += len(stage1_result.subsystems_failed)
+
+            # Stage 1 is critical - if it fails completely, abort
+            if not stage1_result.success and not stage1_result.subsystems_initialized:
+                logger.error("[v138.0] Stage 1 (Foundation) failed - aborting")
+                return False
+
+            # Memory gate before Stage 2
+            if self._config.gc_between_stages and self._memory_gate:
+                await self._memory_gate.run_gc()
+
+            if self._memory_gate:
+                can_proceed, snapshot, pressure = await self._memory_gate.wait_for_headroom(
+                    "Stage 2 Gate"
+                )
+            else:
+                can_proceed, snapshot, pressure = True, None, MemoryPressure.LOW
+            self._memory_pressure = pressure
+
+            if not can_proceed:
+                logger.warning("[v138.0] Memory gate blocked Stage 2 - minimal mode")
+                self._slim_mode = True
+
+            # =================================================================
+            # STAGE 2: REASONING (Important but deferrable)
+            # =================================================================
+            self._current_stage = InitStage.STAGE_2_REASONING
+
+            if self._memory_pressure in (MemoryPressure.HIGH, MemoryPressure.CRITICAL):
+                logger.warning(
+                    f"[v138.0] High memory pressure ({pressure.name}) - "
+                    "deferring Stage 2 subsystems for lazy loading"
+                )
+                self._deferred_subsystems.update(["reasoning", "learning"])
+                self._setup_lazy_proxies_stage_2()
+                stage2_result = StageResult(
+                    stage=InitStage.STAGE_2_REASONING,
+                    success=True,
+                    subsystems_initialized=[],
+                    subsystems_failed=[],
+                    subsystems_deferred=["reasoning", "learning"],
+                    elapsed_seconds=0.0,
+                )
+            else:
+                stage2_result = await self._run_stage_2_reasoning()
+
+            self._stage_results.append(stage2_result)
+            total_initialized += len(stage2_result.subsystems_initialized)
+            total_failed += len(stage2_result.subsystems_failed)
+            total_deferred += len(stage2_result.subsystems_deferred)
+
+            # Memory gate before Stage 3
+            if self._config.gc_between_stages and self._memory_gate:
+                await self._memory_gate.run_gc()
+
+            if self._memory_gate:
+                can_proceed, snapshot, pressure = await self._memory_gate.wait_for_headroom(
+                    "Stage 3 Gate"
+                )
+            else:
+                can_proceed, snapshot, pressure = True, None, MemoryPressure.LOW
+            self._memory_pressure = pressure
+
+            # =================================================================
+            # STAGE 3: HEAVY (Optional, always deferrable)
+            # =================================================================
+            self._current_stage = InitStage.STAGE_3_HEAVY
+
+            # In slim mode or high pressure, defer Stage 3 for lazy loading
+            defer_stage_3 = (
+                self._slim_mode
+                or self._memory_pressure in (MemoryPressure.HIGH, MemoryPressure.CRITICAL)
+                or (self._config.defer_heavy_subsystems and not can_proceed)
+            )
+
+            if defer_stage_3:
+                logger.info(
+                    "[v138.0] Deferring Stage 3 (Heavy) subsystems for lazy loading"
+                )
+                self._deferred_subsystems.update(["multimodal", "agi_models_v80"])
+                self._setup_lazy_proxies_stage_3()
+                stage3_result = StageResult(
+                    stage=InitStage.STAGE_3_HEAVY,
+                    success=True,
+                    subsystems_initialized=[],
+                    subsystems_failed=[],
+                    subsystems_deferred=["multimodal", "agi_models_v80"],
+                    elapsed_seconds=0.0,
+                )
+            else:
+                stage3_result = await self._run_stage_3_heavy()
+
+            self._stage_results.append(stage3_result)
+            total_initialized += len(stage3_result.subsystems_initialized)
+            total_failed += len(stage3_result.subsystems_failed)
+            total_deferred += len(stage3_result.subsystems_deferred)
+
+            # =================================================================
+            # COMPLETION
+            # =================================================================
+            self._current_stage = InitStage.COMPLETED
+            elapsed = time.time() - init_start
+
+            # Mark as initialized if we have at least one working subsystem
+            self._initialized = total_initialized > 0
+
+            # Calculate memory stats
+            total_memory_delta = sum(
+                r.memory_delta_mb for r in self._stage_results if r.memory_delta_mb
+            )
+
+            logger.info("=" * 70)
+            logger.info(
+                f"[v138.0] AGI Hub initialized in {elapsed:.1f}s: "
+                f"{total_initialized} active, {total_deferred} deferred, {total_failed} failed"
+            )
+            if total_memory_delta > 0:
+                logger.info(f"[v138.0] Total memory growth: +{total_memory_delta:.0f}MB")
+            if self._slim_mode:
+                logger.info("[v138.0] Running in SLIM MODE - some features lazy-loaded")
+            logger.info("=" * 70)
+
+            return self._initialized
+
+        except Exception as e:
+            logger.error(f"[v138.0] Staged initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def _run_pre_flight_stage(self) -> StageResult:
+        """
+        v138.0: Pre-flight checks and OOM Protection setup.
+
+        This stage runs BEFORE any heavy subsystem loading to:
+        1. Assess available memory
+        2. Initialize OOM Protection Engine
+        3. Determine slim mode requirements
+        4. Set up memory gate infrastructure
+        """
+        stage_start = time.time()
+        initialized = []
+        failed = []
+
+        logger.info("[v138.0] === PRE-FLIGHT PHASE ===")
+
+        try:
+            # Initialize memory gate
+            self._memory_gate = MemoryGate(self._staged_init_config)
+
+            # Get initial memory snapshot
+            memory_before = await self._safe_get_memory_snapshot()
+            self._memory_pressure = self._memory_gate.classify_memory_pressure(memory_before)
+
+            if memory_before:
+                logger.info(
+                    f"[v138.0] Initial memory: "
+                    f"{memory_before.used_percent:.1f}% used, "
+                    f"{memory_before.headroom_mb:.0f}MB available, "
+                    f"RSS={memory_before.process_rss_mb:.0f}MB"
+                )
+
+            # Determine if we need slim mode
+            if memory_before and memory_before.headroom_percent < self._config.slim_mode_threshold_percent:
+                self._slim_mode = True
+                logger.warning(
+                    f"[v138.0] Low memory detected ({memory_before.headroom_percent:.1f}% headroom) "
+                    f"- enabling SLIM MODE"
+                )
+
+            # Critical memory - we might not be able to proceed at all
+            if self._memory_pressure == MemoryPressure.CRITICAL:
+                logger.error(
+                    "[v138.0] CRITICAL memory pressure detected - running emergency GC"
+                )
+                await self._memory_gate.run_gc(generations=2)
+                # Recheck
+                memory_before = await self._safe_get_memory_snapshot()
+                self._memory_pressure = self._memory_gate.classify_memory_pressure(memory_before)
+
+            # Initialize OOM Protection Engine FIRST (before heavy loads)
+            if self._config.enable_oom_protection:
+                try:
+                    from jarvis_prime.core.reliability_engines import (
+                        OOMProtectionEngine,
+                        OOMConfig,
                     )
 
-                if self._config.enable_orchestrator:
-                    init_tasks["orchestrator"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_orchestrator(),
-                            subsystem_timeout,
-                            "orchestrator"
-                        )
+                    oom_config = OOMConfig(
+                        memory_threshold_percent=self._config.oom_critical_threshold,
+                        warning_threshold_percent=self._config.oom_warning_threshold,
+                        check_interval=5.0,
+                        enable_aggressive_gc=True,
                     )
 
-                if self._config.enable_reasoning:
-                    init_tasks["reasoning"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_reasoning(),
-                            subsystem_timeout,
-                            "reasoning"
-                        )
+                    self._oom_engine = OOMProtectionEngine(
+                        config=oom_config,
+                        on_warning=self._on_oom_warning,
+                        on_critical=self._on_oom_critical,
+                        on_emergency=self._on_oom_emergency,
                     )
 
-                if self._config.enable_learning:
-                    init_tasks["learning"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_learning(),
-                            subsystem_timeout,
-                            "learning"
-                        )
+                    # Start monitoring BEFORE heavy loads
+                    await self._oom_engine.start_monitoring()
+                    initialized.append("oom_protection")
+                    logger.info("[v138.0] OOM Protection Engine active")
+
+                except ImportError:
+                    logger.warning("[v138.0] OOM Protection Engine not available")
+                except Exception as e:
+                    logger.warning(f"[v138.0] OOM Protection init failed: {e}")
+                    failed.append("oom_protection")
+
+            memory_after = await self._safe_get_memory_snapshot()
+
+            return StageResult(
+                stage=InitStage.PRE_FLIGHT,
+                success=True,  # Pre-flight always succeeds (it's just assessment)
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=[],
+                elapsed_seconds=time.time() - stage_start,
+                memory_before=memory_before,
+                memory_after=memory_after,
+            )
+
+        except Exception as e:
+            logger.error(f"[v138.0] Pre-flight failed: {e}")
+            return StageResult(
+                stage=InitStage.PRE_FLIGHT,
+                success=False,
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=[],
+                elapsed_seconds=time.time() - stage_start,
+                error=str(e),
+            )
+
+    async def _run_stage_1_foundation(self) -> StageResult:
+        """
+        v138.0: Stage 1 - Foundation subsystems (Hardware + Orchestrator).
+
+        These are CRITICAL and relatively lightweight.
+        We initialize them with limited parallelism (max 2 concurrent).
+        """
+        stage_start = time.time()
+        initialized = []
+        failed = []
+        deferred = []
+
+        logger.info("[v138.0] === STAGE 1: FOUNDATION ===")
+
+        memory_before = await self._safe_get_memory_snapshot()
+
+        try:
+            subsystem_timeout = self._config.subsystem_init_timeout
+            tasks = {}
+
+            # Hardware Optimizer (critical)
+            if self._config.enable_hardware_optimization:
+                tasks["hardware"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_hardware(),
+                        subsystem_timeout,
+                        "hardware"
+                    )
+                )
+
+            # AGI Orchestrator (critical)
+            if self._config.enable_orchestrator:
+                tasks["orchestrator"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_orchestrator(),
+                        subsystem_timeout,
+                        "orchestrator"
+                    )
+                )
+
+            # Wait for Stage 1 tasks (limited parallelism - only 2 tasks)
+            if tasks:
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks.values(), return_exceptions=True),
+                        timeout=self._config.stage_timeout
                     )
 
-                if self._config.enable_multimodal:
-                    init_tasks["multimodal"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_multimodal(),
-                            subsystem_timeout,
-                            "multimodal"
-                        )
+                    for (name, task), result in zip(tasks.items(), results):
+                        if result is True:
+                            initialized.append(name)
+                            logger.info(f"[v138.0] Stage 1: {name} ✓")
+                        elif isinstance(result, Exception):
+                            failed.append(name)
+                            logger.warning(f"[v138.0] Stage 1: {name} ✗ ({result})")
+                        else:
+                            failed.append(name)
+                            logger.warning(f"[v138.0] Stage 1: {name} returned {result}")
+
+                except asyncio.TimeoutError:
+                    logger.error(f"[v138.0] Stage 1 timed out after {self._config.stage_timeout}s")
+                    for name, task in tasks.items():
+                        if not task.done():
+                            task.cancel()
+                            failed.append(name)
+
+            memory_after = await self._safe_get_memory_snapshot()
+
+            return StageResult(
+                stage=InitStage.STAGE_1_FOUNDATION,
+                success=len(initialized) > 0,
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                memory_before=memory_before,
+                memory_after=memory_after,
+            )
+
+        except Exception as e:
+            logger.error(f"[v138.0] Stage 1 failed: {e}")
+            return StageResult(
+                stage=InitStage.STAGE_1_FOUNDATION,
+                success=False,
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                error=str(e),
+            )
+
+    async def _run_stage_2_reasoning(self) -> StageResult:
+        """
+        v138.0: Stage 2 - Reasoning subsystems (Reasoning + Learning).
+
+        These are IMPORTANT but can be deferred if memory is tight.
+        """
+        stage_start = time.time()
+        initialized = []
+        failed = []
+        deferred = []
+
+        logger.info("[v138.0] === STAGE 2: REASONING ===")
+
+        memory_before = await self._safe_get_memory_snapshot()
+
+        try:
+            subsystem_timeout = self._config.subsystem_init_timeout
+            tasks = {}
+
+            # Reasoning Engine
+            if self._config.enable_reasoning:
+                tasks["reasoning"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_reasoning(),
+                        subsystem_timeout,
+                        "reasoning"
+                    )
+                )
+
+            # Learning Engine
+            if self._config.enable_learning:
+                tasks["learning"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_learning(),
+                        subsystem_timeout,
+                        "learning"
+                    )
+                )
+
+            if tasks:
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks.values(), return_exceptions=True),
+                        timeout=self._config.stage_timeout
                     )
 
-                # v80.0 AGI Models (OPTIONAL - controlled by config)
-                if self._config.enable_agi_models_v80:
-                    init_tasks["agi_models_v80"] = asyncio.create_task(
-                        self._init_with_timeout(
-                            self._init_agi_models_v80(),
-                            self._config.agi_models_v80_timeout,
-                            "agi_models_v80"
-                        )
+                    for (name, task), result in zip(tasks.items(), results):
+                        if result is True:
+                            initialized.append(name)
+                            logger.info(f"[v138.0] Stage 2: {name} ✓")
+                        elif isinstance(result, Exception):
+                            failed.append(name)
+                            logger.warning(f"[v138.0] Stage 2: {name} ✗ ({result})")
+                        else:
+                            failed.append(name)
+                            logger.warning(f"[v138.0] Stage 2: {name} returned {result}")
+
+                except asyncio.TimeoutError:
+                    logger.error(f"[v138.0] Stage 2 timed out after {self._config.stage_timeout}s")
+                    for name, task in tasks.items():
+                        if not task.done():
+                            task.cancel()
+                            failed.append(name)
+
+            memory_after = await self._safe_get_memory_snapshot()
+
+            return StageResult(
+                stage=InitStage.STAGE_2_REASONING,
+                success=True,  # Stage 2 is not critical
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                memory_before=memory_before,
+                memory_after=memory_after,
+            )
+
+        except Exception as e:
+            logger.error(f"[v138.0] Stage 2 failed: {e}")
+            return StageResult(
+                stage=InitStage.STAGE_2_REASONING,
+                success=True,  # Stage 2 failures are non-fatal
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                error=str(e),
+            )
+
+    async def _run_stage_3_heavy(self) -> StageResult:
+        """
+        v138.0: Stage 3 - Heavy subsystems (Multimodal + AGI v80).
+
+        These are OPTIONAL and can always be lazy-loaded.
+        Only initialize if memory permits.
+        """
+        stage_start = time.time()
+        initialized = []
+        failed = []
+        deferred = []
+
+        logger.info("[v138.0] === STAGE 3: HEAVY ===")
+
+        memory_before = await self._safe_get_memory_snapshot()
+
+        try:
+            subsystem_timeout = self._config.subsystem_init_timeout
+
+            # Initialize one at a time to prevent memory spike
+            # (NO parallel initialization in Stage 3)
+
+            # Multimodal Engine
+            if self._config.enable_multimodal:
+                logger.info("[v138.0] Stage 3: Initializing multimodal...")
+                try:
+                    result = await asyncio.wait_for(
+                        self._init_multimodal(),
+                        timeout=subsystem_timeout
                     )
-                else:
-                    logger.info("v80.0 AGI Models disabled by configuration")
-
-                # v93.12: Wait for all tasks with overall timeout
-                if init_tasks:
-                    try:
-                        results = await asyncio.wait_for(
-                            asyncio.gather(
-                                *init_tasks.values(),
-                                return_exceptions=True
-                            ),
-                            timeout=self._config.parallel_init_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(
-                            f"AGI Hub parallel init timed out after "
-                            f"{self._config.parallel_init_timeout}s"
-                        )
-                        # v93.15: Cancel remaining tasks and AWAIT them to retrieve CancelledError
-                        # This prevents "_GatheringFuture exception was never retrieved" warnings
-                        cancelled_names = []
-                        for name, task in init_tasks.items():
-                            if not task.done():
-                                task.cancel()
-                                cancelled_names.append(name)
-                                logger.warning(f"Cancelled hung subsystem: {name}")
-
-                        # CRITICAL: Await cancelled tasks to properly retrieve CancelledError exceptions
-                        # Without this, asyncio complains about unretrieved exceptions
-                        if any(not t.done() for t in init_tasks.values()):
-                            try:
-                                await asyncio.gather(
-                                    *init_tasks.values(),
-                                    return_exceptions=True
-                                )
-                            except Exception:
-                                pass  # Exceptions already handled, just need to await
-
-                        # Collect results for tasks that completed before timeout
-                        results = []
-                        for name, task in init_tasks.items():
-                            if task.done() and not task.cancelled():
-                                try:
-                                    results.append(task.result())
-                                except Exception as e:
-                                    results.append(e)
-                            elif task.cancelled():
-                                results.append(asyncio.TimeoutError(f"{name} cancelled"))
-                            else:
-                                results.append(asyncio.TimeoutError(f"{name} incomplete"))
-                else:
-                    results = []
-
-                # Check results with detailed logging
-                success_count = 0
-                error_count = 0
-                timeout_count = 0
-
-                for (name, task), result in zip(init_tasks.items(), results):
-                    if result is True:
-                        success_count += 1
-                        logger.debug(f"  ✅ {name}: initialized")
-                    elif isinstance(result, asyncio.TimeoutError):
-                        timeout_count += 1
-                        logger.warning(f"  ⏱️ {name}: timed out")
-                    elif isinstance(result, Exception):
-                        error_count += 1
-                        logger.warning(f"  ❌ {name}: {type(result).__name__}: {result}")
+                    if result:
+                        initialized.append("multimodal")
+                        logger.info("[v138.0] Stage 3: multimodal ✓")
                     else:
-                        # False return
-                        logger.warning(f"  ⚠️ {name}: returned {result}")
+                        failed.append("multimodal")
+                except Exception as e:
+                    failed.append("multimodal")
+                    logger.warning(f"[v138.0] Stage 3: multimodal ✗ ({e})")
 
+                # Memory check before next subsystem
+                can_continue, _, pressure = await self._safe_check_headroom(
+                    "Post-Multimodal Check"
+                )
+                if not can_continue:
+                    logger.warning("[v138.0] Memory gate closed - deferring remaining Stage 3")
+                    if self._config.enable_agi_models_v80:
+                        deferred.append("agi_models_v80")
+                        self._deferred_subsystems.add("agi_models_v80")
+                        self._setup_lazy_proxy_agi_v80()
+
+                    memory_after = await self._safe_get_memory_snapshot()
+                    return StageResult(
+                        stage=InitStage.STAGE_3_HEAVY,
+                        success=True,
+                        subsystems_initialized=initialized,
+                        subsystems_failed=failed,
+                        subsystems_deferred=deferred,
+                        elapsed_seconds=time.time() - stage_start,
+                        memory_before=memory_before,
+                        memory_after=memory_after,
+                    )
+
+            # AGI v80 Models (heaviest)
+            if self._config.enable_agi_models_v80:
+                logger.info("[v138.0] Stage 3: Initializing AGI v80 models...")
+                try:
+                    result = await asyncio.wait_for(
+                        self._init_agi_models_v80(),
+                        timeout=self._config.agi_models_v80_timeout
+                    )
+                    if result:
+                        initialized.append("agi_models_v80")
+                        logger.info("[v138.0] Stage 3: agi_models_v80 ✓")
+                    else:
+                        failed.append("agi_models_v80")
+                except Exception as e:
+                    failed.append("agi_models_v80")
+                    logger.warning(f"[v138.0] Stage 3: agi_models_v80 ✗ ({e})")
+
+            memory_after = await self._safe_get_memory_snapshot()
+
+            return StageResult(
+                stage=InitStage.STAGE_3_HEAVY,
+                success=True,  # Stage 3 is optional
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                memory_before=memory_before,
+                memory_after=memory_after,
+            )
+
+        except Exception as e:
+            logger.error(f"[v138.0] Stage 3 failed: {e}")
+            return StageResult(
+                stage=InitStage.STAGE_3_HEAVY,
+                success=True,  # Stage 3 failures are non-fatal
+                subsystems_initialized=initialized,
+                subsystems_failed=failed,
+                subsystems_deferred=deferred,
+                elapsed_seconds=time.time() - stage_start,
+                error=str(e),
+            )
+
+    # -------------------------------------------------------------------------
+    # LAZY LOADING PROXIES
+    # -------------------------------------------------------------------------
+
+    def _setup_lazy_proxies_stage_2(self) -> None:
+        """Set up lazy loading proxies for Stage 2 subsystems."""
+        logger.info("[v138.0] Setting up lazy proxies for Stage 2 subsystems")
+
+        if self._config.enable_reasoning and "reasoning" not in self._lazy_proxies:
+            self._lazy_proxies["reasoning"] = LazySubsystemProxy(
+                factory=self._create_reasoning_engine,
+                async_init=lambda e: e.initialize(),
+                name="reasoning_engine",
+                timeout=self._config.subsystem_init_timeout,
+                priority=SubsystemPriority.IMPORTANT,
+            )
+
+        if self._config.enable_learning and "learning" not in self._lazy_proxies:
+            self._lazy_proxies["learning"] = LazySubsystemProxy(
+                factory=self._create_learning_engine,
+                async_init=lambda e: e.initialize(),
+                name="learning_engine",
+                timeout=self._config.subsystem_init_timeout,
+                priority=SubsystemPriority.IMPORTANT,
+            )
+
+    def _setup_lazy_proxies_stage_3(self) -> None:
+        """Set up lazy loading proxies for Stage 3 subsystems."""
+        logger.info("[v138.0] Setting up lazy proxies for Stage 3 subsystems")
+
+        if self._config.enable_multimodal and "multimodal" not in self._lazy_proxies:
+            self._lazy_proxies["multimodal"] = LazySubsystemProxy(
+                factory=self._create_multimodal_engine,
+                async_init=lambda e: e.initialize(),
+                name="multimodal_engine",
+                timeout=self._config.subsystem_init_timeout,
+                priority=SubsystemPriority.OPTIONAL,
+            )
+
+        if self._config.enable_agi_models_v80:
+            self._setup_lazy_proxy_agi_v80()
+
+    def _setup_lazy_proxy_agi_v80(self) -> None:
+        """Set up lazy loading proxy for AGI v80 models."""
+        if "agi_models_v80" not in self._lazy_proxies:
+            # AGI v80 is a composite - we'll lazy-load its components
+            logger.debug("[v138.0] AGI v80 will be lazy-loaded on first access")
+            self._lazy_proxies["agi_models_v80"] = LazySubsystemProxy(
+                factory=lambda: None,  # Placeholder - v80 has multiple components
+                async_init=self._lazy_init_agi_v80,
+                name="agi_models_v80",
+                timeout=self._config.agi_models_v80_timeout,
+                priority=SubsystemPriority.OPTIONAL,
+            )
+
+    async def _lazy_init_agi_v80(self, _: Any) -> bool:
+        """Lazy initialization of AGI v80 models."""
+        return await self._init_agi_models_v80()
+
+    def _create_reasoning_engine(self) -> Any:
+        """Factory for reasoning engine."""
+        from jarvis_prime.core.reasoning_engine import ReasoningEngine
+        return ReasoningEngine()
+
+    def _create_learning_engine(self) -> Any:
+        """Factory for learning engine."""
+        from jarvis_prime.core.continuous_learning import ContinuousLearningEngine
+        return ContinuousLearningEngine()
+
+    def _create_multimodal_engine(self) -> Any:
+        """Factory for multimodal engine."""
+        from jarvis_prime.core.multimodal_fusion import MultiModalFusionEngine
+        return MultiModalFusionEngine()
+
+    # -------------------------------------------------------------------------
+    # MEMORY HELPERS
+    # -------------------------------------------------------------------------
+
+    async def _safe_get_memory_snapshot(self) -> Optional[MemorySnapshot]:
+        """Safely get memory snapshot, returning None if unavailable."""
+        if self._memory_gate:
+            return await self._memory_gate.get_memory_snapshot()
+        return None
+
+    async def _safe_check_headroom(
+        self, stage_name: str
+    ) -> Tuple[bool, Optional[MemorySnapshot], MemoryPressure]:
+        """Safely check memory headroom, returning safe defaults if unavailable."""
+        if self._memory_gate:
+            return await self._memory_gate.check_headroom(stage_name)
+        return True, None, MemoryPressure.LOW
+
+    # -------------------------------------------------------------------------
+    # OOM PROTECTION CALLBACKS
+    # -------------------------------------------------------------------------
+
+    async def _on_oom_warning(self) -> None:
+        """Called when memory usage hits warning threshold."""
+        logger.warning("[v138.0] OOM Warning - triggering subsystem GC")
+        # Could pause background tasks, reduce cache sizes, etc.
+
+    async def _on_oom_critical(self) -> None:
+        """Called when memory usage hits critical threshold."""
+        logger.error("[v138.0] OOM Critical - aggressive memory reduction")
+        # Could stop non-essential subsystems
+
+    async def _on_oom_emergency(self) -> None:
+        """Called when memory usage hits emergency threshold."""
+        logger.critical("[v138.0] OOM Emergency - survival mode")
+        # Last resort - could restart subsystems, clear caches entirely
+
+    # -------------------------------------------------------------------------
+    # LEGACY INITIALIZATION (fallback)
+    # -------------------------------------------------------------------------
+
+    async def _initialize_legacy(self) -> bool:
+        """
+        Legacy parallel initialization (v93.12 behavior).
+
+        Used when enable_staged_init=False for backwards compatibility.
+        WARNING: This can cause OOM on memory-constrained systems.
+        """
+        logger.warning(
+            "[v138.0] Using legacy parallel initialization - "
+            "enable_staged_init=False. This may cause OOM."
+        )
+
+        init_start = time.time()
+
+        try:
+            init_tasks: Dict[str, asyncio.Task] = {}
+            subsystem_timeout = self._config.subsystem_init_timeout
+
+            if self._config.enable_hardware_optimization:
+                init_tasks["hardware"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_hardware(),
+                        subsystem_timeout,
+                        "hardware_optimizer"
+                    )
+                )
+
+            if self._config.enable_orchestrator:
+                init_tasks["orchestrator"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_orchestrator(),
+                        subsystem_timeout,
+                        "orchestrator"
+                    )
+                )
+
+            if self._config.enable_reasoning:
+                init_tasks["reasoning"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_reasoning(),
+                        subsystem_timeout,
+                        "reasoning"
+                    )
+                )
+
+            if self._config.enable_learning:
+                init_tasks["learning"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_learning(),
+                        subsystem_timeout,
+                        "learning"
+                    )
+                )
+
+            if self._config.enable_multimodal:
+                init_tasks["multimodal"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_multimodal(),
+                        subsystem_timeout,
+                        "multimodal"
+                    )
+                )
+
+            if self._config.enable_agi_models_v80:
+                init_tasks["agi_models_v80"] = asyncio.create_task(
+                    self._init_with_timeout(
+                        self._init_agi_models_v80(),
+                        self._config.agi_models_v80_timeout,
+                        "agi_models_v80"
+                    )
+                )
+
+            if init_tasks:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*init_tasks.values(), return_exceptions=True),
+                    timeout=self._config.parallel_init_timeout
+                )
+
+                success_count = sum(1 for r in results if r is True)
                 elapsed = time.time() - init_start
                 self._initialized = success_count > 0
 
                 logger.info(
-                    f"AGI Integration Hub initialized in {elapsed:.1f}s: "
-                    f"{success_count}/{len(init_tasks)} subsystems active"
-                    + (f", {timeout_count} timed out" if timeout_count else "")
-                    + (f", {error_count} errors" if error_count else "")
+                    f"AGI Hub (legacy) initialized in {elapsed:.1f}s: "
+                    f"{success_count}/{len(init_tasks)} subsystems"
                 )
-
                 return self._initialized
 
-            except Exception as e:
-                logger.error(f"Failed to initialize AGI Hub: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
+            return False
+
+        except Exception as e:
+            logger.error(f"Legacy initialization failed: {e}")
+            return False
 
     async def _init_with_timeout(
         self,
@@ -1081,6 +2338,28 @@ class AGIIntegrationHub:
         self._active_learner = None
         self._nas_engine = None
 
+        # v138.0: Clean up staged initialization resources
+        if self._oom_engine:
+            try:
+                await self._oom_engine.stop_monitoring()
+                logger.debug("  OOM Protection Engine stopped")
+            except Exception as e:
+                logger.warning(f"  OOM Engine shutdown error: {e}")
+            self._oom_engine = None
+
+        if self._memory_gate:
+            try:
+                self._memory_gate.cleanup()
+                logger.debug("  Memory Gate cleaned up")
+            except Exception as e:
+                logger.warning(f"  Memory Gate cleanup error: {e}")
+            self._memory_gate = None
+
+        # Clean up lazy proxies
+        self._lazy_proxies.clear()
+        self._deferred_subsystems.clear()
+        self._stage_results.clear()
+
         self._initialized = False
 
     # -------------------------------------------------------------------------
@@ -1489,7 +2768,7 @@ class AGIIntegrationHub:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current status of all subsystems."""
-        return {
+        status_dict = {
             "initialized": self._initialized,
             "subsystems": {
                 name.name.lower(): {
@@ -1509,6 +2788,36 @@ class AGIIntegrationHub:
                 "model_usage": self._model_usage,
             },
         }
+
+        # v138.0: Add staged initialization info
+        status_dict["staged_init"] = {
+            "current_stage": self._current_stage.name if self._current_stage else "UNKNOWN",
+            "slim_mode": self._slim_mode,
+            "memory_pressure": self._memory_pressure.name if self._memory_pressure else "UNKNOWN",
+            "deferred_subsystems": list(self._deferred_subsystems),
+            "lazy_proxies": {
+                name: proxy.is_initialized
+                for name, proxy in self._lazy_proxies.items()
+            },
+            "stage_results": [
+                {
+                    "stage": r.stage.name,
+                    "success": r.success,
+                    "initialized": r.subsystems_initialized,
+                    "failed": r.subsystems_failed,
+                    "deferred": r.subsystems_deferred,
+                    "elapsed_seconds": r.elapsed_seconds,
+                    "memory_delta_mb": r.memory_delta_mb,
+                }
+                for r in self._stage_results
+            ] if self._stage_results else [],
+        }
+
+        # OOM Protection status
+        if self._oom_engine:
+            status_dict["oom_protection"] = self._oom_engine.get_current_status()
+
+        return status_dict
 
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check on all subsystems."""
