@@ -33,11 +33,20 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 # =============================================================================
 # v149.0: HOLLOW CLIENT GUARD - MUST BE BEFORE ANY ML IMPORTS
+# v150.0: Import is_hollow_client_active for model loading skip check
 # =============================================================================
+_hollow_installed = False
+_hollow_reason = "Not installed"
+_is_hollow_client_active = lambda: False  # Default: not active
+
 try:
-    from jarvis_prime.core.hollow_client_guard import install_hollow_guard
+    from jarvis_prime.core.hollow_client_guard import (
+        install_hollow_guard,
+        is_hollow_client_active as _is_hollow_check,
+    )
     _hollow_installed, _hollow_reason = install_hollow_guard()
-except (ImportError, Exception):
+    _is_hollow_client_active = _is_hollow_check
+except (ImportError, Exception) as e:
     pass  # Guard not available
 
 import warnings
@@ -728,7 +737,21 @@ async def main():
                 status["trinity_enabled"] = _trinity_initialized
                 status["agi_enabled"] = _agi_hub is not None
                 status["neural_routing_enabled"] = _neural_routing_enabled
-                status["ready_for_inference"] = _executor is not None and _executor.is_loaded() if hasattr(_executor, 'is_loaded') else False
+
+                # v150.0: Check hollow client mode for inference readiness
+                hollow_client_active = _is_hollow_client_active()
+                status["hollow_client_mode"] = hollow_client_active
+
+                if hollow_client_active:
+                    # In hollow client mode, we're ready if GCP endpoint is configured
+                    gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", os.environ.get("JARVIS_GCP_PRIME_ENDPOINT"))
+                    status["ready_for_inference"] = bool(gcp_endpoint)
+                    status["inference_mode"] = "cloud_routing"
+                    status["gcp_endpoint"] = gcp_endpoint
+                else:
+                    # Normal mode - check local executor
+                    status["ready_for_inference"] = _executor is not None and _executor.is_loaded() if hasattr(_executor, 'is_loaded') else False
+                    status["inference_mode"] = "local"
 
             return status
 
@@ -755,7 +778,13 @@ async def main():
         temperature: float = 0.7
 
     def _check_ready():
-        """Check if server is ready for inference requests."""
+        """
+        Check if server is ready for inference requests.
+
+        v150.0: Updated to recognize Hollow Client mode as a valid ready state.
+        When hollow client is active, local model is not loaded, but requests
+        should be routed to GCP instead of returning 503.
+        """
         if _startup_state and _startup_state.phase != "ready":
             raise HTTPException(
                 status_code=503,
@@ -765,6 +794,17 @@ async def main():
                     "status": _startup_state.get_status() if _startup_state else {}
                 }
             )
+
+        # v150.0: Check if hollow client mode is active
+        # In hollow client mode, we don't have a local model but can route to cloud
+        hollow_client_active = _is_hollow_client_active()
+
+        if hollow_client_active:
+            # Hollow client mode - requests will be routed to GCP
+            # Don't require local executor or model to be loaded
+            return  # Ready for cloud routing
+
+        # Normal mode - require local executor and model
         if _executor is None:
             raise HTTPException(
                 status_code=503,
@@ -776,10 +816,177 @@ async def main():
                 detail={"error": "Model not loaded"}
             )
 
+    # =========================================================================
+    # v150.0: GCP CLOUD ROUTING FOR HOLLOW CLIENT MODE
+    # =========================================================================
+    async def _route_to_gcp_chat_completions(request: ChatRequest):
+        """
+        v150.0: Route chat completion request to GCP when hollow client is active.
+
+        When JARVIS Prime runs in hollow client mode (SLIM hardware with GCP offload),
+        this function proxies requests to the GCP VM running the full inference engine.
+        """
+        import aiohttp
+        import json
+
+        gcp_endpoint = os.environ.get(
+            "GCP_PRIME_ENDPOINT",
+            os.environ.get("JARVIS_GCP_PRIME_ENDPOINT")
+        )
+
+        if not gcp_endpoint:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Hollow client mode active but no GCP endpoint configured",
+                    "hint": "Set GCP_PRIME_ENDPOINT or JARVIS_GCP_PRIME_ENDPOINT environment variable"
+                }
+            )
+
+        # Build request payload matching OpenAI format
+        payload = {
+            "model": request.model,
+            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "stream": request.stream,
+        }
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        created = int(time.time())
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                url = f"{gcp_endpoint.rstrip('/')}/v1/chat/completions"
+                logger.info(f"[v150.0] Routing to GCP: {url}")
+
+                if request.stream:
+                    # Streaming response - proxy SSE events
+                    from fastapi.responses import StreamingResponse
+
+                    async def stream_from_gcp():
+                        async with session.post(url, json=payload) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                yield f"data: {json.dumps({'error': error_text})}\n\n"
+                                return
+
+                            async for line in response.content:
+                                decoded = line.decode('utf-8', errors='ignore')
+                                if decoded.strip():
+                                    yield decoded
+
+                    return StreamingResponse(
+                        stream_from_gcp(),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-JARVIS-Routing": "gcp-hollow-client",
+                        }
+                    )
+                else:
+                    # Non-streaming - proxy full response
+                    async with session.post(url, json=payload) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise HTTPException(
+                                status_code=response.status,
+                                detail={"error": f"GCP request failed: {error_text}"}
+                            )
+
+                        result = await response.json()
+
+                        # Add routing metadata
+                        if "choices" in result:
+                            result["x_jarvis_routing"] = {
+                                "mode": "hollow_client",
+                                "endpoint": gcp_endpoint,
+                                "routed_at": datetime.now().isoformat(),
+                            }
+
+                        return result
+
+        except aiohttp.ClientError as e:
+            logger.error(f"[v150.0] GCP routing failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": f"GCP endpoint unreachable: {e}",
+                    "endpoint": gcp_endpoint,
+                    "mode": "hollow_client"
+                }
+            )
+        except Exception as e:
+            logger.error(f"[v150.0] Unexpected error in GCP routing: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail={"error": f"Internal error routing to GCP: {e}"}
+            )
+
+    async def _route_to_gcp_generate(request: GenerateRequest):
+        """
+        v150.0: Route generate request to GCP when hollow client is active.
+        """
+        import aiohttp
+
+        gcp_endpoint = os.environ.get(
+            "GCP_PRIME_ENDPOINT",
+            os.environ.get("JARVIS_GCP_PRIME_ENDPOINT")
+        )
+
+        if not gcp_endpoint:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Hollow client mode active but no GCP endpoint configured",
+                    "hint": "Set GCP_PRIME_ENDPOINT environment variable"
+                }
+            )
+
+        payload = {
+            "prompt": request.prompt,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                url = f"{gcp_endpoint.rstrip('/')}/generate"
+                logger.info(f"[v150.0] Routing generate to GCP: {url}")
+
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail={"error": f"GCP request failed: {error_text}"}
+                        )
+
+                    result = await response.json()
+                    result["x_jarvis_routing"] = {
+                        "mode": "hollow_client",
+                        "endpoint": gcp_endpoint,
+                    }
+                    return result
+
+        except aiohttp.ClientError as e:
+            logger.error(f"[v150.0] GCP generate routing failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail={"error": f"GCP endpoint unreachable: {e}"}
+            )
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         """OpenAI-compatible chat completions with unified intelligent routing (v100.0)."""
         _check_ready()
+
+        # v150.0: Route to GCP when hollow client mode is active
+        if _is_hollow_client_active():
+            return await _route_to_gcp_chat_completions(request)
 
         # Format messages
         from jarvis_prime.core.model_manager import ChatMessage
@@ -946,6 +1153,10 @@ async def main():
     async def generate(request: GenerateRequest):
         """Simple text generation with unified intelligent routing (v100.0)."""
         _check_ready()
+
+        # v150.0: Route to GCP when hollow client mode is active
+        if _is_hollow_client_active():
+            return await _route_to_gcp_generate(request)
 
         generate_id = f"gen-{uuid.uuid4().hex[:8]}"
         routing_result = None
@@ -1891,15 +2102,41 @@ async def main():
 
             # -----------------------------------------------------------------
             # STEP 8: Load model (v93.7: with timeout and progress reporting)
+            # v150.0: HOLLOW CLIENT CHECK - Skip local model loading entirely
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("loading_model", 8)
             _startup_state.model_load_start = time.time()
 
-            # v93.7: Configurable model loading timeout
-            model_load_timeout = float(os.environ.get("MODEL_LOAD_TIMEOUT", "600.0"))  # 10 min default
+            # v150.0: CRITICAL FIX - Check hollow client mode BEFORE model loading
+            # When hollow client is active, local ML is blocked and all inference
+            # is routed to GCP. Attempting to load the model would trigger
+            # CloudOffloadRequired, but by then memory has already been allocated.
+            # This check prevents OOM by skipping model loading entirely.
+            if _is_hollow_client_active():
+                logger.info("")
+                logger.info("=" * 70)
+                logger.info("☁️  v150.0: HOLLOW CLIENT MODE ACTIVE - SKIPPING LOCAL MODEL")
+                logger.info("=" * 70)
+                logger.info("   Local ML inference is blocked in Hollow Client mode.")
+                logger.info("   All inference requests will be routed to:")
+                gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", os.environ.get("JARVIS_GCP_PRIME_ENDPOINT", "GCP Cloud"))
+                logger.info(f"   → {gcp_endpoint}")
+                logger.info("")
+                logger.info("   This prevents OOM on SLIM hardware (<32GB RAM).")
+                logger.info("   The server will operate as a routing proxy to cloud inference.")
+                logger.info("=" * 70)
+                logger.info("")
 
-            if model_path.exists():
+                _startup_state.model_loaded = False
+                _startup_state.model_path = None
+                _startup_state.details["hollow_client_mode"] = True
+                _startup_state.details["gcp_endpoint"] = gcp_endpoint
+                _startup_state.details["skip_reason"] = "Hollow Client mode - routing to cloud"
+                log_step_complete("Model loading (SKIPPED - Hollow Client)", time.time() - step_start)
+
+                # Skip to Step 9 - don't attempt local model loading
+            elif model_path.exists():
                 model_size_mb = model_path.stat().st_size / (1024 * 1024)
                 logger.info(f"[Background] Loading model: {model_path} ({model_size_mb:.1f}MB)")
                 logger.info(f"[Background] Model load timeout: {model_load_timeout}s")
