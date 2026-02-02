@@ -1305,20 +1305,64 @@ async def main():
         async def background_initialization():
             """
             v93.1: Run all heavy initialization in background.
+            v192.0: Added hollow client mode support for slim hardware.
 
             This includes:
             - Heavy ML library imports (torch, scikit-learn, etc.)
             - Hardware detection
             - Model manager creation
-            - Model loading
+            - Model loading (SKIPPED in hollow client mode)
             - Trinity integration
             - Heartbeat writer
+
+            Hollow Client Mode (v192.0):
+            - Activated by JARVIS_SKIP_LOCAL_MODEL_LOAD=true
+            - Skips model loading entirely to prevent OOM on slim hardware
+            - Server starts healthy but with model_loaded=false
+            - Inference requests will be routed to GCP by JARVIS Body
             """
             nonlocal _completion_routes_ready
+            global _trinity_integration  # v192.0: Declare early for hollow client mode
 
             try:
                 _startup_state.phase = "initializing"
                 init_start = time.time()
+
+                # v192.0: Check for hollow client mode
+                skip_local_model = os.environ.get("JARVIS_SKIP_LOCAL_MODEL_LOAD", "").lower() in ("true", "1", "yes", "on")
+                hollow_client_mode = os.environ.get("JARVIS_HOLLOW_CLIENT_MODE", "").lower() in ("true", "1", "yes", "on")
+                gcp_endpoint = os.environ.get("GCP_PRIME_ENDPOINT", "") or os.environ.get("JARVIS_GCP_PRIME_ENDPOINT", "")
+
+                if skip_local_model or hollow_client_mode:
+                    logger.info("=" * 70)
+                    logger.info("[v192.0] 🔌 HOLLOW CLIENT MODE ACTIVATED")
+                    logger.info("=" * 70)
+                    logger.info(f"[v192.0] JARVIS_SKIP_LOCAL_MODEL_LOAD={skip_local_model}")
+                    logger.info(f"[v192.0] JARVIS_HOLLOW_CLIENT_MODE={hollow_client_mode}")
+                    if gcp_endpoint:
+                        logger.info(f"[v192.0] GCP_PRIME_ENDPOINT={gcp_endpoint}")
+                        logger.info("[v192.0] Inference will be routed to GCP VM")
+                    else:
+                        logger.info("[v192.0] No GCP endpoint - inference requests will fail")
+                        logger.info("[v192.0] Waiting for GCP VM to become available...")
+                    logger.info("=" * 70)
+
+                    # Skip heavy model loading - just set up minimal server
+                    _startup_state.phase = "ready"
+                    _startup_state.init_elapsed = time.time() - init_start
+
+                    # Initialize Trinity (without loaded model)
+                    # Note: _trinity_integration is declared global later in the function
+                    _trinity_integration = TrinityIntegration()
+                    await _trinity_integration.initialize(
+                        port=args.port,
+                        model_path="",  # No local model
+                        model_loaded=False,  # Explicitly mark as no model
+                    )
+
+                    logger.info(f"[v192.0] Hollow client ready in {_startup_state.init_elapsed:.1f}s")
+                    logger.info("[v192.0] Health endpoint: http://127.0.0.1:{args.port}/health")
+                    return  # Exit early - no model loading needed
 
                 logger.info("[Background] Starting heavy initialization...")
 
@@ -1404,7 +1448,7 @@ async def main():
                     logger.info(f"[Background] Model loaded ({_startup_state.model_load_elapsed:.1f}s)")
 
                 # Initialize Trinity
-                global _trinity_integration
+                # Note: global _trinity_integration is declared at function start (v192.0)
                 _trinity_integration = TrinityIntegration()
                 trinity_model_path = str(model_path) if model_path else ""
                 await _trinity_integration.initialize(
