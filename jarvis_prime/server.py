@@ -1016,7 +1016,8 @@ def parse_args():
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
+        # v192.2: Changed from 8000 to 8001 to avoid conflict with jarvis-body/unified_supervisor
+        default=int(os.getenv("JARVIS_PRIME_PORT", "8001")),
         help="Port to listen on",
     )
 
