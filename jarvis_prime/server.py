@@ -1781,11 +1781,45 @@ async def main():
         await server.serve()
 
     except ImportError as e:
+        # v197.1: Enhanced error handling with auto-installation attempt
         logger.error(f"Missing dependency: {e}")
         logger.error("Install with: pip install fastapi uvicorn llama-cpp-python")
+        
+        # v197.1: Attempt to identify and install the specific missing package
+        missing_pkg = str(e).split("'")[1] if "'" in str(e) else None
+        if missing_pkg:
+            logger.info(f"[v197.1] Attempting to install missing package: {missing_pkg}")
+            try:
+                import subprocess
+                # Map common module names to pip package names
+                pkg_map = {
+                    "fastapi": "fastapi",
+                    "uvicorn": "uvicorn",
+                    "pydantic": "pydantic",
+                    "llama_cpp": "llama-cpp-python",
+                    "aiohttp": "aiohttp",
+                    "httpx": "httpx",
+                }
+                pip_pkg = pkg_map.get(missing_pkg, missing_pkg)
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet", pip_pkg],
+                    capture_output=True,
+                    text=True,
+                    timeout=180  # llama-cpp-python can take a while to compile
+                )
+                if result.returncode == 0:
+                    logger.info(f"[v197.1] ✅ Installed {pip_pkg}. Please restart the server.")
+                else:
+                    logger.error(f"[v197.1] ❌ Failed to install {pip_pkg}: {result.stderr[:200]}")
+            except Exception as install_err:
+                logger.error(f"[v197.1] ❌ Auto-install failed: {install_err}")
+        
+        logger.error("[v197.1] CRITICAL: Cannot start due to missing dependencies.")
         sys.exit(1)
     except Exception as e:
         logger.error(f"Server error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
 

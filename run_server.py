@@ -684,6 +684,8 @@ async def main():
     # =========================================================================
     # STEP 1: Import FastAPI (lightweight, instant)
     # =========================================================================
+    # v197.1: RESILIENT DEPENDENCY LOADING - Auto-install or graceful degradation
+    # =========================================================================
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.middleware.cors import CORSMiddleware
@@ -693,7 +695,34 @@ async def main():
     except ImportError as e:
         logger.error(f"Missing dependencies: {e}")
         logger.error("Install with: pip install fastapi uvicorn pydantic")
-        sys.exit(1)
+        
+        # v197.1: Attempt auto-installation before giving up
+        logger.info("[v197.1] Attempting auto-installation of missing dependencies...")
+        try:
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "fastapi", "uvicorn", "pydantic"],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            if result.returncode == 0:
+                logger.info("[v197.1] ✅ Auto-installation successful! Retrying import...")
+                # Retry the imports
+                from fastapi import FastAPI, HTTPException
+                from fastapi.middleware.cors import CORSMiddleware
+                from fastapi.responses import StreamingResponse
+                from pydantic import BaseModel
+                import uvicorn
+                logger.info("[v197.1] ✅ Dependencies loaded successfully after auto-install")
+            else:
+                logger.error(f"[v197.1] ❌ Auto-installation failed: {result.stderr}")
+                logger.error("[v197.1] CRITICAL: Cannot start without FastAPI. Please install manually.")
+                sys.exit(1)
+        except Exception as install_error:
+            logger.error(f"[v197.1] ❌ Auto-installation error: {install_error}")
+            logger.error("[v197.1] CRITICAL: Cannot start without FastAPI. Please install manually.")
+            sys.exit(1)
 
     # =========================================================================
     # STEP 2: Create MINIMAL FastAPI app that responds to health IMMEDIATELY
