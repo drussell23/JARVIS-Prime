@@ -653,6 +653,67 @@ _model_path: Optional[Path] = None
 _args = None
 
 
+def _check_port_available(host: str, port: int) -> tuple[bool, str]:
+    """
+    v198.0: Pre-startup port availability check.
+
+    This is a defense-in-depth measure that provides a clear error message
+    BEFORE uvicorn attempts to bind, rather than letting it fail with
+    a cryptic "Address already in use" error.
+
+    Uses two-phase check:
+    1. Connect test - detects if something is actively listening
+    2. Bind test - confirms we can actually bind
+
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    import socket
+
+    bind_host = '127.0.0.1' if host == '0.0.0.0' else host
+
+    # Phase 1: Check if anything is already listening
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            result = sock.connect_ex((bind_host, port))
+            if result == 0:
+                # Connection succeeded = something is listening
+                pass  # Fall through to get PID info
+            else:
+                # No listener, verify we can bind
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bind_sock:
+                        bind_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        bind_sock.settimeout(1.0)
+                        bind_sock.bind((bind_host, port))
+                        return True, ""
+                except OSError as bind_err:
+                    pass  # Fall through to error reporting
+    except Exception:
+        pass
+
+    # Port is in use - gather diagnostic info
+    # Try to identify what's using the port
+    pid_info = ""
+    try:
+        import psutil
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == port:
+                try:
+                    proc = psutil.Process(conn.pid)
+                    pid_info = f" (PID {conn.pid}: {proc.name()})"
+                except Exception:
+                    pid_info = f" (PID {conn.pid})"
+                break
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    return False, f"Port {port} is already in use{pid_info}"
+
+
 async def main():
     """
     v93.2: Main entry point with IMMEDIATE HTTP server startup.
@@ -663,11 +724,12 @@ async def main():
 
     Startup sequence:
     1. Parse args (instant)
-    2. Create minimal FastAPI app with health endpoint (instant)
-    3. Start uvicorn server (instant - server is now LISTENING)
-    4. FastAPI startup event triggers background_initialization()
-    5. Heavy imports, model loading, bridges all run in background
-    6. Health endpoint reports "starting" -> "ready" as init completes
+    2. v198.0: Pre-check port availability (instant)
+    3. Create minimal FastAPI app with health endpoint (instant)
+    4. Start uvicorn server (instant - server is now LISTENING)
+    5. FastAPI startup event triggers background_initialization()
+    6. Heavy imports, model loading, bridges all run in background
+    7. Health endpoint reports "starting" -> "ready" as init completes
     """
     global _startup_state, _args
 
@@ -675,6 +737,24 @@ async def main():
 
     if _args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # =========================================================================
+    # v198.0: PRE-STARTUP PORT AVAILABILITY CHECK
+    # =========================================================================
+    # Check port BEFORE any heavy initialization to fail fast with clear error
+    port_available, port_error = _check_port_available(_args.host, _args.port)
+    if not port_available:
+        logger.error("=" * 70)
+        logger.error("🔴 PORT CONFLICT DETECTED")
+        logger.error("=" * 70)
+        logger.error(f"   {port_error}")
+        logger.error("")
+        logger.error("   Possible solutions:")
+        logger.error(f"   1. Kill the process using port {_args.port}")
+        logger.error(f"   2. Use a different port: --port {_args.port + 1}")
+        logger.error("   3. Run 'lsof -i :{port}' to see what's using it")
+        logger.error("=" * 70)
+        sys.exit(1)
 
     # Initialize startup state FIRST
     _startup_state = StartupState()
