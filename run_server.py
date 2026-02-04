@@ -2217,6 +2217,10 @@ async def main():
             log_step("loading_model", 8)
             _startup_state.model_load_start = time.time()
 
+            # v150.1: Define model load timeout (was missing, causing NameError)
+            # Default: 600s (10 min) for large models, configurable via env var
+            model_load_timeout = float(os.getenv("JARVIS_MODEL_LOAD_TIMEOUT", "600.0"))
+
             # v150.0: CRITICAL FIX - Check hollow client mode BEFORE model loading
             # When hollow client is active, local ML is blocked and all inference
             # is routed to GCP. Attempting to load the model would trigger
