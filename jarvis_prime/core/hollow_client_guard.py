@@ -108,11 +108,26 @@ class HollowGuardConfig:
             total_ram_gb = 16.0  # Conservative default
         
         # Determine profile
-        if profile_name == "CLOUD_ONLY" or total_ram_gb < 16 or force_hollow:
-            profile = HollowProfile.CLOUD_ONLY
-        elif profile_name == "SLIM" or slim_mode or total_ram_gb < 32:
+        # v150.0: Environment override takes PRIORITY over RAM detection
+        # This allows users to force local ML on SLIM hardware (e.g., TinyLlama on 16GB)
+        if profile_name == "UNLIMITED":
+            # Explicit UNLIMITED override - allow everything
+            profile = HollowProfile.UNLIMITED
+        elif profile_name == "FULL":
+            # Explicit FULL override - allow most ML locally
+            profile = HollowProfile.FULL
+        elif profile_name == "SLIM":
+            # Explicit SLIM - block heavy ML
             profile = HollowProfile.SLIM
-        elif profile_name == "FULL" or total_ram_gb < 64:
+        elif profile_name == "CLOUD_ONLY" or force_hollow:
+            # Explicit CLOUD_ONLY or forced - block all ML
+            profile = HollowProfile.CLOUD_ONLY
+        # RAM-based auto-detection (only when no explicit profile set)
+        elif total_ram_gb < 16:
+            profile = HollowProfile.CLOUD_ONLY
+        elif slim_mode or total_ram_gb < 32:
+            profile = HollowProfile.SLIM
+        elif total_ram_gb < 64:
             profile = HollowProfile.FULL
         else:
             profile = HollowProfile.UNLIMITED
