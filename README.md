@@ -1,21 +1,24 @@
 # JARVIS Prime
 
-**Enterprise-Grade AGI Operating System with Neural Orchestrator Core**
+**The Mind of the AGI OS — LLM inference, Neural Orchestrator Core, and cross-repo coordination**
 
-🚀 v100.0 - Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration
+🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation
 
-JARVIS Prime is a **production-ready, enterprise-grade AGI operating system** that seamlessly connects JARVIS (Body/Action Execution) to JARVIS-Prime (Mind/Cognitive Processing) through the **Neural Orchestrator Core v100.0** - a unified, intelligent routing system that consolidates all routing decisions into a single source of truth. It provides hybrid cloud-local inference, advanced resilience patterns, complete AGI capabilities, and seamless cross-repository orchestration.
+JARVIS Prime is the **cognitive layer** of the JARVIS AGI ecosystem. It provides LLM inference (local and cloud), the **Neural Orchestrator Core** (unified routing), AGI models, reasoning engines, and **first-class integration** with JARVIS (Body) and Reactor-Core (Nerves). It is started either **standalone** or by the **unified supervisor** in JARVIS; during startup, model loading progress is preserved across Early Prime → Trinity handoff (v221.0).
 
 ---
 
 ## 🎯 What is JARVIS Prime?
 
-JARVIS Prime is the **complete AGI cognitive architecture** for the JARVIS ecosystem:
+JARVIS Prime is the **Mind** in the three-repo Trinity architecture:
 
-- **Body (JARVIS)**: macOS integration, computer use, action execution
-- **Mind (JARVIS-Prime)**: LLM inference, reasoning, cognitive processing
-- **Soul (Reactor-Core)**: Model training, fine-tuning, continuous improvement
-- **Neural Orchestrator Core v100.0**: Unified intelligent routing system - the single source of truth for all routing decisions
+| Role | Repository | Responsibility |
+|------|------------|----------------|
+| **Body** | [JARVIS (JARVIS-AI-Agent)](https://github.com/drussell23/JARVIS-AI-Agent) | macOS integration, computer use, unified supervisor, voice/vision |
+| **Mind** | **JARVIS-Prime (this repo)** | LLM inference, reasoning, Neural Orchestrator Core, OpenAI-compatible API |
+| **Nerves** | [Reactor-Core](https://github.com/drussell23/JARVIS-Reactor) | Model training, fine-tuning, experience collection, model deployment |
+
+**Neural Orchestrator Core v100.0** is the single source of truth for routing (Tier 0/0.5/1/2, memory pressure, sticky routing, circuit breakers). Prime exposes health and **model loading progress** (`model_load_progress_pct`, `startup_progress`, etc.) so the JARVIS unified supervisor can show accurate progress and avoid regression during handoff (v221.0).
 
 ### The Revolution: **Neural Orchestrator Core v100.0**
 
@@ -534,6 +537,38 @@ reflection_result = await engine.reason(
                   └─────────────────────┘
 ```
 
+### Cross-Repo Integration (Trinity)
+
+JARVIS-Prime is the **Mind** in the three-repo Trinity architecture. It is **started and monitored** by the JARVIS unified supervisor and **coordinates with Reactor-Core** for training data and model deployment.
+
+**How JARVIS (Body) uses Prime:**
+
+- **Discovery:** Supervisor resolves `JARVIS_PRIME_REPO_PATH` (or default `~/Documents/repos/JARVIS-Prime`).
+- **Early Prime pre-warm:** Supervisor can start Prime early so LLM loading begins in parallel; when Trinity phase starts, it **adopts** the running process and clears `JARVIS_EARLY_PRIME_PID`. The Early Prime monitor then stops with **handoff=True** so progress is **preserved** (v221.0).
+- **Health:** Supervisor polls `GET /health` and reads `model_load_progress_pct`, `startup_progress`, `loading_progress`, `phase`, `model_loaded`, `ready_for_inference`. Progress never regresses (e.g. 18% → 0%) thanks to handoff-safe state in the supervisor.
+- **State:** Prime reads/writes shared state under `~/.jarvis/` (e.g. `cross_repo/`, Neural Orchestrator state) for safety context and routing.
+
+**How Reactor-Core uses Prime:**
+
+- **Inference:** Reactor can call Prime’s OpenAI-compatible API for generation during training or evaluation.
+- **Model deployment:** Trained/updated models can be deployed to Prime (e.g. hot swap, model registry).
+- **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Prime participates in Trinity state sync.
+
+**Health endpoint contract for supervisor:**
+
+- During model loading: `model_load_progress_pct` (0–100), `model_loading_in_progress`, `phase` (e.g. `loading_model`), `model_load_elapsed_seconds`.
+- When ready: `model_loaded`, `ready_for_inference`, `phase: "ready"`.
+- `jarvis_prime/server.py` and `run_server.py` both expose this contract (v221.0 ensures `server.py` reports progress for cross-repo coordination).
+
+### Model Loading Progress & Handoff (v221.0)
+
+When the JARVIS unified supervisor uses **Early Prime pre-warm**, Prime starts early and a background monitor polls `/health` and updates the dashboard. When the **Trinity phase** takes over, it adopts the running Prime process and clears the early-Prime env var; the Early Prime monitor then stops. **v221.0** ensures:
+
+- **No progress regression:** The supervisor’s `update_model_loading(active=False, handoff=True)` preserves `max_progress_seen`. Progress never drops (e.g. 18% → 0%).
+- **Prime health:** Prime’s `/health` must report `model_load_progress_pct` (and related fields) so the Trinity monitor can continue from the preserved progress. Both `run_server.py` and `jarvis_prime/server.py` support this (v221.0).
+
+See JARVIS-AI-Agent `memory/2026-02-04.md` (or equivalent) for the full root-cause analysis and fix summary.
+
 ### Request Flow with Neural Orchestrator Core
 
 ```
@@ -598,13 +633,23 @@ pip install -e .
 pip install -e ".[server,gcs,telemetry,agi,neural-orchestrator]"
 ```
 
+### Entry Points
+
+| Entry Point | Purpose | When to Use |
+|-------------|---------|-------------|
+| **`run_server.py`** | Full server with startup state, progress reporting, and health endpoint | **Recommended** — used by unified supervisor; reports `model_load_progress_pct`, `startup_progress`, `model_loading_in_progress` |
+| **`jarvis_prime/server.py`** (module) | Alternative FastAPI server with immediate HTTP startup and background model load | When running Prime as a module; v221.0 adds `model_load_progress_pct` to health for cross-repo coordination |
+| **Unified Supervisor (JARVIS)** | `python3 unified_supervisor.py` in JARVIS-AI-Agent | **Recommended for full ecosystem** — starts Body + Prime + Reactor-Core with Trinity coordination |
+
+The **health endpoint** (`GET /health`) must expose `model_load_progress_pct` (and optionally `startup_progress`, `loading_progress`, `model_loading_in_progress`) so the JARVIS unified supervisor can track loading progress and avoid regression during Early Prime → Trinity handoff (v221.0).
+
 ### Unified Supervisor (Recommended)
 
-Start all components with a single command:
+Start all components with a single command from the **JARVIS (Body)** repo:
 
 ```bash
-# Start JARVIS, JARVIS-Prime, and Reactor-Core
-python3 run_supervisor.py
+# From JARVIS-AI-Agent repo — starts JARVIS + JARVIS-Prime + Reactor-Core
+python3 unified_supervisor.py
 
 # Supervisor will:
 # 1. Start JARVIS-Prime server (port 8000)
@@ -627,6 +672,8 @@ python3 run_supervisor.py
 # All components started successfully
 # Supervisor running, press Ctrl+C to stop
 ```
+
+**Note:** The unified supervisor lives in **JARVIS-AI-Agent**; it discovers and starts JARVIS-Prime (and Reactor-Core). From within the JARVIS-Prime repo you can run the **standalone** server only (see below).
 
 ### Standalone Server
 
