@@ -1106,11 +1106,15 @@ def parse_args():
 class StartupState:
     """
     v93.1: Track server startup state for immediate health checks.
+    v221.0: Enhanced with progress percentage for cross-repo coordination.
 
     This allows the HTTP server to start IMMEDIATELY and respond to health
     checks while heavy initialization (ML imports, model loading) happens
     in the background.
     """
+    # v221.0: Expected model load time for progress estimation
+    DEFAULT_MODEL_LOAD_TIMEOUT = 720  # 12 minutes
+    
     def __init__(self):
         self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
         self.start_time = time.time()
@@ -1119,9 +1123,17 @@ class StartupState:
         self.init_elapsed: Optional[float] = None
         self.model_load_start: Optional[float] = None
         self.model_load_elapsed: Optional[float] = None
+        # v221.0: Track model loading timeout for progress calculation
+        self.model_load_timeout: float = self.DEFAULT_MODEL_LOAD_TIMEOUT
 
     def get_status(self) -> Dict[str, Any]:
-        """Get current status for health endpoint."""
+        """
+        Get current status for health endpoint.
+        
+        v221.0: Added model_load_progress_pct for cross-repo coordination with
+        unified_supervisor. This allows the supervisor to track loading progress
+        during Early Prime → Trinity handoff without progress regression.
+        """
         elapsed = time.time() - self.start_time
         result = {
             "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
@@ -1135,6 +1147,22 @@ class StartupState:
             result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
         if self.error:
             result["error"] = self.error
+        
+        # v221.0: Add progress percentage during model loading
+        # This is CRITICAL for cross-repo coordination - unified_supervisor
+        # uses this to prevent progress regression during Early Prime → Trinity handoff
+        if self.phase in ("loading_model", "initializing") and self.model_load_start:
+            model_load_elapsed = time.time() - self.model_load_start
+            # Calculate progress as percentage of expected timeout
+            progress_pct = min(99, int((model_load_elapsed / self.model_load_timeout) * 100))
+            result["model_load_progress_pct"] = progress_pct
+            result["model_loading_in_progress"] = True
+            result["model_load_elapsed_seconds"] = round(model_load_elapsed, 1)
+            result["model_load_timeout_seconds"] = self.model_load_timeout
+        elif self.phase == "ready":
+            result["model_load_progress_pct"] = 100
+            result["model_loading_in_progress"] = False
+        
         return result
 
 
