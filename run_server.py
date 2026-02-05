@@ -575,11 +575,15 @@ def parse_args():
 class StartupState:
     """
     v93.2: Track server startup state for immediate health checks.
+    v224.0: Phase-based progress tracking with milestone-based reporting.
 
     This allows the HTTP server to start IMMEDIATELY and respond to health
     checks while heavy initialization (ML imports, model loading) happens
     in the background.
     """
+
+    _TOTAL_INIT_STEPS = 9  # Steps 1-9 in background_initialization()
+
     def __init__(self):
         self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
         self.start_time = time.time()
@@ -591,11 +595,66 @@ class StartupState:
         self.model_loaded: bool = False
         self.details: Dict[str, Any] = {}
 
+        # v224.0: Phase-based progress tracking
+        self.init_phases: list = []
+        self.current_phase_index: int = -1
+
+    def begin_phase(self, name: str, step_num: int) -> None:
+        """
+        v224.0: Begin a new initialization phase with milestone tracking.
+
+        Automatically completes the previous in-progress phase (if any).
+        """
+        # Auto-complete previous phase
+        if 0 <= self.current_phase_index < len(self.init_phases):
+            prev = self.init_phases[self.current_phase_index]
+            if prev["status"] == "in_progress":
+                prev["status"] = "completed"
+                prev["completed_at"] = time.time()
+                prev["elapsed_seconds"] = round(time.time() - prev["started_at"], 2)
+
+        phase_entry = {
+            "name": name,
+            "step_num": step_num,
+            "total_steps": self._TOTAL_INIT_STEPS,
+            "status": "in_progress",
+            "started_at": time.time(),
+            "completed_at": None,
+            "elapsed_seconds": 0,
+        }
+
+        self.init_phases.append(phase_entry)
+        self.current_phase_index = len(self.init_phases) - 1
+        self.details["step"] = name
+        self.details["step_num"] = step_num
+        self.details["total_steps"] = self._TOTAL_INIT_STEPS
+
+    def complete_phase(self, name: str) -> None:
+        """v224.0: Mark a phase as completed by name."""
+        for phase in self.init_phases:
+            if phase["name"] == name and phase["status"] == "in_progress":
+                phase["status"] = "completed"
+                phase["completed_at"] = time.time()
+                phase["elapsed_seconds"] = round(time.time() - phase["started_at"], 2)
+                break
+
+    def fail_phase(self, name: str, error: str) -> None:
+        """v224.0: Mark a phase as failed by name."""
+        for phase in self.init_phases:
+            if phase["name"] == name and phase["status"] == "in_progress":
+                phase["status"] = "failed"
+                phase["completed_at"] = time.time()
+                phase["elapsed_seconds"] = round(time.time() - phase["started_at"], 2)
+                phase["error"] = error
+                break
+
     def get_status(self) -> Dict[str, Any]:
         """
         Get current status for health endpoint.
 
         v93.7: Enhanced with detailed step information and loading progress.
+        v224.0: Phase-based progress tracking with v2 protocol.
+
         Reports model_load_elapsed_seconds DURING loading (not just after)
         to enable intelligent progress-based timeout extension.
         """
@@ -620,8 +679,46 @@ class StartupState:
             result["current_step"] = self.details.get("step", "unknown")
             result["details"] = self.details
 
-        # v93.5: Report model load elapsed DURING loading (not just after)
-        # This enables the orchestrator's intelligent timeout extension
+        # v224.0: Structured phase progress (v2 protocol)
+        if self.init_phases:
+            completed_phases = sum(1 for p in self.init_phases if p["status"] == "completed")
+            total_phases = self._TOTAL_INIT_STEPS
+            current_phase = (
+                self.init_phases[self.current_phase_index]
+                if 0 <= self.current_phase_index < len(self.init_phases)
+                else None
+            )
+
+            result["init_progress"] = {
+                "protocol_version": 2,
+                "completed_phases": completed_phases,
+                "total_phases": total_phases,
+                "overall_pct": round((completed_phases / total_phases) * 100, 1) if total_phases > 0 else 0,
+                "current_phase": {
+                    "name": current_phase["name"],
+                    "step_num": current_phase["step_num"],
+                    "status": current_phase["status"],
+                    "elapsed_seconds": round(
+                        time.time() - current_phase["started_at"], 1
+                    ) if current_phase["status"] == "in_progress" else current_phase.get("elapsed_seconds", 0),
+                } if current_phase else None,
+                "phases": [
+                    {
+                        "name": p["name"],
+                        "step_num": p["step_num"],
+                        "status": p["status"],
+                        "elapsed_seconds": round(
+                            time.time() - p["started_at"], 1
+                        ) if p["status"] == "in_progress" else p.get("elapsed_seconds", 0),
+                    }
+                    for p in self.init_phases
+                ],
+            }
+
+        # v93.5 + v224.0: Report model load elapsed DURING loading (not just after)
+        # BUGFIX (v224.0): model_load_progress_pct is now 0 when NOT in the actual
+        # model loading step. Previously it was non-zero during Steps 1-7 because
+        # model_load_start was set before pre-load work.
         if self.model_load_elapsed:
             result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
         elif self.model_load_start:
@@ -629,9 +726,13 @@ class StartupState:
             current_elapsed = time.time() - self.model_load_start
             result["model_load_elapsed_seconds"] = round(current_elapsed, 1)
             result["model_loading_in_progress"] = True
-            # v93.7: Estimate progress based on typical load time
+            # v224.0: Only report non-zero progress when actually loading model
             model_timeout = self.details.get("model_load_timeout", 600.0)
             result["model_load_progress_pct"] = min(95, round((current_elapsed / model_timeout) * 100, 1))
+        else:
+            # v224.0: Not yet in model loading phase — report 0
+            result["model_load_progress_pct"] = 0
+            result["model_loading_in_progress"] = False
 
         if self.error:
             result["error"] = self.error
@@ -1842,12 +1943,15 @@ async def main():
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("importing_ml_libraries", 1)
+            _startup_state.begin_phase("importing_ml_libraries", 1)
 
             try:
                 from jarvis_prime.core.llama_cpp_executor import LlamaCppExecutor, LlamaCppConfig
                 log_step_complete("ML libraries import", time.time() - step_start)
+                _startup_state.complete_phase("importing_ml_libraries")
             except ImportError as e:
                 logger.error(f"❌ Import error: {e}")
+                _startup_state.fail_phase("importing_ml_libraries", str(e))
                 _startup_state.phase = "error"
                 _startup_state.error = f"Missing llama-cpp-python: {e}"
                 return
@@ -1857,6 +1961,7 @@ async def main():
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("initializing_bridge", 2)
+            _startup_state.begin_phase("initializing_bridge", 2)
             bridge_enabled = _args.bridge_enabled and not _args.no_bridge
             if bridge_enabled:
                 try:
@@ -1875,12 +1980,14 @@ async def main():
             else:
                 logger.info("   ℹ️ Cross-repo bridge disabled (--no-bridge)")
                 _bridge = None
+            _startup_state.complete_phase("initializing_bridge")
 
             # -----------------------------------------------------------------
             # STEP 3: Initialize Trinity bridge
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("initializing_trinity", 3)
+            _startup_state.begin_phase("initializing_trinity", 3)
             try:
                 from jarvis_prime.core.trinity_bridge import (
                     initialize_trinity,
@@ -1902,12 +2009,14 @@ async def main():
                 logger.warning(f"   ⚠️ Trinity module not available ({e})")
             except Exception as e:
                 logger.warning(f"   ⚠️ Trinity init failed ({e})")
+            _startup_state.complete_phase("initializing_trinity")
 
             # -----------------------------------------------------------------
             # STEP 4: Initialize AGI Hub (with Hardware-Aware Configuration)
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("initializing_agi_hub", 4)
+            _startup_state.begin_phase("initializing_agi_hub", 4)
 
             # v138.0: Perform hardware assessment BEFORE AGI Hub initialization
             global _hardware_assessment
@@ -2047,12 +2156,14 @@ async def main():
                     import traceback
                     traceback.print_exc()
                     _agi_hub = None
+            _startup_state.complete_phase("initializing_agi_hub")
 
             # -----------------------------------------------------------------
             # STEP 5: Initialize Neural Orchestrator
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("initializing_neural_orchestrator", 5)
+            _startup_state.begin_phase("initializing_neural_orchestrator", 5)
             try:
                 from jarvis_prime.core.neural_orchestrator_core import (
                     NeuralOrchestratorCore,
@@ -2073,12 +2184,14 @@ async def main():
                 logger.warning(f"   ⚠️ Neural Orchestrator init failed: {e}")
                 import traceback
                 traceback.print_exc()
+            _startup_state.complete_phase("initializing_neural_orchestrator")
 
             # -----------------------------------------------------------------
             # STEP 6: Resolve model path and download if needed
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("resolving_model", 6)
+            _startup_state.begin_phase("resolving_model", 6)
             _startup_state.phase = "loading_model"
 
             model_path = Path(_args.model)
@@ -2157,12 +2270,14 @@ async def main():
                 size_gb = model_path.stat().st_size / (1024**3)
                 logger.info(f"   Size: {size_gb:.2f} GB")
             log_step_complete("Model resolution", time.time() - step_start)
+            _startup_state.complete_phase("resolving_model")
 
             # -----------------------------------------------------------------
             # STEP 7: Hardware optimization and executor creation
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("configuring_hardware", 7)
+            _startup_state.begin_phase("configuring_hardware", 7)
             optimized_gpu_layers = _args.gpu_layers
             optimized_threads = _args.threads
             optimized_ctx_size = _args.ctx_size
@@ -2208,6 +2323,7 @@ async def main():
             logger.info(f"   Threads: {optimized_threads}")
             logger.info(f"   Context: {optimized_ctx_size}")
             log_step_complete("Hardware configuration", time.time() - step_start)
+            _startup_state.complete_phase("configuring_hardware")
 
             # -----------------------------------------------------------------
             # STEP 8: Load model (v93.7: with timeout and progress reporting)
@@ -2215,7 +2331,10 @@ async def main():
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("loading_model", 8)
-            _startup_state.model_load_start = time.time()
+            _startup_state.begin_phase("loading_model", 8)
+            # v224.0: BUGFIX — model_load_start is set below, right before the actual
+            # _executor.load() call (was previously set here, inflating elapsed time
+            # by including hollow client checks and model existence validation).
 
             # v150.1: Define model load timeout (was missing, causing NameError)
             # Default: 600s (10 min) for large models, configurable via env var
@@ -2247,6 +2366,7 @@ async def main():
                 _startup_state.details["gcp_endpoint"] = gcp_endpoint
                 _startup_state.details["skip_reason"] = "Hollow Client mode - routing to cloud"
                 log_step_complete("Model loading (SKIPPED - Hollow Client)", time.time() - step_start)
+                _startup_state.complete_phase("loading_model")
 
                 # Skip to Step 9 - don't attempt local model loading
             elif model_path.exists():
@@ -2276,6 +2396,8 @@ async def main():
                 try:
                     # v93.7: Model loading with timeout protection
                     # v108.2: Enhanced exception handling for all failure modes
+                    # v224.0: Set model_load_start HERE, right before actual loading
+                    _startup_state.model_load_start = time.time()
                     await asyncio.wait_for(
                         _executor.load(model_path),
                         timeout=model_load_timeout
@@ -2288,6 +2410,7 @@ async def main():
 
                     # v93.7: Log step completion with timing
                     log_step_complete("Model loading", load_time)
+                    _startup_state.complete_phase("loading_model")
 
                 except asyncio.TimeoutError:
                     load_time = time.time() - start
@@ -2295,6 +2418,7 @@ async def main():
                         f"[Background] MODEL LOAD TIMEOUT after {load_time:.1f}s "
                         f"(limit: {model_load_timeout}s)"
                     )
+                    _startup_state.fail_phase("loading_model", f"Timeout after {load_time:.1f}s")
                     _startup_state.phase = "error"
                     _startup_state.error = f"Model load timeout after {load_time:.1f}s"
                     _startup_state.model_load_elapsed = load_time
@@ -2311,6 +2435,7 @@ async def main():
                         f"  Error: {e}\n"
                         f"  Suggestion: Try a smaller model or free system memory"
                     )
+                    _startup_state.fail_phase("loading_model", f"OOM: {e}")
                     _startup_state.phase = "error"
                     _startup_state.error = f"Out of memory loading model ({model_size_mb:.0f}MB)"
                     _startup_state.model_load_elapsed = load_time
@@ -2326,6 +2451,7 @@ async def main():
                         f"  Error: {e}\n"
                         f"  Suggestion: Check model file integrity and disk space"
                     )
+                    _startup_state.fail_phase("loading_model", f"OSError: {e}")
                     _startup_state.phase = "error"
                     _startup_state.error = f"File error loading model: {e}"
                     _startup_state.model_load_elapsed = load_time
@@ -2344,6 +2470,7 @@ async def main():
                         f"  Error: {e}\n"
                         f"  Traceback:\n{tb_str}"
                     )
+                    _startup_state.fail_phase("loading_model", f"{type(e).__name__}: {e}")
                     _startup_state.phase = "error"
                     _startup_state.error = f"Model load failed: {type(e).__name__}: {e}"
                     _startup_state.model_load_elapsed = load_time
@@ -2377,6 +2504,7 @@ async def main():
                 logger.warning(f"[Background] Model not found: {_args.model}")
                 logger.warning("[Background] Server will run in health-check-only mode")
                 _startup_state.model_path = None
+                _startup_state.complete_phase("loading_model")
 
                 if _bridge:
                     try:
@@ -2390,9 +2518,11 @@ async def main():
             # -----------------------------------------------------------------
             step_start = time.time()
             log_step("marking_ready", 9)
+            _startup_state.begin_phase("marking_ready", 9)
 
             _startup_state.phase = "ready"
             _startup_state.init_elapsed = time.time() - init_start
+            _startup_state.complete_phase("marking_ready")
             _startup_state.details = {}  # Clear step details
 
             # v93.7: Calculate detailed timing breakdown
