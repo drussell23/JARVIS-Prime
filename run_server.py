@@ -815,6 +815,39 @@ def _check_port_available(host: str, port: int) -> tuple[bool, str]:
     return False, f"Port {port} is already in use{pid_info}"
 
 
+def _find_available_port(host: str, preferred_port: int, max_attempts: int = 10) -> Optional[int]:
+    """
+    v228.0: Find an available port starting from preferred_port + 1.
+    Searches sequentially through ports preferred_port+1 to preferred_port+max_attempts.
+    Returns the first available port, or None if all are occupied.
+    """
+    import socket
+
+    bind_host = '127.0.0.1' if host == '0.0.0.0' else host
+
+    for offset in range(1, max_attempts + 1):
+        candidate = preferred_port + offset
+        if candidate > 65535:
+            break
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.settimeout(1.0)
+                sock.bind((bind_host, candidate))
+                # Port is free — also verify nothing is listening
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.5)
+                    result = probe.connect_ex((bind_host, candidate))
+                    if result != 0:
+                        logger.debug(f"[PortFallback] Port {candidate} is available")
+                        return candidate
+        except OSError:
+            logger.debug(f"[PortFallback] Port {candidate} unavailable, trying next")
+            continue
+
+    return None
+
+
 async def main():
     """
     v93.2: Main entry point with IMMEDIATE HTTP server startup.
@@ -841,21 +874,34 @@ async def main():
 
     # =========================================================================
     # v198.0: PRE-STARTUP PORT AVAILABILITY CHECK
+    # v228.0: Intelligent port fallback instead of hard exit
     # =========================================================================
     # Check port BEFORE any heavy initialization to fail fast with clear error
+    original_port = _args.port
     port_available, port_error = _check_port_available(_args.host, _args.port)
     if not port_available:
-        logger.error("=" * 70)
-        logger.error("🔴 PORT CONFLICT DETECTED")
-        logger.error("=" * 70)
-        logger.error(f"   {port_error}")
-        logger.error("")
-        logger.error("   Possible solutions:")
-        logger.error(f"   1. Kill the process using port {_args.port}")
-        logger.error(f"   2. Use a different port: --port {_args.port + 1}")
-        logger.error("   3. Run 'lsof -i :{port}' to see what's using it")
-        logger.error("=" * 70)
-        sys.exit(1)
+        logger.warning(f"[Startup] Port {_args.port} unavailable: {port_error}")
+        # v228.0: Intelligent port fallback
+        fallback_port = _find_available_port(_args.host, _args.port)
+        if fallback_port:
+            logger.info(f"[Startup] Found available fallback port: {fallback_port} (original: {_args.port})")
+            _args.port = fallback_port
+        else:
+            logger.error("=" * 70)
+            logger.error("PORT CONFLICT DETECTED - NO FALLBACK AVAILABLE")
+            logger.error("=" * 70)
+            logger.error(f"   {port_error}")
+            logger.error(f"   Tried ports {original_port} through {original_port + 10}")
+            logger.error("=" * 70)
+            sys.exit(1)
+
+    # v228.0: Broadcast actual port to environment for discovery
+    os.environ["JARVIS_PRIME_PORT"] = str(_args.port)
+    os.environ["JARVIS_PRIME_URL"] = f"http://localhost:{_args.port}"
+    if _args.port != original_port:
+        os.environ["JARVIS_PRIME_ORIGINAL_PORT"] = str(original_port)
+        os.environ["JARVIS_PRIME_IS_FALLBACK_PORT"] = "true"
+        logger.info(f"[Startup] Environment updated: JARVIS_PRIME_PORT={_args.port}, JARVIS_PRIME_URL=http://localhost:{_args.port}")
 
     # Initialize startup state FIRST
     _startup_state = StartupState()
