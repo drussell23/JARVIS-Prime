@@ -33,13 +33,18 @@ PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
+# v223.0: SmartWatchdog/Progress tracking configuration
+# These control the /health/startup endpoint behavior
+JARVIS_PRIME_MODEL_TIMEOUT="${JARVIS_PRIME_MODEL_TIMEOUT:-720}"  # 12 minutes default
+
 echo "📋 Configuration:"
-echo "   MODEL_CACHE_DIR: ${MODEL_CACHE_DIR}"
-echo "   MODEL_PATH:      ${MODEL_PATH}"
-echo "   WARMUP_ON_START: ${WARMUP_ON_START}"
-echo "   PORT:            ${PORT}"
-echo "   HOST:            ${HOST}"
-echo "   LOG_LEVEL:       ${LOG_LEVEL}"
+echo "   MODEL_CACHE_DIR:             ${MODEL_CACHE_DIR}"
+echo "   MODEL_PATH:                  ${MODEL_PATH}"
+echo "   WARMUP_ON_START:             ${WARMUP_ON_START}"
+echo "   PORT:                        ${PORT}"
+echo "   HOST:                        ${HOST}"
+echo "   LOG_LEVEL:                   ${LOG_LEVEL}"
+echo "   JARVIS_PRIME_MODEL_TIMEOUT:  ${JARVIS_PRIME_MODEL_TIMEOUT}s"
 echo ""
 
 # =============================================================================

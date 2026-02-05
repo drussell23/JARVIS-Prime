@@ -1107,63 +1107,263 @@ class StartupState:
     """
     v93.1: Track server startup state for immediate health checks.
     v221.0: Enhanced with progress percentage for cross-repo coordination.
+    v223.0: Enterprise-Grade Async Startup - Granular stages and step tracking
+            for SmartWatchdog integration.
 
     This allows the HTTP server to start IMMEDIATELY and respond to health
     checks while heavy initialization (ML imports, model loading) happens
     in the background.
+    
+    STAGES (v223.0):
+    - booting: Server process starting, minimal initialization
+    - importing: Heavy ML library imports (torch, etc.)
+    - hardware_detect: Detecting GPU/CPU/Memory
+    - downloading: Model download in progress (if needed)
+    - loading_tensors: Loading model weights into memory
+    - initializing: Model initialization and warmup
+    - ready: Fully operational
+    - error: Startup failed
     """
     # v221.0: Expected model load time for progress estimation
-    DEFAULT_MODEL_LOAD_TIMEOUT = 720  # 12 minutes
+    DEFAULT_MODEL_LOAD_TIMEOUT = float(os.environ.get("JARVIS_PRIME_MODEL_TIMEOUT", "720"))  # 12 minutes default
+    
+    # v223.0: Stage weights for progress calculation (must sum to 100)
+    STAGE_WEIGHTS = {
+        "booting": 2,         # 0-2%
+        "importing": 8,       # 2-10%
+        "hardware_detect": 5, # 10-15%
+        "downloading": 15,    # 15-30% (if applicable)
+        "loading_tensors": 55,# 30-85% (bulk of time for large models)
+        "initializing": 10,   # 85-95%
+        "ready": 5,           # 95-100%
+    }
+    
+    # v223.0: Stage descriptions for human-readable output
+    STAGE_DESCRIPTIONS = {
+        "booting": "Initializing server process",
+        "importing": "Loading ML libraries",
+        "hardware_detect": "Detecting hardware capabilities",
+        "downloading": "Downloading model files",
+        "loading_tensors": "Loading model tensors into memory",
+        "initializing": "Initializing model and warmup",
+        "ready": "Server operational",
+        "error": "Startup failed",
+    }
     
     def __init__(self):
         self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
+        # v223.0: Granular stage tracking
+        self.stage = "booting"   # Detailed stage within phase
+        self.current_step = "Server starting..."  # Human-readable step description
         self.start_time = time.time()
         self.error: Optional[str] = None
+        self.error_details: Optional[str] = None  # v223.0: Stack trace or additional details
         self.manager = None
         self.init_elapsed: Optional[float] = None
         self.model_load_start: Optional[float] = None
         self.model_load_elapsed: Optional[float] = None
         # v221.0: Track model loading timeout for progress calculation
         self.model_load_timeout: float = self.DEFAULT_MODEL_LOAD_TIMEOUT
+        
+        # v223.0: Detailed progress tracking
+        self._stage_progress: float = 0.0  # Progress within current stage (0-1)
+        self._stages_completed: List[str] = []
+        self._last_progress_update: float = time.time()
+        self._model_info: Dict[str, Any] = {}  # Model name, size, etc.
+        
+        # v223.0: Thread-safe progress updates
+        import threading
+        self._lock = threading.Lock()
+    
+    def set_stage(self, stage: str, current_step: str = "", stage_progress: float = 0.0) -> None:
+        """
+        v223.0: Update the current stage with thread safety.
+        
+        Args:
+            stage: One of the STAGE_* constants
+            current_step: Human-readable description of current action
+            stage_progress: Progress within this stage (0.0 to 1.0)
+        """
+        with self._lock:
+            if self.stage != stage:
+                if self.stage and self.stage not in self._stages_completed:
+                    self._stages_completed.append(self.stage)
+                self.stage = stage
+                self._stage_progress = stage_progress
+            else:
+                self._stage_progress = stage_progress
+            
+            if current_step:
+                self.current_step = current_step
+            elif stage in self.STAGE_DESCRIPTIONS:
+                self.current_step = self.STAGE_DESCRIPTIONS[stage]
+            
+            self._last_progress_update = time.time()
+    
+    def update_progress(self, stage_progress: float, current_step: Optional[str] = None) -> None:
+        """
+        v223.0: Update progress within current stage.
+        
+        Args:
+            stage_progress: Progress within this stage (0.0 to 1.0)
+            current_step: Optional updated step description
+        """
+        with self._lock:
+            self._stage_progress = min(1.0, max(0.0, stage_progress))
+            if current_step:
+                self.current_step = current_step
+            self._last_progress_update = time.time()
+    
+    def set_model_info(self, name: str = "", size_gb: float = 0.0, path: str = "") -> None:
+        """v223.0: Set model information for progress display."""
+        with self._lock:
+            self._model_info = {
+                "name": name,
+                "size_gb": size_gb,
+                "path": path,
+            }
+    
+    def set_error(self, error: str, details: Optional[str] = None) -> None:
+        """v223.0: Set error state with optional details."""
+        with self._lock:
+            self.stage = "error"
+            self.phase = "error"
+            self.error = error
+            self.error_details = details
+            self._last_progress_update = time.time()
+    
+    def _calculate_progress_pct(self) -> int:
+        """
+        v223.0: Calculate overall progress percentage based on completed stages
+        and progress within current stage.
+        
+        Returns:
+            Progress percentage (0-100)
+        """
+        if self.stage == "ready":
+            return 100
+        if self.stage == "error":
+            # Return progress at failure point
+            return self._calculate_base_progress()
+        
+        # Calculate base progress from completed stages
+        base_progress = self._calculate_base_progress()
+        
+        # Add progress within current stage
+        current_weight = self.STAGE_WEIGHTS.get(self.stage, 0)
+        stage_contribution = int(current_weight * self._stage_progress)
+        
+        return min(99, base_progress + stage_contribution)  # Cap at 99 until ready
+    
+    def _calculate_base_progress(self) -> int:
+        """Calculate progress from completed stages."""
+        progress = 0
+        for stage in self._stages_completed:
+            progress += self.STAGE_WEIGHTS.get(stage, 0)
+        return progress
+    
+    def get_startup_status(self) -> Dict[str, Any]:
+        """
+        v223.0: Get detailed startup status for /health/startup endpoint.
+        
+        This is the SINGLE SOURCE OF TRUTH for startup progress, designed for
+        enterprise-grade SmartWatchdog integration.
+        
+        Returns:
+            Structured JSON with status, progress, stage, step, and error info
+        """
+        with self._lock:
+            elapsed = time.time() - self.start_time
+            progress_pct = self._calculate_progress_pct()
+            
+            result = {
+                # Primary status fields for SmartWatchdog
+                "status": "error" if self.error else ("ready" if self.stage == "ready" else "loading"),
+                "progress_pct": progress_pct,
+                "current_step": self.current_step,
+                
+                # Detailed stage information
+                "stage": self.stage,
+                "stage_description": self.STAGE_DESCRIPTIONS.get(self.stage, self.stage),
+                "stage_progress": round(self._stage_progress * 100, 1),
+                
+                # Timing information
+                "elapsed_seconds": round(elapsed, 1),
+                "last_progress_update": round(time.time() - self._last_progress_update, 1),
+                
+                # Process information
+                "pid": os.getpid(),
+                "timestamp": time.time(),
+            }
+            
+            # Add model info if available
+            if self._model_info:
+                result["model"] = self._model_info
+            
+            # Add error details if in error state
+            if self.error:
+                result["error_details"] = self.error
+                if self.error_details:
+                    result["error_trace"] = self.error_details
+            
+            # Add ETA estimation
+            if progress_pct > 5 and elapsed > 10 and progress_pct < 100:
+                rate = progress_pct / elapsed
+                remaining = (100 - progress_pct) / rate if rate > 0 else 600
+                result["estimated_remaining_seconds"] = round(remaining, 0)
+                result["estimated_total_seconds"] = round(elapsed + remaining, 0)
+            
+            return result
 
     def get_status(self) -> Dict[str, Any]:
         """
-        Get current status for health endpoint.
+        Get current status for /health endpoint.
         
         v221.0: Added model_load_progress_pct for cross-repo coordination with
         unified_supervisor. This allows the supervisor to track loading progress
         during Early Prime → Trinity handoff without progress regression.
+        
+        v223.0: Now uses granular stage tracking for accurate progress.
         """
-        elapsed = time.time() - self.start_time
-        result = {
-            "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
-            "phase": self.phase,
-            "startup_elapsed_seconds": round(elapsed, 1),
-            "pid": os.getpid(),
-        }
-        if self.init_elapsed:
-            result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
-        if self.model_load_elapsed:
-            result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
-        if self.error:
-            result["error"] = self.error
-        
-        # v221.0: Add progress percentage during model loading
-        # This is CRITICAL for cross-repo coordination - unified_supervisor
-        # uses this to prevent progress regression during Early Prime → Trinity handoff
-        if self.phase in ("loading_model", "initializing") and self.model_load_start:
-            model_load_elapsed = time.time() - self.model_load_start
-            # Calculate progress as percentage of expected timeout
-            progress_pct = min(99, int((model_load_elapsed / self.model_load_timeout) * 100))
-            result["model_load_progress_pct"] = progress_pct
-            result["model_loading_in_progress"] = True
-            result["model_load_elapsed_seconds"] = round(model_load_elapsed, 1)
-            result["model_load_timeout_seconds"] = self.model_load_timeout
-        elif self.phase == "ready":
-            result["model_load_progress_pct"] = 100
-            result["model_loading_in_progress"] = False
-        
-        return result
+        with self._lock:
+            elapsed = time.time() - self.start_time
+            progress_pct = self._calculate_progress_pct()
+            
+            result = {
+                "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
+                "phase": self.phase,
+                "startup_elapsed_seconds": round(elapsed, 1),
+                "pid": os.getpid(),
+            }
+            if self.init_elapsed:
+                result["init_elapsed_seconds"] = round(self.init_elapsed, 1)
+            if self.model_load_elapsed:
+                result["model_load_elapsed_seconds"] = round(self.model_load_elapsed, 1)
+            if self.error:
+                result["error"] = self.error
+            
+            # v223.0: Use granular progress calculation
+            if self.phase in ("loading_model", "initializing") or self.stage in ("downloading", "loading_tensors", "initializing"):
+                result["model_load_progress_pct"] = progress_pct
+                result["model_loading_in_progress"] = True
+                if self.model_load_start:
+                    result["model_load_elapsed_seconds"] = round(time.time() - self.model_load_start, 1)
+                result["model_load_timeout_seconds"] = self.model_load_timeout
+                # v223.0: Add stage info for SmartWatchdog
+                result["stage"] = self.stage
+                result["current_step"] = self.current_step
+            elif self.phase == "ready":
+                result["model_load_progress_pct"] = 100
+                result["model_loading_in_progress"] = False
+                result["stage"] = "ready"
+            else:
+                # v223.0: Even in early phases, report progress
+                result["model_load_progress_pct"] = progress_pct
+                result["model_loading_in_progress"] = self.stage not in ("booting", "ready", "error")
+                result["stage"] = self.stage
+                result["current_step"] = self.current_step
+            
+            return result
 
 
 # Global startup state for immediate health checks
@@ -1239,6 +1439,62 @@ async def main():
                 raise HTTPException(status_code=503, detail=status)
 
             return status
+
+        @app.get("/health/startup")
+        async def health_startup():
+            """
+            v223.0: Enterprise-Grade Startup Progress Endpoint.
+            
+            This is the SINGLE SOURCE OF TRUTH for startup progress, designed for
+            SmartWatchdog integration in unified_supervisor.py.
+            
+            Returns a structured JSON with:
+            - status: "booting" | "loading" | "ready" | "error"
+            - progress_pct: 0-100 overall progress
+            - current_step: Human-readable description (e.g., "Loading layer 12/32")
+            - stage: Detailed stage name
+            - error_details: Error info if status == "error"
+            
+            The SmartWatchdog uses this to:
+            1. LIVENESS RULE: If progress_pct > last_seen, reset kill timer
+            2. STALL RULE: If no progress for STALL_THRESHOLD, kill
+            3. FAIL FAST RULE: If status == "error", kill immediately
+            
+            Example response during loading:
+            {
+                "status": "loading",
+                "progress_pct": 45,
+                "current_step": "Loading layer 12/32",
+                "stage": "loading_tensors",
+                "stage_description": "Loading model tensors into memory",
+                "stage_progress": 52.5,
+                "elapsed_seconds": 180.5,
+                "estimated_remaining_seconds": 220.0,
+                "pid": 12345,
+                "model": {"name": "Mistral-7B", "size_gb": 14.5}
+            }
+            
+            Example response when ready:
+            {
+                "status": "ready",
+                "progress_pct": 100,
+                "current_step": "Server operational",
+                "stage": "ready",
+                "elapsed_seconds": 420.0,
+                "pid": 12345
+            }
+            """
+            if not _startup_state:
+                return {
+                    "status": "booting",
+                    "progress_pct": 0,
+                    "current_step": "Server initializing...",
+                    "stage": "booting",
+                    "pid": os.getpid(),
+                    "timestamp": time.time(),
+                }
+            
+            return _startup_state.get_startup_status()
 
         @app.get("/trinity/status")
         async def trinity_status():
@@ -1335,6 +1591,7 @@ async def main():
             """
             v93.1: Run all heavy initialization in background.
             v192.0: Added hollow client mode support for slim hardware.
+            v223.0: Enterprise-grade granular stage tracking for SmartWatchdog.
 
             This includes:
             - Heavy ML library imports (torch, scikit-learn, etc.)
@@ -1343,6 +1600,9 @@ async def main():
             - Model loading (SKIPPED in hollow client mode)
             - Trinity integration
             - Heartbeat writer
+
+            v223.0 Stages:
+            - booting → importing → hardware_detect → [downloading] → loading_tensors → initializing → ready
 
             Hollow Client Mode (v192.0):
             - Activated by JARVIS_SKIP_LOCAL_MODEL_LOAD=true
@@ -1355,6 +1615,7 @@ async def main():
 
             try:
                 _startup_state.phase = "initializing"
+                _startup_state.set_stage("booting", "Background initialization starting...")
                 init_start = time.time()
 
                 # v192.0: Check for hollow client mode
@@ -1378,6 +1639,7 @@ async def main():
 
                     # Skip heavy model loading - just set up minimal server
                     _startup_state.phase = "ready"
+                    _startup_state.set_stage("ready", "Hollow client mode - no local model")
                     _startup_state.init_elapsed = time.time() - init_start
 
                     # Initialize Trinity (without loaded model)
@@ -1395,19 +1657,24 @@ async def main():
 
                 logger.info("[Background] Starting heavy initialization...")
 
-                # Heavy imports (triggers torch/scikit-learn warnings)
+                # v223.0: Stage - importing ML libraries
+                _startup_state.set_stage("importing", "Importing ML libraries (torch, transformers)...")
                 logger.info("[Background] Importing ML libraries...")
                 from jarvis_prime.core.model_manager import PrimeModelManager, create_api_app
+                _startup_state.update_progress(0.5, "ML libraries loaded, importing executors...")
 
-                # Detect hardware
+                # v223.0: Stage - hardware detection
+                _startup_state.set_stage("hardware_detect", "Detecting hardware capabilities...")
                 try:
                     from jarvis_prime.core.llama_cpp_executor import HardwareDetector, LlamaCppConfig
                     hw = HardwareDetector.detect()
                     logger.info(f"[Background] Hardware: {hw.gpu_name or 'CPU'}")
                     logger.info(f"[Background] Backend: {hw.backend.name}")
                     logger.info(f"[Background] Memory: {hw.total_memory_gb:.1f} GB")
+                    _startup_state.update_progress(1.0, f"Detected: {hw.gpu_name or 'CPU'}, {hw.total_memory_gb:.1f}GB RAM")
                 except Exception as e:
                     logger.warning(f"[Background] Hardware detection failed: {e}")
+                    _startup_state.update_progress(1.0, "Hardware detection skipped")
 
                 # Select executor
                 executor_class = None
@@ -1439,14 +1706,18 @@ async def main():
                             initial_model = str(model_path_obj)
                             logger.info(f"[Background] Found model: {model_path_obj.name}")
                         elif args.auto_download:
+                            # v223.0: Stage - downloading model
+                            _startup_state.set_stage("downloading", "Downloading model files...")
                             logger.info("[Background] Downloading model...")
                             downloader = GGUFModelDownloader(models_dir=Path(models_dir))
                             recommended = downloader.get_recommended_model()
                             if recommended:
+                                _startup_state.update_progress(0.1, f"Downloading {recommended.filename}...")
                                 model_path_obj = await downloader.download(
                                     f"{recommended.repo_id}/{recommended.filename}"
                                 )
                                 initial_model = str(model_path_obj)
+                                _startup_state.update_progress(1.0, f"Downloaded {recommended.filename}")
 
                 _startup_state.init_elapsed = time.time() - init_start
                 logger.info(f"[Background] Initialization complete ({_startup_state.init_elapsed:.1f}s)")
@@ -1460,21 +1731,63 @@ async def main():
                 )
                 _startup_state.manager = manager
 
-                # Start manager (with background model loading)
+                # v223.0: Stage - loading model tensors
                 _startup_state.phase = "loading_model"
                 _startup_state.model_load_start = time.time()
                 model_path = Path(initial_model) if initial_model else None
+                
+                if model_path:
+                    # Set model info for progress display
+                    model_name = model_path.stem
+                    try:
+                        model_size_gb = model_path.stat().st_size / (1024 ** 3)
+                    except Exception:
+                        model_size_gb = 7.0  # Default estimate
+                    _startup_state.set_model_info(name=model_name, size_gb=model_size_gb, path=str(model_path))
+                    _startup_state.set_stage("loading_tensors", f"Loading {model_name} into memory...")
+                    logger.info(f"[Background] Loading model: {model_name} ({model_size_gb:.1f}GB)")
+                
                 await manager.start(initial_model_path=model_path, background_model_load=True)
 
-                # Wait for model to load
+                # Wait for model to load with progress tracking
                 if model_path:
                     logger.info(f"[Background] Waiting for model to load: {model_path.name}")
+                    load_start = time.time()
+                    estimated_load_time = _startup_state.model_load_timeout
+                    poll_count = 0
+                    
+                    # v223.0: Progress tracking loop with granular updates
                     while manager.get_health_status() == "starting":
                         await asyncio.sleep(1.0)
                         if shutdown_event.is_set():
                             return
+                        
+                        poll_count += 1
+                        elapsed = time.time() - load_start
+                        
+                        # Calculate progress based on elapsed time and estimated total
+                        # Use sigmoid-like curve for more realistic progress
+                        # (slower start, faster middle, slower end)
+                        linear_progress = min(0.99, elapsed / estimated_load_time)
+                        # Sigmoid adjustment: steeper in middle
+                        adjusted_progress = linear_progress ** 0.8  # Slightly faster early progress
+                        
+                        # Update stage progress
+                        _startup_state.update_progress(
+                            adjusted_progress,
+                            f"Loading model tensors... ({elapsed:.0f}s elapsed)"
+                        )
+                        
+                        # Log progress periodically (every 30s)
+                        if poll_count % 30 == 0:
+                            progress_pct = int(adjusted_progress * 100)
+                            logger.info(f"[Background] Model loading: {progress_pct}% ({elapsed:.0f}s)")
+                    
                     _startup_state.model_load_elapsed = time.time() - _startup_state.model_load_start
                     logger.info(f"[Background] Model loaded ({_startup_state.model_load_elapsed:.1f}s)")
+                    
+                    # v223.0: Transition to initializing stage
+                    _startup_state.set_stage("initializing", "Model loaded, warming up...")
 
                 # Initialize Trinity
                 # Note: global _trinity_integration is declared at function start (v192.0)
@@ -1549,22 +1862,24 @@ async def main():
                 # Start heartbeat writer
                 await start_heartbeat_writer(args, manager, model_path)
 
-                # Mark as ready
+                # v223.0: Mark as ready with proper stage tracking
                 _startup_state.phase = "ready"
+                _startup_state.set_stage("ready", "Server operational - accepting requests")
                 total_time = time.time() - _startup_state.start_time
                 logger.info("=" * 70)
-                logger.info(f"[v93.1] JARVIS-Prime fully ready in {total_time:.1f}s")
+                logger.info(f"[v223.0] JARVIS-Prime fully ready in {total_time:.1f}s")
+                logger.info(f"[v223.0] /health/startup endpoint: http://{args.host}:{args.port}/health/startup")
                 logger.info(f"API endpoint: http://{args.host}:{args.port}/v1/chat/completions")
                 logger.info("=" * 70)
 
             except Exception as e:
-                # v109.2: Enhanced error logging with full traceback for debugging
+                # v223.0: Enhanced error logging with full traceback for SmartWatchdog
                 import traceback
                 full_traceback = traceback.format_exc()
                 logger.error(f"[Background] Initialization failed: {e}")
                 logger.error(f"[Background] Full traceback:\n{full_traceback}")
                 _startup_state.phase = "error"
-                _startup_state.error = str(e)
+                _startup_state.set_error(str(e), full_traceback)
 
         async def start_heartbeat_writer(args, manager, model_path):
             """Start the heartbeat writer task."""
