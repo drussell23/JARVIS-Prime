@@ -1174,6 +1174,34 @@ class StartupState:
         # v223.0: Thread-safe progress updates
         import threading
         self._lock = threading.Lock()
+
+        # v235.2: Optional APARS file integration (for golden-image startup)
+        self._apars_file: Optional[str] = os.environ.get("JARVIS_APARS_FILE")
+        self._apars_cache: Optional[Dict[str, Any]] = None
+        self._apars_cache_mtime: float = 0.0
+
+    def _read_apars_file(self) -> Optional[Dict[str, Any]]:
+        """Load APARS payload from file if configured."""
+        if not self._apars_file:
+            self._apars_file = os.environ.get("JARVIS_APARS_FILE")
+        if not self._apars_file:
+            return None
+        try:
+            mtime = os.path.getmtime(self._apars_file)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return self._apars_cache
+        if self._apars_cache is not None and mtime == self._apars_cache_mtime:
+            return self._apars_cache
+        try:
+            with open(self._apars_file, "r") as f:
+                payload = json.load(f)
+            self._apars_cache = payload
+            self._apars_cache_mtime = mtime
+            return payload
+        except Exception:
+            return self._apars_cache
     
     def set_stage(self, stage: str, current_step: str = "", stage_progress: float = 0.0) -> None:
         """
@@ -1362,7 +1390,16 @@ class StartupState:
                 result["model_loading_in_progress"] = self.stage not in ("booting", "ready", "error")
                 result["stage"] = self.stage
                 result["current_step"] = self.current_step
-            
+
+            # v235.2: Attach APARS payload if available (golden-image startup)
+            apars_payload = self._read_apars_file()
+            if apars_payload:
+                result["apars"] = apars_payload
+                if "ready_for_inference" in apars_payload:
+                    result.setdefault("ready_for_inference", apars_payload.get("ready_for_inference"))
+                if "model_loaded" in apars_payload:
+                    result.setdefault("model_loaded", apars_payload.get("model_loaded"))
+
             return result
 
 
