@@ -1461,7 +1461,7 @@ async def main():
         warnings.filterwarnings('ignore', category=DeprecationWarning)
         warnings.filterwarnings('ignore', category=FutureWarning)
 
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
 
         app = FastAPI(
             title="JARVIS-Prime API",
@@ -1550,8 +1550,10 @@ async def main():
         _completion_routes_ready = False
 
         @app.post("/v1/chat/completions")
-        async def chat_completions_placeholder(request: dict):
-            """Placeholder until model manager is ready."""
+        async def chat_completions_placeholder(request: Request):
+            """Placeholder until model manager is ready.
+            v153.0: Changed param from `dict` to `Request` — FastAPI treated `dict`
+            as a query parameter, causing 422 on POST. `Request` accepts any body."""
             if not _completion_routes_ready:
                 raise HTTPException(
                     status_code=503,
@@ -1563,8 +1565,9 @@ async def main():
             return {"error": "Not implemented"}
 
         @app.post("/v1/completions")
-        async def completions_placeholder(request: dict):
-            """Placeholder until model manager is ready."""
+        async def completions_placeholder(request: Request):
+            """Placeholder until model manager is ready.
+            v153.0: Changed param from `dict` to `Request` — see chat_completions_placeholder."""
             if not _completion_routes_ready:
                 raise HTTPException(
                     status_code=503,

@@ -893,6 +893,41 @@ class PrimeModelManager:
 # OpenAI-Compatible API Server
 # ============================================================================
 
+# v153.0: Pydantic models moved to MODULE LEVEL from inside create_api_app().
+# Root cause: `from __future__ import annotations` (line 15) makes all type
+# annotations lazy strings (ForwardRef). When routes are registered inside
+# create_api_app() and later copied to the main app in server.py, FastAPI
+# resolves annotations from __globals__ (module namespace). Function-scoped
+# classes aren't in __globals__ → ForwardRef fails → FastAPI falls back to
+# treating parameters as query params → 422 Unprocessable Entity.
+try:
+    from pydantic import BaseModel as _PydanticBaseModel
+
+    class MessageModel(_PydanticBaseModel):
+        role: str
+        content: str
+        name: Optional[str] = None
+
+    class CompletionRequestModel(_PydanticBaseModel):
+        model: str = "jarvis-prime"
+        messages: List[MessageModel] = []
+        prompt: Optional[str] = None
+        max_tokens: int = 2048
+        temperature: float = 0.7
+        top_p: float = 0.9
+        stream: bool = False
+        stop: Optional[List[str]] = None
+        user: Optional[str] = None
+        # Extensions
+        force_tier: Optional[str] = None
+        session_id: Optional[str] = None
+
+except ImportError:
+    # Pydantic not available — models will be created at runtime in create_api_app
+    MessageModel = None  # type: ignore
+    CompletionRequestModel = None  # type: ignore
+
+
 def create_api_app(manager: PrimeModelManager):
     """
     Create a FastAPI app with OpenAI-compatible endpoints.
@@ -908,7 +943,6 @@ def create_api_app(manager: PrimeModelManager):
         from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
         from fastapi.responses import StreamingResponse
         from pydantic import BaseModel
-        from typing import List, Optional
         import json
     except ImportError:
         raise ImportError("FastAPI required: pip install fastapi uvicorn")
@@ -922,25 +956,6 @@ def create_api_app(manager: PrimeModelManager):
     # WebSocket event subscribers for Neural Mesh integration (v10.3)
     _event_subscribers: List[WebSocket] = []
     _event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-
-    class MessageModel(BaseModel):
-        role: str
-        content: str
-        name: Optional[str] = None
-
-    class CompletionRequestModel(BaseModel):
-        model: str = "jarvis-prime"
-        messages: List[MessageModel] = []
-        prompt: Optional[str] = None
-        max_tokens: int = 2048
-        temperature: float = 0.7
-        top_p: float = 0.9
-        stream: bool = False
-        stop: Optional[List[str]] = None
-        user: Optional[str] = None
-        # Extensions
-        force_tier: Optional[str] = None
-        session_id: Optional[str] = None
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: CompletionRequestModel):
