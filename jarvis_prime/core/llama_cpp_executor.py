@@ -1576,21 +1576,84 @@ class GGUFModelDownloader:
 # =============================================================================
 
 
+def _select_best_model(gguf_files: list, quant_priority: list) -> Optional[Path]:
+    """Select the best model from a list of GGUF files.
+
+    Prefers Llama 3 > Mistral > other, then highest-quality quantization.
+    """
+    # Group by model family
+    families = {"llama3": [], "mistral": [], "other": []}
+    for f in gguf_files:
+        name = f.name.lower()
+        if "llama" in name and "3" in name:
+            families["llama3"].append(f)
+        elif "mistral" in name:
+            families["mistral"].append(f)
+        else:
+            families["other"].append(f)
+
+    # Try each family in preference order
+    for family in ["llama3", "mistral", "other"]:
+        candidates = families[family]
+        if not candidates:
+            continue
+        # Pick highest-quality quantization
+        for quant in quant_priority:
+            for f in candidates:
+                if quant in f.name:
+                    return f
+        return candidates[0]
+    return None
+
+
 def get_default_model_path() -> Path:
-    """Get the default model path."""
-    models_dir = Path.home() / ".jarvis" / "prime" / "models"
+    """Get the default model path.
 
-    # Look for existing GGUF
-    gguf_files = list(models_dir.glob("*.gguf"))
+    v235.4: Search multiple directories for GGUF models, including
+    golden image paths and HuggingFace snapshot directories.
 
-    if gguf_files:
-        # Prefer Llama 3 variants
-        for f in gguf_files:
-            if "llama" in f.name.lower() and "3" in f.name:
-                return f
-        return gguf_files[0]
+    Priority:
+    1. JARVIS_PRIME_MODEL_PATH env var (explicit override)
+    2. Search directories for .gguf files:
+       - ~/.jarvis/prime/models/ (local dev)
+       - /opt/jarvis-prime/models/ (golden image, including HF snapshots)
+       - $JARVIS_DIR/models/ (env-configured install dir)
+    """
+    # Priority 1: Explicit env var
+    env_model = os.environ.get("JARVIS_PRIME_MODEL_PATH")
+    if env_model and Path(env_model).exists():
+        return Path(env_model)
 
-    return models_dir / "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
+    # Priority 2: Search multiple directories
+    search_dirs = [
+        Path.home() / ".jarvis" / "prime" / "models",
+        Path("/opt/jarvis-prime/models"),
+    ]
+    jarvis_dir = os.environ.get("JARVIS_DIR")
+    if jarvis_dir:
+        search_dirs.append(Path(jarvis_dir) / "models")
+
+    for models_dir in search_dirs:
+        if not models_dir.exists():
+            continue
+
+        # Direct .gguf files in the directory
+        gguf_files = list(models_dir.glob("*.gguf"))
+
+        # Also search HuggingFace snapshot directories (models--*/snapshots/*/*.gguf)
+        gguf_files.extend(models_dir.glob("models--*/snapshots/*/*.gguf"))
+
+        if gguf_files:
+            # Select best model: prefer higher-quality quantizations
+            # Q4_K_M > Q4_K_S > Q5_K_M > Q3_K_M > Q2_K > any
+            quant_priority = ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q5_K_S", "Q3_K_M", "Q3_K_S", "Q2_K"]
+            best = _select_best_model(gguf_files, quant_priority)
+            if best:
+                return best
+            return gguf_files[0]
+
+    # Fallback: return expected path (will trigger download if auto_download is enabled)
+    return Path.home() / ".jarvis" / "prime" / "models" / "Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"
 
 
 async def create_executor_with_model(
