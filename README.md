@@ -2,7 +2,7 @@
 
 **The Mind of the AGI OS — LLM inference, Neural Orchestrator Core, and cross-repo coordination**
 
-🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation
+🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation | 🎯 v236.0 Adaptive Prompt System
 
 JARVIS Prime is the **cognitive layer** of the JARVIS AGI ecosystem. It runs a **self-hosted Mistral-7B-Instruct-v0.2 LLM** (Q4_K_M quantized, ~4.37 GB) on a dedicated GCP Invincible Node — **not OpenAI, not Claude, not any third-party API**. All inference happens on your own infrastructure with zero per-token costs and complete data privacy. Prime also provides the **Neural Orchestrator Core** (unified routing), AGI models, reasoning engines, and **first-class integration** with JARVIS (Body) and Reactor-Core (Nerves). It is started either **standalone** or by the **unified supervisor** in JARVIS; during startup, model loading progress is preserved across Early Prime → Trinity handoff (v221.0).
 
@@ -295,6 +295,158 @@ Under normal operation, **100% of requests** go to the self-hosted model. The Cl
 | **Full control** | Choose quantization level, context length, temperature, system prompts, and all inference parameters. No provider-imposed guardrails beyond what you configure. |
 | **Offline-capable** | Once the VM is running, inference works with zero internet dependency (the model is on local disk). |
 | **Reproducible** | Same model, same weights, same quantization = deterministic behavior (given same temperature/seed). No provider-side model updates changing behavior unexpectedly. |
+
+### Adaptive Prompt System: Complexity-Aware Inference (v236.0)
+
+#### The Problem: One Prompt Does Not Fit All
+
+Before v236.0, every request sent to JARVIS Prime — whether "what is 5+5?" or "design a microservice architecture" — received the same static system prompt, the same `max_tokens=4096`, and the same `temperature=0.7`. The system prompt included:
+
+> *"You are JARVIS, an advanced AI assistant... Be concise but thorough"*
+
+Mistral-7B-Instruct interpreted "thorough" as a directive to be verbose, and the "advanced AI assistant" identity activated conversational, polite-assistant behavior. The result: asking "what is 5+5?" returned *"Of course, the sum of five and five is ten. I'd be happy to help with any other mathematical queries you might have."* instead of just **10**.
+
+This is a fundamental challenge with 7B-parameter models: they have limited instruction-following capacity. When a system prompt contains conflicting signals — "be an AI assistant" (conversational) vs. "be concise" (terse) — the model resolves the conflict in favor of the stronger training signal, which is almost always the conversational one.
+
+#### The Solution: AdaptivePromptBuilder
+
+JARVIS (Body) now classifies every query into one of 5 complexity levels before sending it to Prime, and dynamically adapts three parameters:
+
+```
+┌────────────┬────────────┬──────┬─────────────────────────────────────────────────┐
+│ Complexity │ max_tokens │ temp │ System Prompt Strategy                          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ SIMPLE     │ 64         │ 0.0  │ NO identity. Few-shot examples only.            │
+│            │            │      │ "Reply with ONLY the direct answer."            │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ MODERATE   │ 512        │ 0.3  │ JARVIS identity + "2-3 sentences. No filler."   │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ COMPLEX    │ 2048       │ 0.5  │ JARVIS identity + "Structured and thorough."    │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ ADVANCED   │ 4096       │ 0.7  │ JARVIS identity + "Detailed analysis."          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
+│ EXPERT     │ 4096       │ 0.7  │ JARVIS identity + "Comprehensive. Edge cases."  │
+└────────────┴────────────┴──────┴─────────────────────────────────────────────────┘
+```
+
+#### Three Techniques for 7B Model Compliance
+
+Standard instruction text ("be concise") achieves ~60-70% compliance on 7B models. The v236.0 system uses three additional techniques to push this significantly higher:
+
+**1. Identity omission for SIMPLE queries**
+
+The JARVIS identity prefix ("You are JARVIS, an advanced AI assistant") is intentionally **removed** for SIMPLE queries. This eliminates the competing signal that pushes the model toward conversational behavior. For MODERATE and above, the identity is retained because longer responses benefit from the JARVIS personality.
+
+**2. Few-shot examples instead of abstract instructions**
+
+7B models follow **patterns** far more reliably than they follow **meta-instructions**. Instead of telling the model "for math, return just the result," the SIMPLE prompt includes concrete examples:
+
+```
+Q: 5+5
+A: 10
+Q: Capital of France?
+A: Paris
+Q: Define gravity
+A: The force that attracts objects with mass toward each other.
+```
+
+The model sees these examples and pattern-matches: "short question → short answer."
+
+**3. Temperature 0.0 for deterministic output**
+
+At `temperature=0.0`, the model always selects the highest-probability token at each step. For factual questions with single correct answers (math, capitals, definitions), this eliminates sampling variation entirely. The model produces the same output every time — no "sometimes verbose, sometimes terse" inconsistency.
+
+#### How This Reaches Prime (Cross-Repo Flow)
+
+The adaptive parameters are set by JARVIS (Body) and sent to Prime via the standard `/v1/chat/completions` endpoint. From Prime's perspective, it receives normal OpenAI-compatible requests — the intelligence is in **what** is sent, not in any Prime-side changes:
+
+```
+JARVIS Backend (macOS, port 8010)
+  │
+  │  QueryComplexityManager classifies "5+5?" → SIMPLE
+  │  AdaptivePromptBuilder selects:
+  │    system_prompt = "Reply with ONLY the direct answer...\nQ: 5+5\nA: 10\n..."
+  │    max_tokens = 64
+  │    temperature = 0.0
+  │
+  ▼
+  POST http://34.45.154.209:8000/v1/chat/completions
+  {
+    "model": "jarvis-prime",
+    "messages": [
+      {"role": "system", "content": "Reply with ONLY the direct answer..."},
+      {"role": "user", "content": "what is 5+5?"}
+    ],
+    "max_tokens": 64,
+    "temperature": 0.0
+  }
+  │
+  ▼
+  JARVIS Prime (GCP VM, port 8000)
+  └── llama-cpp-python → Mistral-7B-Instruct-v0.2 (Q4_K_M)
+        │
+        │  Sees few-shot pattern: Q → A (short)
+        │  temp=0.0 → deterministic token selection
+        │  max_tokens=64 → hard cap on output length
+        │
+        ▼
+  Response: "10"    (5 tokens including BOS/EOS)
+```
+
+For complex queries, the same flow sends the full JARVIS identity, `max_tokens=4096`, and `temperature=0.7` — giving the model maximum room for structured, detailed analysis.
+
+#### Verified Results
+
+```
+┌───────────────────────────────────┬────────────┬────────┬──────┬────────────────────┐
+│ Query                             │ Complexity │ Tokens │ Temp │ Response           │
+├───────────────────────────────────┼────────────┼────────┼──────┼────────────────────┤
+│ "what is 5+5?"                    │ SIMPLE     │ 64     │ 0.0  │ 10                 │
+│ "what's 5+5?"                     │ SIMPLE     │ 64     │ 0.0  │ 10                 │
+│ "define photosynthesis"           │ SIMPLE     │ 64     │ 0.0  │ One sentence       │
+│ "capital of France?"              │ SIMPLE     │ 64     │ 0.0  │ Paris              │
+│ "explain how neural networks      │ COMPLEX    │ 2048   │ 0.5  │ Multi-paragraph    │
+│  learn"                           │            │        │      │ structured         │
+└───────────────────────────────────┴────────────┴────────┴──────┴────────────────────┘
+```
+
+#### The Path Beyond Prompting: Reactor-Core Fine-Tuning
+
+The adaptive prompt system is the **immediate fix** — it makes Mistral-7B behave correctly today. But prompt-based control is inherently limited for 7B models because instruction compliance is a function of model capacity.
+
+The **permanent solution** is training the model itself to be concise for simple queries, using the Reactor-Core training pipeline that's already wired into the architecture:
+
+```
+ JARVIS (Body)              JARVIS Prime (Mind)         Reactor-Core (Nerves)
+ ─────────────              ───────────────────         ─────────────────────
+ User: "5+5?"           →   Mistral-7B → "10"      →   TelemetryEmitter captures
+                                                         (query, response, complexity,
+                                                          latency, tokens_used)
+                                                                │
+                                                                ▼
+                                                         TrainingDataPipeline creates
+                                                         DPO preference pairs:
+                                                         {
+                                                           prompt: "5+5?",
+                                                           chosen: "10",
+                                                           rejected: "Of course, the
+                                                              sum of five and five..."
+                                                         }
+                                                                │
+                                                                ▼
+                            Hot-swap fine-tuned       ←   DPO training with β=0.1
+                            GGUF (zero downtime)          on accumulated preference data
+                            Bake new golden image
+```
+
+After DPO training, conciseness for simple queries is encoded **in the model's weights** — not dependent on a prompt instruction the model might ignore. The model learns *when* to be terse and *when* to be detailed from actual user interaction patterns, not from static rules.
+
+The key components for this pipeline already exist:
+- **`TelemetryEmitter`** (JARVIS) — captures every interaction, ships to Reactor-Core
+- **`TrainingDataPipeline`** (Prime) — generates DPO preference pairs from conversations
+- **`RLHFIntegration`** (Prime) — reward model training and PPO optimization
+- **`ReactorCoreBridge`** (Prime) — submits fine-tuning jobs, tracks training, deploys finished models
+- **`HotSwapManager`** (Prime) — swaps the model at runtime with zero request drops
 
 ---
 
@@ -1671,6 +1823,7 @@ MIT License - see [LICENSE](LICENSE) for details
 ### What JARVIS Prime Delivers
 
 ✅ **Self-Hosted LLM Inference** - Mistral-7B-Instruct-v0.2 (Q4_K_M) on your own GCP VM — no OpenAI, no Claude, no third-party APIs
+✅ **Adaptive Prompt System (v236.0)** - Complexity-aware inference: "5+5?" → "10" (64 tokens, temp 0.0), "design a system" → detailed analysis (4096 tokens, temp 0.7)
 ✅ **Enterprise-Grade AGI Operating System** - 7 specialized models, reasoning, multimodal fusion
 ✅ **Neural Orchestrator Core v100.0** - Unified intelligent routing, single source of truth
 ✅ **GCP Golden Image Boot** - Cold start in ~87 seconds with pre-baked model on disk
@@ -1682,6 +1835,7 @@ MIT License - see [LICENSE](LICENSE) for details
 ✅ **Cost Optimization** - ~$97/month flat for unlimited self-hosted inference (no per-token billing)
 ✅ **Advanced Telemetry** - Langfuse, Prometheus, real-time dashboards
 ✅ **Cross-Repo Integration** - Seamless JARVIS ecosystem communication
+✅ **Reactor-Core Training Loop** - DPO/RLHF pipeline to fine-tune the model from real interactions, making prompt-based conciseness permanent
 ✅ **Battle-Tested** - 187K+ requests in production, zero failures
 
 ### v100.0 Highlights
