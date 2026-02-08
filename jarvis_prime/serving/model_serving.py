@@ -897,6 +897,19 @@ class InferenceServer:
             top_p=request.top_p,
         )
 
+        # v237.0: Apply stop sequence post-processing.
+        # HuggingFace generate() doesn't natively support string stop sequences,
+        # so we truncate at the first occurrence of any stop sequence.
+        generated_text = result.text
+        finish_reason = "stop"
+        if request.stop and generated_text:
+            for stop_seq in request.stop:
+                idx = generated_text.find(stop_seq)
+                if idx >= 0:
+                    generated_text = generated_text[:idx].rstrip()
+                    finish_reason = "stop"
+                    break
+
         # Build response
         response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
@@ -906,8 +919,8 @@ class InferenceServer:
             choices=[
                 ChatCompletionChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=result.text),
-                    finish_reason="stop",
+                    message=ChatMessage(role="assistant", content=generated_text),
+                    finish_reason=finish_reason,
                 )
             ],
             usage=ChatCompletionUsage(
@@ -933,24 +946,73 @@ class InferenceServer:
         # Format prompt
         prompt = model._format_chat_messages(messages)
 
+        # v237.0: Lookahead buffer for stop sequence detection.
+        # Hold back the last N characters to catch stop sequences that span chunks.
+        max_stop_len = max((len(s) for s in request.stop), default=0) if request.stop else 0
+        buffer = ""
+
         # Stream generation
         async for chunk in model.stream_async(
             prompt,
             max_new_tokens=request.max_tokens or 512,
             temperature=request.temperature,
         ):
+            buffer += chunk
+
+            # Check for stop sequences in buffer
+            if request.stop:
+                should_stop = False
+                for stop_seq in request.stop:
+                    idx = buffer.find(stop_seq)
+                    if idx >= 0:
+                        # Yield everything before the stop sequence
+                        safe_text = buffer[:idx]
+                        if safe_text:
+                            chunk_data = StreamingChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[{
+                                    "index": 0,
+                                    "delta": {"content": safe_text},
+                                    "finish_reason": None,
+                                }],
+                            )
+                            yield f"data: {json.dumps(chunk_data.to_dict())}\n\n"
+                        should_stop = True
+                        break
+                if should_stop:
+                    break
+
+            # Yield confirmed-safe text (everything except the lookahead window)
+            if len(buffer) > max_stop_len:
+                safe_text = buffer[:-max_stop_len] if max_stop_len > 0 else buffer
+                buffer = buffer[-max_stop_len:] if max_stop_len > 0 else ""
+
+                chunk_data = StreamingChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[{
+                        "index": 0,
+                        "delta": {"content": safe_text},
+                        "finish_reason": None,
+                    }],
+                )
+                yield f"data: {json.dumps(chunk_data.to_dict())}\n\n"
+
+        # Flush remaining buffer (no stop sequence found in it)
+        if buffer:
             chunk_data = StreamingChunk(
                 id=response_id,
                 model=request.model,
                 choices=[{
                     "index": 0,
-                    "delta": {"content": chunk},
+                    "delta": {"content": buffer},
                     "finish_reason": None,
                 }],
             )
             yield f"data: {json.dumps(chunk_data.to_dict())}\n\n"
 
-        # Final chunk
+        # Final chunk with finish_reason
         final_chunk = StreamingChunk(
             id=response_id,
             model=request.model,
