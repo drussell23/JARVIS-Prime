@@ -700,6 +700,8 @@ MODEL_TEMPLATE_MAP = {
     "phi3": "phi3",
     "gemma": "gemma",
     "qwen": "chatml",  # v241.0 R2-3: Qwen2.5 uses ChatML format
+    "deepseek": "chatml",  # v241.1: DeepSeek-R1-Distill-Qwen uses ChatML (Qwen2 arch)
+    "gemma-2": "gemma",  # v241.1: Gemma 2 uses Gemma template
 }
 
 

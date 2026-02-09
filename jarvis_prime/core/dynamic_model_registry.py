@@ -957,6 +957,103 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
         license="Apache-2.0",
         release_date="2024-01",
     ),
+    # v241.1: Advanced reasoning & specialist models for GCP golden image
+    "deepseek-r1-qwen-7b": ModelSpec(
+        model_id="deepseek-r1-qwen-7b",
+        name="DeepSeek R1 Distill Qwen 7B",
+        description="Distilled from DeepSeek-R1 (671B MoE) — explicit chain-of-thought reasoning, "
+                    "excels at multi-step logic, planning, and complex analysis. AIME 2024: 55.5% vs Qwen2.5-7B ~30%",
+        hf_repo="bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+        hf_filename_template="DeepSeek-R1-Distill-Qwen-7B-{quant}.gguf",
+        parameter_count="7B",
+        parameter_count_billions=7.0,
+        context_length=131072,
+        architecture="qwen2",
+        tier_level=ModelTierLevel.TIER_0_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=28.0,
+        tokens_per_second_a100=90.0,
+        memory_required_gb=4.5,
+        capabilities=[
+            ModelCapability.CHAIN_OF_THOUGHT,
+            ModelCapability.REASONING,
+            ModelCapability.MATH,
+            ModelCapability.INSTRUCTION_FOLLOWING,
+        ],
+        primary_use_cases=["complex_reasoning", "logic_puzzles", "planning", "scientific_analysis"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+            QuantizationType.Q5_K_M,
+            QuantizationType.Q8_0,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="MIT",
+        release_date="2025-01",
+    ),
+    "gemma-2-9b": ModelSpec(
+        model_id="gemma-2-9b",
+        name="Google Gemma 2 9B Instruct",
+        description="Google's best sub-10B generalist — tops MMLU (72.3), HellaSwag (81.9), ARC-C (68.4) "
+                    "at this scale. Strongest general intelligence available in the 7-9B range",
+        hf_repo="bartowski/gemma-2-9b-it-GGUF",
+        hf_filename_template="gemma-2-9b-it-{quant}.gguf",
+        parameter_count="9B",
+        parameter_count_billions=9.0,
+        context_length=8192,
+        architecture="gemma2",
+        tier_level=ModelTierLevel.TIER_0_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=24.0,
+        tokens_per_second_a100=80.0,
+        memory_required_gb=5.5,
+        capabilities=[
+            ModelCapability.GENERAL_CHAT,
+            ModelCapability.REASONING,
+            ModelCapability.INSTRUCTION_FOLLOWING,
+            ModelCapability.MULTI_TURN,
+        ],
+        primary_use_cases=["general_knowledge", "nuanced_analysis", "instruction_following", "factual_qa"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+            QuantizationType.Q5_K_M,
+            QuantizationType.Q8_0,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="Gemma-Terms-of-Use",
+        release_date="2024-06",
+    ),
+    "qwen-2.5-math-7b": ModelSpec(
+        model_id="qwen-2.5-math-7b",
+        name="Qwen 2.5 Math 7B Instruct",
+        description="Alibaba's dedicated math specialist — 83.6% on MATH benchmark (vs GPT-4 ~76%). "
+                    "Supports chain-of-thought and tool-integrated reasoning for proofs and calculus",
+        hf_repo="Qwen/Qwen2.5-Math-7B-Instruct-GGUF",
+        hf_filename_template="qwen2.5-math-7b-instruct-{quant}.gguf",
+        parameter_count="7B",
+        parameter_count_billions=7.0,
+        context_length=4096,
+        architecture="qwen2",
+        tier_level=ModelTierLevel.TIER_0_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=28.0,
+        tokens_per_second_a100=90.0,
+        memory_required_gb=4.5,
+        capabilities=[
+            ModelCapability.MATH,
+            ModelCapability.CHAIN_OF_THOUGHT,
+            ModelCapability.REASONING,
+            ModelCapability.INSTRUCTION_FOLLOWING,
+        ],
+        primary_use_cases=["math_proofs", "calculus", "competition_math", "word_problems"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+            QuantizationType.Q5_K_M,
+            QuantizationType.Q8_0,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="Apache-2.0",
+        release_date="2024-09",
+    ),
 }
 
 
@@ -964,8 +1061,8 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
 # v241.0: GCP MULTI-MODEL ROUTING
 # =============================================================================
 
-# Task→Model mapping for GCP CPU-only inference (e2-standard-4, 16 GB RAM)
-# NOTE: LLaVA and BGE excluded — not routable in v241 (see manifest.routable flag)
+# Task→Model mapping for GCP CPU-only inference (e2-highmem-4, 32 GB RAM)
+# NOTE: LLaVA, BGE, TinyLlama excluded — not routable (see manifest.routable flag)
 # Architecture note: JARVIS Body's _infer_task_type() in query_handler.py
 # produces these task_type strings. If you add new types here, update that
 # function too. See gcp_model_swap_coordinator.py for the sister note.
@@ -976,12 +1073,14 @@ GCP_TASK_MODEL_MAPPING: Dict[str, str] = {
     "quick_question": "phi-3.5-mini",
     "voice_command": "phi-3.5-mini",
 
-    # Math/reasoning → Qwen2.5-7B (best-in-class 7B math)
-    "math_simple": "qwen-2.5-7b",
-    "math_complex": "qwen-2.5-7b",
-    "reason_simple": "qwen-2.5-7b",
-    "reason_complex": "qwen-2.5-7b",
-    "analyze": "qwen-2.5-7b",
+    # Math — split by complexity (v241.1)
+    "math_simple": "qwen-2.5-7b",              # Algebra, arithmetic → Qwen2.5-7B
+    "math_complex": "qwen-2.5-math-7b",        # Proofs, calculus, competition → Qwen2.5-Math-7B
+
+    # Reasoning — split by complexity (v241.1)
+    "reason_simple": "qwen-2.5-7b",            # Basic reasoning → Qwen2.5-7B
+    "reason_complex": "deepseek-r1-qwen-7b",   # Multi-step CoT → DeepSeek-R1 distill
+    "analyze": "deepseek-r1-qwen-7b",          # Complex analysis → DeepSeek-R1 distill
 
     # Code → Qwen2.5-Coder-7B (code specialist)
     "code_simple": "qwen-2.5-coder-7b",
@@ -996,10 +1095,10 @@ GCP_TASK_MODEL_MAPPING: Dict[str, str] = {
     "creative_brainstorm": "llama-3.1-8b",
     "summarize": "llama-3.1-8b",
 
-    # General/default → Mistral-7B (current behavior)
-    "general_chat": "mistral-7b",
-    "translate": "mistral-7b",
-    "unknown": "mistral-7b",
+    # General/default → Gemma-2-9B (v241.1: upgraded from Mistral-7B)
+    "general_chat": "gemma-2-9b",
+    "translate": "mistral-7b",                  # Mistral still strong for translation
+    "unknown": "gemma-2-9b",
 }
 
 # Per-model executor config overrides for GCP CPU-only inference.
@@ -1037,6 +1136,25 @@ GCP_MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
     "tinyllama-1.1b": {
         "n_ctx": 2048,
+        "chat_template": "chatml",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    # v241.1: Advanced reasoning & specialist models
+    "deepseek-r1-qwen-7b": {
+        "n_ctx": 32768,         # Qwen2 arch supports 128K but 32K is practical on CPU
+        "chat_template": "chatml",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "gemma-2-9b": {
+        "n_ctx": 8192,
+        "chat_template": "gemma",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "qwen-2.5-math-7b": {
+        "n_ctx": 4096,          # Math queries are typically short
         "chat_template": "chatml",
         "n_gpu_layers": 0,
         "flash_attn": False,

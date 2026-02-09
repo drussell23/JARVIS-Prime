@@ -74,9 +74,14 @@ class ModelEntry:
 # ---------------------------------------------------------------------------
 
 _FILENAME_PATTERNS = {
+    # Order matters: more specific patterns MUST come before generic ones.
+    # _scan_filenames() iterates and breaks on first match.
     re.compile(r"mistral.*7b.*instruct", re.IGNORECASE): "mistral-7b",
-    re.compile(r"qwen.*2\.?5.*7b.*instruct(?!.*coder)", re.IGNORECASE): "qwen-2.5-7b",
     re.compile(r"qwen.*2\.?5.*coder.*7b", re.IGNORECASE): "qwen-2.5-coder-7b",
+    re.compile(r"qwen.*2\.?5.*math.*7b", re.IGNORECASE): "qwen-2.5-math-7b",
+    re.compile(r"qwen.*2\.?5.*7b.*instruct", re.IGNORECASE): "qwen-2.5-7b",  # Generic Qwen — after coder/math
+    re.compile(r"deepseek.*r1.*(?:distill|qwen).*7b", re.IGNORECASE): "deepseek-r1-qwen-7b",
+    re.compile(r"gemma.*2.*9b", re.IGNORECASE): "gemma-2-9b",
     re.compile(r"llava.*1\.?6.*mistral", re.IGNORECASE): "llava-v1.6-mistral-7b",
     re.compile(r"phi.*3\.?5.*mini", re.IGNORECASE): "phi-3.5-mini",
     re.compile(r"llama.*3\.?1.*8b", re.IGNORECASE): "llama-3.1-8b",
