@@ -587,12 +587,20 @@ class TelemetryHook:
                 date_str = datetime.now().strftime("%Y%m%d")
                 shared_path = shared_dir / f"prime_interactions_{date_str}.jsonl"
 
+                # v242.1: Atomic append with file locking to prevent interleaved
+                # writes from multiple processes writing to ~/.jarvis/telemetry/
+                import fcntl
                 with open(shared_path, "a") as f:
-                    for record in records_to_write:
-                        if record.success:
-                            training_data = record.to_training_format()
-                            canonical = from_telemetry_hook_format(training_data)
-                            f.write(json.dumps(canonical.to_reactor_core_format()) + "\n")
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        for record in records_to_write:
+                            if record.success:
+                                training_data = record.to_training_format()
+                                canonical = from_telemetry_hook_format(training_data)
+                                f.write(json.dumps(canonical.to_reactor_core_format()) + "\n")
+                        f.flush()
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             except Exception as e:
                 logger.debug(f"[TelemetryHook] Canonical write failed: {e}")
 

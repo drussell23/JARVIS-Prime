@@ -1405,6 +1405,7 @@ async def main():
             async def stream_generator():
                 start = time.time()
                 token_count = 0
+                accumulated_content = []  # v242.1: Accumulate for telemetry
 
                 try:
                     async for token in _executor.generate_stream(
@@ -1413,6 +1414,7 @@ async def main():
                         temperature=request.temperature,
                     ):
                         token_count += 1
+                        accumulated_content.append(token)
                         chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -1442,6 +1444,22 @@ async def main():
 
                     latency_ms = (time.time() - start) * 1000
                     _record_inference_metrics(prompt_tokens, token_count, latency_ms, True)
+
+                    # v242.1: Capture streaming interaction for training data pipeline
+                    if _telemetry_hook and accumulated_content:
+                        try:
+                            full_response = "".join(accumulated_content)
+                            asyncio.create_task(_capture_interaction(
+                                messages=messages,
+                                response_text=full_response,
+                                model_id=_v241_active_model_id,
+                                task_type=_v241_task_type,
+                                latency_ms=latency_ms,
+                                tokens_used=token_count,
+                                success=True,
+                            ))
+                        except Exception as e:
+                            logger.debug(f"[v242.1] Stream telemetry capture failed: {e}")
 
                 except Exception as e:
                     logger.error(f"Streaming error: {e}")

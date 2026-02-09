@@ -701,39 +701,54 @@ class ReactorCoreBridge:
                 logger.info(f"[Bridge] Uploaded {uploaded} {data_type} to {output_file}")
 
             elif self._config.communication_method == CommunicationMethod.REST_API:
-                # HTTP upload: POST each item to experiences/stream endpoint
+                # v242.1: HTTP upload via batch endpoint (single request for all items)
+                # Falls back to per-item POST if batch endpoint unavailable
                 import aiohttp
 
-                url = f"{self._config.api_url}/api/v1/experiences/stream"
+                # Convert all items to canonical format
+                batch_items = []
+                for item in data:
+                    if _has_schema:
+                        event = ExperienceEvent(
+                            event_type=ExperienceType.INTERACTION,
+                            source=ExperienceSource.JARVIS_PRIME,
+                            user_input=item.get("instruction", item.get("user_input", "")),
+                            assistant_output=item.get("output", item.get("assistant_output", "")),
+                            confidence=item.get("metadata", {}).get("feedback_score", 1.0),
+                            metadata=item.get("metadata", {}),
+                        )
+                        batch_items.append(event.to_reactor_core_format())
+                    else:
+                        batch_items.append(item)
+
                 async with aiohttp.ClientSession() as session:
-                    for item in data:
-                        if _has_schema:
-                            event = ExperienceEvent(
-                                event_type=ExperienceType.INTERACTION,
-                                source=ExperienceSource.JARVIS_PRIME,
-                                user_input=item.get("instruction", item.get("user_input", "")),
-                                assistant_output=item.get("output", item.get("assistant_output", "")),
-                                confidence=item.get("metadata", {}).get("feedback_score", 1.0),
-                                metadata=item.get("metadata", {}),
-                            )
-                            payload = {
-                                "experience": event.to_reactor_core_format(),
-                                "source": "jarvis_prime",
-                            }
-                        else:
-                            payload = {"experience": item, "source": "jarvis_prime"}
-
-                        try:
-                            async with session.post(url, json=payload) as resp:
-                                if resp.status == 200:
-                                    uploaded += 1
-                                else:
-                                    text = await resp.text()
-                                    logger.warning(f"[Bridge] Upload failed ({resp.status}): {text[:200]}")
-                        except Exception as e:
-                            logger.warning(f"[Bridge] Upload request failed: {e}")
-
-                logger.info(f"[Bridge] Uploaded {uploaded}/{len(data)} {data_type} via REST API")
+                    # Try batch endpoint first (v242.1)
+                    batch_url = f"{self._config.api_url}/api/v1/experiences/batch"
+                    try:
+                        payload = {"experiences": batch_items, "source": "jarvis_prime"}
+                        async with session.post(batch_url, json=payload) as resp:
+                            if resp.status == 200:
+                                result = await resp.json()
+                                uploaded = result.get("accepted", 0)
+                                logger.info(f"[Bridge] Batch uploaded {uploaded}/{len(data)} {data_type}")
+                            elif resp.status == 404:
+                                # Batch endpoint not available — fall back to per-item
+                                logger.debug("[Bridge] Batch endpoint not available, falling back to per-item")
+                                url = f"{self._config.api_url}/api/v1/experiences/stream"
+                                for exp_item in batch_items:
+                                    try:
+                                        item_payload = {"experience": exp_item, "source": "jarvis_prime"}
+                                        async with session.post(url, json=item_payload) as item_resp:
+                                            if item_resp.status == 200:
+                                                uploaded += 1
+                                    except Exception:
+                                        pass
+                                logger.info(f"[Bridge] Per-item uploaded {uploaded}/{len(data)} {data_type}")
+                            else:
+                                text = await resp.text()
+                                logger.warning(f"[Bridge] Batch upload failed ({resp.status}): {text[:200]}")
+                    except Exception as e:
+                        logger.warning(f"[Bridge] Upload request failed: {e}")
 
             return uploaded > 0
 
