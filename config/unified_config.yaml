@@ -830,3 +830,103 @@ development:
     echo: "/test/echo"
     health: "/test/health"
     metrics: "/test/metrics"
+
+# =============================================================================
+# v241.0: GCP Multi-Model Routing (e2-standard-4, 16 GB RAM, CPU-only)
+# =============================================================================
+gcp_model_routing:
+  enabled: "${GCP_MULTI_MODEL_ENABLED:-true}"
+  default_model: "${GCP_DEFAULT_MODEL:-mistral-7b}"
+  models_dir: "${GCP_MODELS_DIR:-/opt/jarvis-prime/models}"
+
+  # Per-model-size cooldowns to prevent swap thrashing
+  cooldown_small_seconds: 30    # Models < 3 GB (Phi-3.5-mini, TinyLlama)
+  cooldown_medium_seconds: 60   # Models 3-5 GB (Mistral, Qwen)
+  cooldown_large_seconds: 90    # Models > 5 GB (LLaVA, Llama-3.1)
+
+  swap_queue_max_size: 50
+  swap_validation_timeout: 30
+
+  # Model inventory (all Q4_K_M GGUF)
+  # routable: false = pre-staged but not task-routable in v241
+  models:
+    mistral-7b:
+      repo: "TheBloke/Mistral-7B-Instruct-v0.2-GGUF"
+      filename: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+      size_gb: 4.4
+      routable: true
+      role: "General conversational AI"
+      config_overrides:
+        n_ctx: 8192
+        chat_template: "mistral"
+        n_gpu_layers: 0
+        flash_attn: false
+
+    qwen-2.5-7b:
+      repo: "Qwen/Qwen2.5-7B-Instruct-GGUF"
+      filename: "qwen2.5-7b-instruct-q4_k_m.gguf"
+      size_gb: 4.4
+      routable: true
+      role: "Math & reasoning specialist"
+      config_overrides:
+        n_ctx: 32768
+        chat_template: "chatml"
+        n_gpu_layers: 0
+        flash_attn: false
+
+    qwen-2.5-coder-7b:
+      repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+      filename: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+      size_gb: 4.4
+      routable: true
+      role: "Code generation & debugging"
+      config_overrides:
+        n_ctx: 32768
+        chat_template: "chatml"
+        n_gpu_layers: 0
+        flash_attn: false
+
+    llava-v1.6-mistral-7b:
+      repo: "cjpais/llava-v1.6-mistral-7b-gguf"
+      filename: "llava-v1.6-mistral-7b.Q4_K_M.gguf"
+      size_gb: 4.9
+      routable: false  # Needs CLIP encoder + multimodal inference (v242)
+      role: "Vision / multimodal (pre-staged, not yet routable)"
+
+    phi-3.5-mini:
+      repo: "bartowski/Phi-3.5-mini-instruct-GGUF"
+      filename: "Phi-3.5-mini-instruct-Q4_K_M.gguf"
+      size_gb: 2.2
+      routable: true
+      role: "Fast lightweight inference"
+      config_overrides:
+        n_ctx: 4096
+        chat_template: "phi3"
+        n_gpu_layers: 0
+        flash_attn: false
+
+    llama-3.1-8b:
+      repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+      filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+      size_gb: 4.9
+      routable: true
+      role: "Long context & creative"
+      config_overrides:
+        n_ctx: 8192
+        chat_template: "llama3"
+        n_gpu_layers: 0
+        flash_attn: false
+
+    tinyllama-1.1b:
+      repo: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
+      filename: "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+      size_gb: 0.67
+      routable: false  # Speculative decoding draft
+      role: "Speculative decoding draft"
+
+    bge-large-en:
+      repo: "TaylorAI/bge-large-en-v1.5-gguf"
+      filename: "bge-large-en-v1.5-q4_k_m.gguf"
+      size_gb: 0.17
+      routable: false  # Embedding model — no generate() path
+      role: "Embedding for RAG (pre-staged)"

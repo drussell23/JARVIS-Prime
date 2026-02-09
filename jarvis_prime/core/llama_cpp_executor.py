@@ -699,6 +699,7 @@ MODEL_TEMPLATE_MAP = {
     "phi-3": "phi3",
     "phi3": "phi3",
     "gemma": "gemma",
+    "qwen": "chatml",  # v241.0 R2-3: Qwen2.5 uses ChatML format
 }
 
 

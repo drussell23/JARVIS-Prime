@@ -863,6 +863,184 @@ KNOWN_MODELS: Dict[str, ModelSpec] = {
         is_moe=True,
         moe_active_params=2.4,
     ),
+    # =========================================================================
+    # v241.0: Additional models for GCP multi-model golden image
+    # =========================================================================
+    "qwen-2.5-coder-7b": ModelSpec(
+        model_id="qwen-2.5-coder-7b",
+        name="Qwen 2.5 Coder 7B Instruct",
+        description="Alibaba's code-specialized 7B — best-in-class for code generation & debugging",
+        hf_repo="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        hf_filename_template="qwen2.5-coder-7b-instruct-{quant}.gguf",
+        parameter_count="7B",
+        parameter_count_billions=7.0,
+        context_length=131072,
+        architecture="qwen2",
+        tier_level=ModelTierLevel.TIER_0_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=28.0,
+        tokens_per_second_a100=90.0,
+        memory_required_gb=4.5,
+        capabilities=[
+            ModelCapability.CODE_GENERATION,
+            ModelCapability.CODE_ANALYSIS,
+            ModelCapability.CODE_EXPERT,
+            ModelCapability.INSTRUCTION_FOLLOWING,
+            ModelCapability.LONG_CONTEXT,
+        ],
+        primary_use_cases=["code_generation", "code_review", "debugging", "refactoring"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+            QuantizationType.Q5_K_M,
+            QuantizationType.Q8_0,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="Apache-2.0",
+        release_date="2024-09",
+    ),
+    "llama-3.1-8b": ModelSpec(
+        model_id="llama-3.1-8b",
+        name="Meta Llama 3.1 8B Instruct",
+        description="Meta's 8B with native 128K context — great for long documents & creative tasks",
+        hf_repo="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        hf_filename_template="Meta-Llama-3.1-8B-Instruct-{quant}.gguf",
+        parameter_count="8B",
+        parameter_count_billions=8.0,
+        context_length=131072,
+        architecture="llama",
+        tier_level=ModelTierLevel.TIER_0_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=26.0,
+        tokens_per_second_a100=85.0,
+        memory_required_gb=5.0,
+        capabilities=[
+            ModelCapability.GENERAL_CHAT,
+            ModelCapability.CREATIVE,
+            ModelCapability.SUMMARIZATION,
+            ModelCapability.LONG_CONTEXT,
+            ModelCapability.MULTI_TURN,
+            ModelCapability.INSTRUCTION_FOLLOWING,
+        ],
+        primary_use_cases=["creative_writing", "summarization", "long_context", "brainstorming"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+            QuantizationType.Q5_K_M,
+            QuantizationType.Q8_0,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="Llama-3.1-Community",
+        release_date="2024-07",
+    ),
+    "tinyllama-1.1b": ModelSpec(
+        model_id="tinyllama-1.1b",
+        name="TinyLlama 1.1B Chat v1.0",
+        description="Ultra-small 1.1B — speculative decoding draft model, not for standalone use",
+        hf_repo="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+        hf_filename_template="tinyllama-1.1b-chat-v1.0.{quant}.gguf",
+        parameter_count="1.1B",
+        parameter_count_billions=1.1,
+        context_length=2048,
+        architecture="llama",
+        tier_level=ModelTierLevel.TIER_0_ULTRA_FAST,
+        location=ModelLocation.LOCAL_ONLY,
+        tokens_per_second_m1=120.0,
+        tokens_per_second_a100=300.0,
+        memory_required_gb=0.7,
+        capabilities=[
+            ModelCapability.FAST_INFERENCE,
+        ],
+        primary_use_cases=["speculative_decoding_draft"],
+        available_quantizations=[
+            QuantizationType.Q4_K_M,
+        ],
+        default_quantization=QuantizationType.Q4_K_M,
+        license="Apache-2.0",
+        release_date="2024-01",
+    ),
+}
+
+
+# =============================================================================
+# v241.0: GCP MULTI-MODEL ROUTING
+# =============================================================================
+
+# Task→Model mapping for GCP CPU-only inference (e2-standard-4, 16 GB RAM)
+# NOTE: LLaVA and BGE excluded — not routable in v241 (see manifest.routable flag)
+# Architecture note: JARVIS Body's _infer_task_type() in query_handler.py
+# produces these task_type strings. If you add new types here, update that
+# function too. See gcp_model_swap_coordinator.py for the sister note.
+GCP_TASK_MODEL_MAPPING: Dict[str, str] = {
+    # Fast tasks → Phi-3.5-mini (2.2 GB, ~3s latency)
+    "greeting": "phi-3.5-mini",
+    "simple_chat": "phi-3.5-mini",
+    "quick_question": "phi-3.5-mini",
+    "voice_command": "phi-3.5-mini",
+
+    # Math/reasoning → Qwen2.5-7B (best-in-class 7B math)
+    "math_simple": "qwen-2.5-7b",
+    "math_complex": "qwen-2.5-7b",
+    "reason_simple": "qwen-2.5-7b",
+    "reason_complex": "qwen-2.5-7b",
+    "analyze": "qwen-2.5-7b",
+
+    # Code → Qwen2.5-Coder-7B (code specialist)
+    "code_simple": "qwen-2.5-coder-7b",
+    "code_complex": "qwen-2.5-coder-7b",
+    "code_review": "qwen-2.5-coder-7b",
+    "code_explain": "qwen-2.5-coder-7b",
+    "code_architecture": "qwen-2.5-coder-7b",
+    "code_debug": "qwen-2.5-coder-7b",
+
+    # Long context / creative → Llama-3.1-8B (128K context)
+    "creative_write": "llama-3.1-8b",
+    "creative_brainstorm": "llama-3.1-8b",
+    "summarize": "llama-3.1-8b",
+
+    # General/default → Mistral-7B (current behavior)
+    "general_chat": "mistral-7b",
+    "translate": "mistral-7b",
+    "unknown": "mistral-7b",
+}
+
+# Per-model executor config overrides for GCP CPU-only inference.
+# Passed as **kwargs to LlamaCppExecutor.load() which merges with base config.
+GCP_MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "mistral-7b": {
+        "n_ctx": 8192,
+        "chat_template": "mistral",
+        "n_gpu_layers": 0,       # CPU-only on GCP
+        "flash_attn": False,     # No GPU flash attention on CPU
+    },
+    "qwen-2.5-7b": {
+        "n_ctx": 32768,
+        "chat_template": "chatml",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "qwen-2.5-coder-7b": {
+        "n_ctx": 32768,
+        "chat_template": "chatml",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "phi-3.5-mini": {
+        "n_ctx": 4096,
+        "chat_template": "phi3",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "llama-3.1-8b": {
+        "n_ctx": 8192,           # Don't use full 128K on 16 GB RAM
+        "chat_template": "llama3",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
+    "tinyllama-1.1b": {
+        "n_ctx": 2048,
+        "chat_template": "chatml",
+        "n_gpu_layers": 0,
+        "flash_attn": False,
+    },
 }
 
 

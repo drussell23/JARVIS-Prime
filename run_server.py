@@ -784,6 +784,7 @@ _startup_state: Optional[StartupState] = None
 _bridge = None
 _neural_orchestrator = None
 _executor = None
+_model_coordinator = None  # v241.0: GCP multi-model swap coordinator
 _agi_hub = None
 _trinity_initialized = False
 _trinity_record_inference = None
@@ -1071,6 +1072,7 @@ async def main():
         max_tokens: int = 512
         temperature: float = 0.7
         stream: bool = False
+        metadata: Optional[Dict[str, Any]] = None  # v241.0: task_type hints from JARVIS Body
 
     class GenerateRequest(BaseModel):
         prompt: str
@@ -1288,6 +1290,26 @@ async def main():
         if _is_hollow_client_active():
             return await _route_to_gcp_chat_completions(request)
 
+        # v241.0: Extract task_type from metadata for model swap routing
+        _v241_task_type = None
+        _v241_active_model_id = None
+        if request.metadata:
+            _v241_task_type = request.metadata.get("task_type")
+            if _v241_task_type:
+                logger.debug(f"[v241] Task type hint from JARVIS Body: {_v241_task_type}")
+
+        # v241.0: Pre-hook — ensure correct model loaded for task type.
+        # This swaps the model in _executor in-place. All existing code below
+        # (format_messages, generate, generate_stream) runs UNCHANGED.
+        if _model_coordinator:
+            try:
+                _v241_active_model_id = await _model_coordinator.ensure_model(_v241_task_type)
+            except Exception as _v241_err:
+                # If it's an HTTPException (503 from bounded queue), re-raise
+                if isinstance(_v241_err, HTTPException):
+                    raise
+                logger.warning(f"[v241] Model swap coordinator error: {_v241_err}")
+
         # Format messages
         from jarvis_prime.core.model_manager import ChatMessage
         messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
@@ -1390,14 +1412,17 @@ async def main():
                     yield f"data: {json.dumps(error_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
 
+            _stream_headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+            if _v241_active_model_id:  # v241.0: per-model telemetry
+                _stream_headers["X-Model-Id"] = _v241_active_model_id
             return StreamingResponse(
                 stream_generator(),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=_stream_headers,
             )
 
         # Non-streaming response
@@ -1438,6 +1463,7 @@ async def main():
                 },
                 "x_latency_ms": latency_ms,
                 "x_routing": routing_metadata,
+                "x_model_id": _v241_active_model_id,  # v241.0: per-model telemetry
             }
         except Exception as e:
             logger.error(f"Chat error: {e}")
@@ -1998,6 +2024,7 @@ async def main():
         """
         global _bridge, _executor, _agi_hub, _neural_orchestrator, _model_path
         global _trinity_initialized, _trinity_record_inference, _neural_routing_enabled
+        global _model_coordinator  # v241.0
 
         try:
             _startup_state.phase = "initializing"
@@ -2604,6 +2631,31 @@ async def main():
                         pass
 
             # -----------------------------------------------------------------
+            # STEP 8b: v241.0 — Initialize GCP model swap coordinator
+            # -----------------------------------------------------------------
+            _model_coordinator = None
+            _v241_models_dir = Path(os.getenv("GCP_MODELS_DIR", "/opt/jarvis-prime/models"))
+            _v241_manifest = _v241_models_dir / "manifest.json"
+            if _v241_manifest.exists():
+                try:
+                    from jarvis_prime.core.gcp_model_swap_coordinator import GCPModelSwapCoordinator
+                    _model_coordinator = GCPModelSwapCoordinator(
+                        executor=_executor,
+                        models_dir=_v241_models_dir,
+                        manifest_path=_v241_manifest,
+                    )
+                    await _model_coordinator.initialize()
+                    logger.info(
+                        f"[v241] Model swap coordinator initialized: "
+                        f"{len(_model_coordinator.inventory)} models in inventory"
+                    )
+                except Exception as _v241_init_err:
+                    logger.warning(f"[v241] Coordinator init failed: {_v241_init_err}")
+                    _model_coordinator = None
+            else:
+                logger.info("[v241] No model manifest found — single-model mode (backward compat)")
+
+            # -----------------------------------------------------------------
             # STEP 9: Mark ready (v93.7: with enhanced logging)
             # -----------------------------------------------------------------
             step_start = time.time()
@@ -2655,9 +2707,15 @@ async def main():
             else:
                 logger.info("   ├─ AGI Integration Hub: Not initialized")
             if _neural_routing_enabled:
-                logger.info("   └─ Neural Orchestrator v100.0: Active")
+                logger.info("   ├─ Neural Orchestrator v100.0: Active")
             else:
-                logger.info("   └─ Neural Orchestrator: Not initialized")
+                logger.info("   ├─ Neural Orchestrator: Not initialized")
+            if _model_coordinator:
+                _v241_inv = _model_coordinator.inventory
+                _v241_routable = sum(1 for e in _v241_inv.values() if e.routable)
+                logger.info(f"   └─ GCP Model Coordinator v241.0: {_v241_routable} routable / {len(_v241_inv)} total")
+            else:
+                logger.info("   └─ GCP Model Coordinator: Not active (single-model mode)")
 
             logger.info("")
             logger.info("=" * 70)
