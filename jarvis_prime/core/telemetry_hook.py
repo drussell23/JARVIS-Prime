@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -573,6 +574,27 @@ class TelemetryHook:
                     for record in records_to_write:
                         if record.success:  # Only include successful completions
                             f.write(json.dumps(record.to_training_format()) + "\n")
+
+            # v242.0: Also write in canonical format to shared telemetry dir
+            try:
+                _jarvis_home = str(Path.home() / ".jarvis")
+                if _jarvis_home not in sys.path:
+                    sys.path.insert(0, _jarvis_home)
+                from schemas.experience_schema import from_telemetry_hook_format
+
+                shared_dir = Path.home() / ".jarvis" / "telemetry"
+                shared_dir.mkdir(parents=True, exist_ok=True)
+                date_str = datetime.now().strftime("%Y%m%d")
+                shared_path = shared_dir / f"prime_interactions_{date_str}.jsonl"
+
+                with open(shared_path, "a") as f:
+                    for record in records_to_write:
+                        if record.success:
+                            training_data = record.to_training_format()
+                            canonical = from_telemetry_hook_format(training_data)
+                            f.write(json.dumps(canonical.to_reactor_core_format()) + "\n")
+            except Exception as e:
+                logger.debug(f"[TelemetryHook] Canonical write failed: {e}")
 
             self._file_record_count += len(records_to_write)
             logger.debug(f"Flushed {len(records_to_write)} records to {self._current_file}")

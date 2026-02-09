@@ -785,6 +785,7 @@ _bridge = None
 _neural_orchestrator = None
 _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
+_telemetry_hook = None  # v242.0: Training data capture
 _agi_hub = None
 _trinity_initialized = False
 _trinity_record_inference = None
@@ -1281,10 +1282,57 @@ async def main():
                 detail={"error": f"GCP endpoint unreachable: {e}"}
             )
 
+    # v242.0: Telemetry capture helper for training data pipeline
+    async def _capture_interaction(
+        messages: list,
+        response_text: str,
+        model_id: Optional[str] = None,
+        task_type: Optional[str] = None,
+        latency_ms: float = 0.0,
+        tokens_used: int = 0,
+        success: bool = True,
+    ) -> None:
+        """v242.0: Capture interaction for training data pipeline."""
+        if not _telemetry_hook:
+            return
+
+        try:
+            # Extract user's last message as prompt
+            user_input = ""
+            for msg in reversed(messages):
+                if isinstance(msg, dict):
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                elif hasattr(msg, "role"):
+                    role = msg.role
+                    content = msg.content
+                else:
+                    continue
+                if role == "user":
+                    user_input = content
+                    break
+
+            await _telemetry_hook.log(
+                prompt=user_input,
+                completion=response_text,
+                model_version=model_id or "unknown",
+                latency_ms=latency_ms,
+                success=success,
+                task_type=task_type or "",
+                metadata={
+                    "task_type": task_type,
+                    "tokens_used": tokens_used,
+                    "source": "jarvis_prime",
+                },
+            )
+        except Exception as e:
+            logger.debug(f"[v242] Telemetry record failed: {e}")
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatRequest):
         """OpenAI-compatible chat completions with unified intelligent routing (v100.0)."""
         _check_ready()
+        _req_start = time.time()  # v242.0: Track request timing for telemetry
 
         # v150.0: Route to GCP when hollow client mode is active
         if _is_hollow_client_active():
@@ -1445,6 +1493,26 @@ async def main():
                     await _neural_orchestrator.record_circuit_success(routing_result.tier.name)
                 except Exception:
                     pass
+
+            # v242.0: Capture interaction for training data pipeline
+            if _telemetry_hook:
+                try:
+                    usage = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    }
+                    asyncio.create_task(_capture_interaction(
+                        messages=messages,
+                        response_text=response,
+                        model_id=_v241_active_model_id,
+                        task_type=_v241_task_type,
+                        latency_ms=(time.time() - _req_start) * 1000,
+                        tokens_used=usage.get("total_tokens", 0),
+                        success=True,
+                    ))
+                except Exception as e:
+                    logger.debug(f"[v242] Telemetry capture failed: {e}")
 
             return {
                 "id": completion_id,
@@ -2025,6 +2093,7 @@ async def main():
         global _bridge, _executor, _agi_hub, _neural_orchestrator, _model_path
         global _trinity_initialized, _trinity_record_inference, _neural_routing_enabled
         global _model_coordinator  # v241.0
+        global _telemetry_hook  # v242.0
 
         try:
             _startup_state.phase = "initializing"
@@ -2656,6 +2725,20 @@ async def main():
                 logger.info("[v241] No model manifest found — single-model mode (backward compat)")
 
             # -----------------------------------------------------------------
+            # STEP 8c: v242.0 — Initialize telemetry hook for training data capture
+            # -----------------------------------------------------------------
+            _telemetry_hook = None
+            try:
+                from jarvis_prime.core.telemetry_hook import TelemetryHook
+                telemetry_dir = Path(os.getenv("JARVIS_TELEMETRY_DIR", str(Path.home() / ".jarvis" / "telemetry")))
+                telemetry_dir.mkdir(parents=True, exist_ok=True)
+                _telemetry_hook = TelemetryHook(output_dir=str(telemetry_dir))
+                await _telemetry_hook.start()
+                logger.info("[v242] Telemetry hook initialized for training data capture")
+            except Exception as e:
+                logger.warning(f"[v242] Telemetry hook initialization failed (non-critical): {e}")
+
+            # -----------------------------------------------------------------
             # STEP 9: Mark ready (v93.7: with enhanced logging)
             # -----------------------------------------------------------------
             step_start = time.time()
@@ -2713,9 +2796,13 @@ async def main():
             if _model_coordinator:
                 _v241_inv = _model_coordinator.inventory
                 _v241_routable = sum(1 for e in _v241_inv.values() if e.routable)
-                logger.info(f"   └─ GCP Model Coordinator v241.0: {_v241_routable} routable / {len(_v241_inv)} total")
+                logger.info(f"   ├─ GCP Model Coordinator v241.0: {_v241_routable} routable / {len(_v241_inv)} total")
             else:
-                logger.info("   └─ GCP Model Coordinator: Not active (single-model mode)")
+                logger.info("   ├─ GCP Model Coordinator: Not active (single-model mode)")
+            if _telemetry_hook:
+                logger.info(f"   └─ Telemetry Hook v242.0: Active ({_telemetry_hook.output_dir})")
+            else:
+                logger.info("   └─ Telemetry Hook: Not initialized")
 
             logger.info("")
             logger.info("=" * 70)

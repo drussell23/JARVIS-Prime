@@ -629,6 +629,118 @@ class ReactorCoreBridge:
         self._jobs_submitted += 1
         return job.id
 
+    async def upload_training_data(
+        self,
+        data: List[Dict[str, Any]],
+        data_type: str = "instructions",
+    ) -> bool:
+        """
+        v242.0: Upload training data to Reactor Core.
+
+        Called by TrainingDataPipeline._sync_to_reactor() to send
+        collected and annotated training data.
+
+        Args:
+            data: List of training examples (instruction/output dicts)
+            data_type: Type of data ("instructions", "preferences", "conversations")
+
+        Returns:
+            True if upload succeeded, False otherwise.
+        """
+        if not data:
+            logger.info("[Bridge] No data to upload")
+            return True
+
+        try:
+            # Convert to canonical experience format
+            import sys as _sys
+            _jarvis_home = str(Path.home() / ".jarvis")
+            if _jarvis_home not in _sys.path:
+                _sys.path.insert(0, _jarvis_home)
+
+            try:
+                from schemas.experience_schema import (
+                    ExperienceEvent,
+                    ExperienceSource,
+                    ExperienceType,
+                    SCHEMA_VERSION,
+                )
+                _has_schema = True
+            except ImportError:
+                _has_schema = False
+
+            uploaded = 0
+
+            if self._config.communication_method == CommunicationMethod.FILE_SYSTEM:
+                # File-based upload: write to shared directory
+                data_dir = Path(self._config.data_dir)
+                data_dir.mkdir(parents=True, exist_ok=True)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_file = data_dir / f"{data_type}_{timestamp}.jsonl"
+
+                with open(output_file, "w") as f:
+                    for item in data:
+                        if _has_schema:
+                            event = ExperienceEvent(
+                                event_type=ExperienceType.INTERACTION,
+                                source=ExperienceSource.JARVIS_PRIME,
+                                user_input=item.get("instruction", item.get("user_input", "")),
+                                assistant_output=item.get("output", item.get("assistant_output", "")),
+                                system_context=item.get("input", item.get("system_context")),
+                                confidence=item.get("metadata", {}).get("feedback_score", 1.0),
+                                model_id=item.get("metadata", {}).get("model_id"),
+                                task_type=item.get("metadata", {}).get("task_type"),
+                                metadata=item.get("metadata", {}),
+                            )
+                            f.write(json.dumps(event.to_reactor_core_format()) + "\n")
+                        else:
+                            f.write(json.dumps(item) + "\n")
+                        uploaded += 1
+
+                logger.info(f"[Bridge] Uploaded {uploaded} {data_type} to {output_file}")
+
+            elif self._config.communication_method == CommunicationMethod.REST_API:
+                # HTTP upload: POST each item to experiences/stream endpoint
+                import aiohttp
+
+                url = f"{self._config.api_url}/api/v1/experiences/stream"
+                async with aiohttp.ClientSession() as session:
+                    for item in data:
+                        if _has_schema:
+                            event = ExperienceEvent(
+                                event_type=ExperienceType.INTERACTION,
+                                source=ExperienceSource.JARVIS_PRIME,
+                                user_input=item.get("instruction", item.get("user_input", "")),
+                                assistant_output=item.get("output", item.get("assistant_output", "")),
+                                confidence=item.get("metadata", {}).get("feedback_score", 1.0),
+                                metadata=item.get("metadata", {}),
+                            )
+                            payload = {
+                                "experience": event.to_reactor_core_format(),
+                                "source": "jarvis_prime",
+                            }
+                        else:
+                            payload = {"experience": item, "source": "jarvis_prime"}
+
+                        try:
+                            async with session.post(url, json=payload) as resp:
+                                if resp.status == 200:
+                                    uploaded += 1
+                                else:
+                                    text = await resp.text()
+                                    logger.warning(f"[Bridge] Upload failed ({resp.status}): {text[:200]}")
+                        except Exception as e:
+                            logger.warning(f"[Bridge] Upload request failed: {e}")
+
+                logger.info(f"[Bridge] Uploaded {uploaded}/{len(data)} {data_type} via REST API")
+
+            return uploaded > 0
+
+        except Exception as e:
+            logger.error(f"[Bridge] upload_training_data failed: {e}")
+            return False
+
     async def _submit_job(self, job: TrainingJob) -> None:
         """Submit job to Reactor Core."""
         if self._config.communication_method == CommunicationMethod.FILE_SYSTEM:
