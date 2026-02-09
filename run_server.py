@@ -1291,6 +1291,7 @@ async def main():
         latency_ms: float = 0.0,
         tokens_used: int = 0,
         success: bool = True,
+        error: Optional[str] = None,
     ) -> None:
         """v242.0: Capture interaction for training data pipeline."""
         if not _telemetry_hook:
@@ -1312,6 +1313,16 @@ async def main():
                     user_input = content
                     break
 
+            metadata = {
+                "task_type": task_type,
+                "tokens_used": tokens_used,
+                "source": "jarvis_prime",
+            }
+            # v242.2: Include error info for failed interactions — valuable for DPO
+            if error:
+                metadata["error"] = error
+                metadata["outcome"] = "failure"
+
             await _telemetry_hook.log(
                 prompt=user_input,
                 completion=response_text,
@@ -1319,11 +1330,7 @@ async def main():
                 latency_ms=latency_ms,
                 success=success,
                 task_type=task_type or "",
-                metadata={
-                    "task_type": task_type,
-                    "tokens_used": tokens_used,
-                    "source": "jarvis_prime",
-                },
+                metadata=metadata,
             )
         except Exception as e:
             logger.debug(f"[v242] Telemetry record failed: {e}")
@@ -1463,7 +1470,27 @@ async def main():
 
                 except Exception as e:
                     logger.error(f"Streaming error: {e}")
-                    _record_inference_metrics(0, 0, 0, False)
+                    latency_ms = (time.time() - start) * 1000
+                    _record_inference_metrics(prompt_tokens, token_count, latency_ms, False)
+
+                    # v242.2: Capture partial streaming response on error for training data
+                    # Failure data is valuable — DPO generator can use as negative examples
+                    if _telemetry_hook and accumulated_content:
+                        try:
+                            partial_response = "".join(accumulated_content)
+                            asyncio.create_task(_capture_interaction(
+                                messages=messages,
+                                response_text=partial_response,
+                                model_id=_v241_active_model_id,
+                                task_type=_v241_task_type,
+                                latency_ms=latency_ms,
+                                tokens_used=token_count,
+                                success=False,
+                                error=str(e),
+                            ))
+                        except Exception as cap_err:
+                            logger.debug(f"[v242.2] Failed to capture error telemetry: {cap_err}")
+
                     error_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
