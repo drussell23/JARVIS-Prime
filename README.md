@@ -1788,6 +1788,77 @@ Savings: $154.50/month (86% reduction) 🎉
 
 ## 🗺️ Roadmap
 
+### v243.0 - Ouroboros: JARVIS Self-Programming (Planned)
+
+JARVIS becomes capable of reading, understanding, and improving its own codebase autonomously using a two-model pipeline:
+
+- [ ] **Architect phase** — DeepSeek-R1-Distill-Qwen-14B analyzes the JARVIS/J-Prime/Reactor-Core codebase, plans changes with explicit `<think>` reasoning traces. Outputs structured plan with file paths, line numbers, specific changes, and risk assessment.
+- [ ] **Implementer phase** — Qwen2.5-Coder-14B-Instruct generates code diffs from the architect's plan. Multi-file changes with correct imports, type hints, and docstrings.
+- [ ] **Verifier phase** — DeepSeek-R1-14B reviews generated code, checks for missed requirements, sends back for revision if needed.
+- [ ] **Execution pipeline** — Architect (R1-14B, ~20-40s) → model swap (~30s) → Implementer (Coder-14B, ~20-40s) → model swap (~30s) → Verifier (R1-14B, ~15-25s). Total: ~2-3 minutes per self-improvement cycle.
+- [ ] **Safety guardrails** — Changes require human approval before commit. Automated test suite must pass. Automatic rollback on any failure. Git branch isolation for all self-modifications.
+- [ ] **Self-improvement targets** — Optimize model swap cooldowns from real usage patterns. Refactor detected code smells. Auto-generate missing test cases. Update documentation from code changes.
+
+**Why two models, not one:**
+A specialist 14B code model generates better code than a generalist. A specialist 14B reasoning model produces better architectural plans than a code model. The model swap (~30s) is cheaper than the quality loss of using one model for both phases. Self-programming is not latency-sensitive — correctness matters more than speed.
+
+### v242.0 - Training Data Pipeline Activation (Planned)
+
+Activate the JARVIS Body → Reactor Core → fine-tuning → deployment loop. The infrastructure is ~80% built across all three repos. Key connection points need wiring:
+
+**What's built (working):**
+- [x] `TelemetryEmitter` in JARVIS Body — emits `emit_interaction()` after every command via `UnifiedCommandProcessor`
+- [x] `TrinityExperienceReceiver` in Reactor Core — watches `~/.jarvis/` directories for event files, deduplication, ordering
+- [x] `TelemetryIngestor` in Reactor Core — reads JSONL from `~/.jarvis/telemetry/`
+- [x] `UnifiedTrainingPipeline` in Reactor Core — DPO/LoRA training, GGUF export
+- [x] `HotSwapManager` in J-Prime — accepts fine-tuned GGUF files, zero-downtime swap
+- [x] `TrainingDataPipeline` in J-Prime — captures conversations, generates DPO pairs
+
+**What's broken (needs fixing):**
+- [ ] **Fix A: JSONL format alignment** — `TelemetryEmitter` disk output must match `TelemetryIngestor`'s expected format (event_type, properties.user_input, properties.output, metrics.model_id)
+- [ ] **Fix B: J-Prime interaction capture** — `run_server.py` adds `X-Model-Id` header but doesn't log interactions for training. Every `/v1/chat/completions` request should be captured.
+- [ ] **Fix C: ReactorCoreBridge.upload_training_data()** — Called by `TrainingDataPipeline._sync_to_reactor()` but the method is **not implemented**. This broken link means J-Prime's locally captured conversations never reach Reactor Core.
+- [ ] **Fix D: Automatic DPO pair generation** — When the same query type gets different quality answers from different specialist models, automatically generate preference pairs without human labeling.
+
+**The multi-model training data advantage:**
+
+```
+v241.1 multi-model routing creates IMPLICIT quality comparisons:
+
+  Query: "5x+3=18"
+    Mistral-7B (before routing fix):  "x = 11"  ← rejected
+    Qwen2.5-Math-7B (after routing):  "x = 3"   ← chosen
+
+  → Automatic DPO pair: {prompt: "5x+3=18", chosen: "x=3", rejected: "x=11"}
+  → No human labeling needed. Multi-model routing IS the labeling mechanism.
+```
+
+**Training constraints:**
+- LoRA fine-tuning requires the **full-precision base model** (FP16, ~14 GB for 7B), not the GGUF
+- Training happens on a machine with sufficient RAM (local Mac or separate GCP VM)
+- The GGUF is the *output* — quantized and deployed to the golden image
+- Elastic Weight Consolidation (EWC) prevents catastrophic forgetting when training on task-specific data
+
+### v241.2 - 14B Model Tier (Planned)
+
+Add three 14B-class models for significantly stronger reasoning, math, and code:
+
+- [ ] **DeepSeek-R1-Distill-Qwen-14B** (~8.1 GB, ~10 GB RAM) — 69.7% AIME 2024 (up from 55.5% on 7B). Explicit `<think>` chain-of-thought. Route `reason_complex` and `analyze` here.
+- [ ] **Phi-4** (14B, ~8.0 GB, ~10 GB RAM) — Microsoft's 80.4% MATH. Route `math_complex` word problems here.
+- [ ] **Qwen2.5-Coder-14B-Instruct** (~8.1 GB, ~10 GB RAM) — ~80-85% HumanEval. Foundation for Ouroboros. Route `code_complex` and `code_architecture` here.
+- [ ] Update `GCP_TASK_MODEL_MAPPING` with 14B routing for complex tasks (7B stays for simple variants)
+- [ ] Update `GCP_MODEL_CONFIGS` with 14B-specific context sizes and templates
+- [ ] Add filename patterns for 14B models in `GCPModelSwapCoordinator._scan_filenames()`
+- [ ] Update golden image builder and `manifest.json` for 14 total models
+- [ ] Disk impact: +24.3 GB → total ~64.7 GB on 80 GB SSD (~15.3 GB headroom)
+
+### v244.0 - LLaVA Vision Integration (Planned)
+
+- [ ] Build CLIP vision encoder pipeline in J-Prime (multimodal inference path)
+- [ ] Mark LLaVA-v1.6-Mistral-7B as `routable: true` in manifest
+- [ ] Route vision commands to self-hosted LLaVA instead of Claude Vision API
+- [ ] Eliminate last external API dependency for core features
+
 ### ✅ v241.0/v241.1 - Multi-Model GCP Golden Image + Task-Type Routing (Current)
 
 - [x] 11 specialist models pre-baked in golden image (~40.4 GB on 80 GB SSD)
