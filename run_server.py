@@ -1413,6 +1413,7 @@ async def main():
                 start = time.time()
                 token_count = 0
                 accumulated_content = []  # v242.1: Accumulate for telemetry
+                _telemetry_captured = False  # v242.3: Guard against double-capture
 
                 try:
                     async for token in _executor.generate_stream(
@@ -1455,6 +1456,7 @@ async def main():
                     # v242.1: Capture streaming interaction for training data pipeline
                     if _telemetry_hook and accumulated_content:
                         try:
+                            _telemetry_captured = True
                             full_response = "".join(accumulated_content)
                             asyncio.create_task(_capture_interaction(
                                 messages=messages,
@@ -1477,6 +1479,7 @@ async def main():
                     # Failure data is valuable — DPO generator can use as negative examples
                     if _telemetry_hook and accumulated_content:
                         try:
+                            _telemetry_captured = True
                             partial_response = "".join(accumulated_content)
                             asyncio.create_task(_capture_interaction(
                                 messages=messages,
@@ -1504,6 +1507,29 @@ async def main():
                     }
                     yield f"data: {json.dumps(error_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
+
+                finally:
+                    # v242.3: Capture telemetry on client disconnect (GeneratorExit /
+                    # CancelledError are BaseExceptions — not caught by except Exception).
+                    # Without this, partial responses from disconnected clients are silently lost.
+                    if not _telemetry_captured and accumulated_content:
+                        latency_ms = (time.time() - start) * 1000
+                        _record_inference_metrics(prompt_tokens, token_count, latency_ms, False)
+                        if _telemetry_hook:
+                            try:
+                                partial_response = "".join(accumulated_content)
+                                asyncio.create_task(_capture_interaction(
+                                    messages=messages,
+                                    response_text=partial_response,
+                                    model_id=_v241_active_model_id,
+                                    task_type=_v241_task_type,
+                                    latency_ms=latency_ms,
+                                    tokens_used=token_count,
+                                    success=False,
+                                    error="client_disconnect",
+                                ))
+                            except Exception:
+                                pass  # Best-effort — process may be shutting down
 
             _stream_headers = {
                 "Cache-Control": "no-cache",
