@@ -575,12 +575,16 @@ class TelemetryHook:
                         if record.success:  # Only include successful completions
                             f.write(json.dumps(record.to_training_format()) + "\n")
 
-            # v242.0: Also write in canonical format to shared telemetry dir
+            # v242.2: Also write in canonical format to shared telemetry dir
+            # (repo-local schema first, ~/.jarvis fallback)
             try:
-                _jarvis_home = str(Path.home() / ".jarvis")
-                if _jarvis_home not in sys.path:
-                    sys.path.insert(0, _jarvis_home)
-                from schemas.experience_schema import from_telemetry_hook_format
+                try:
+                    from jarvis_prime.schemas.experience_schema import from_telemetry_hook_format
+                except ImportError:
+                    _jarvis_home = str(Path.home() / ".jarvis")
+                    if _jarvis_home not in sys.path:
+                        sys.path.insert(0, _jarvis_home)
+                    from schemas.experience_schema import from_telemetry_hook_format
 
                 shared_dir = Path.home() / ".jarvis" / "telemetry"
                 shared_dir.mkdir(parents=True, exist_ok=True)

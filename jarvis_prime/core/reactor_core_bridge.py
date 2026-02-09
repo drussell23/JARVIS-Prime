@@ -652,14 +652,10 @@ class ReactorCoreBridge:
             return True
 
         try:
-            # Convert to canonical experience format
-            import sys as _sys
-            _jarvis_home = str(Path.home() / ".jarvis")
-            if _jarvis_home not in _sys.path:
-                _sys.path.insert(0, _jarvis_home)
-
+            # v242.2: Convert to canonical experience format (repo-local first, fallback)
+            _has_schema = False
             try:
-                from schemas.experience_schema import (
+                from jarvis_prime.schemas.experience_schema import (
                     ExperienceEvent,
                     ExperienceSource,
                     ExperienceType,
@@ -667,7 +663,20 @@ class ReactorCoreBridge:
                 )
                 _has_schema = True
             except ImportError:
-                _has_schema = False
+                try:
+                    import sys as _sys
+                    _jarvis_home = str(Path.home() / ".jarvis")
+                    if _jarvis_home not in _sys.path:
+                        _sys.path.insert(0, _jarvis_home)
+                    from schemas.experience_schema import (
+                        ExperienceEvent,
+                        ExperienceSource,
+                        ExperienceType,
+                        SCHEMA_VERSION,
+                    )
+                    _has_schema = True
+                except ImportError:
+                    pass
 
             uploaded = 0
 
