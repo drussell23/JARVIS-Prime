@@ -2,7 +2,7 @@
 
 **The Mind of the AGI OS — LLM inference, Neural Orchestrator Core, and cross-repo coordination**
 
-🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation | 🎯 v236.0 Adaptive Prompt System
+🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation | 🎯 v236.0 Adaptive Prompt System | 🛡️ v238.0 Degenerate Response Defense-in-Depth
 
 JARVIS Prime is the **cognitive layer** of the JARVIS AGI ecosystem. It runs a **self-hosted Mistral-7B-Instruct-v0.2 LLM** (Q4_K_M quantized, ~4.37 GB) on a dedicated GCP Invincible Node — **not OpenAI, not Claude, not any third-party API**. All inference happens on your own infrastructure with zero per-token costs and complete data privacy. Prime also provides the **Neural Orchestrator Core** (unified routing), AGI models, reasoning engines, and **first-class integration** with JARVIS (Body) and Reactor-Core (Nerves). It is started either **standalone** or by the **unified supervisor** in JARVIS; during startup, model loading progress is preserved across Early Prime → Trinity handoff (v221.0).
 
@@ -296,7 +296,7 @@ Under normal operation, **100% of requests** go to the self-hosted model. The Cl
 | **Offline-capable** | Once the VM is running, inference works with zero internet dependency (the model is on local disk). |
 | **Reproducible** | Same model, same weights, same quantization = deterministic behavior (given same temperature/seed). No provider-side model updates changing behavior unexpectedly. |
 
-### Adaptive Prompt System: Complexity-Aware Inference (v236.0)
+### Adaptive Prompt System: Complexity-Aware Inference (v236.0, v238.0)
 
 #### The Problem: One Prompt Does Not Fit All
 
@@ -313,20 +313,24 @@ This is a fundamental challenge with 7B-parameter models: they have limited inst
 JARVIS (Body) now classifies every query into one of 5 complexity levels before sending it to Prime, and dynamically adapts three parameters:
 
 ```
-┌────────────┬────────────┬──────┬─────────────────────────────────────────────────┐
-│ Complexity │ max_tokens │ temp │ System Prompt Strategy                          │
-├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
-│ SIMPLE     │ 64         │ 0.0  │ NO identity. Few-shot examples only.            │
-│            │            │      │ "Reply with ONLY the direct answer."            │
-├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
-│ MODERATE   │ 512        │ 0.3  │ JARVIS identity + "2-3 sentences. No filler."   │
-├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
-│ COMPLEX    │ 2048       │ 0.5  │ JARVIS identity + "Structured and thorough."    │
-├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
-│ ADVANCED   │ 4096       │ 0.7  │ JARVIS identity + "Detailed analysis."          │
-├────────────┼────────────┼──────┼─────────────────────────────────────────────────┤
-│ EXPERT     │ 4096       │ 0.7  │ JARVIS identity + "Comprehensive. Edge cases."  │
-└────────────┴────────────┴──────┴─────────────────────────────────────────────────┘
+┌────────────┬────────────┬──────┬─────────────────────────────────────────────────────────────────┐
+│ Complexity │ max_tokens │ temp │ System Prompt Strategy                                          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────────────────────┤
+│ SIMPLE     │ 48         │ 0.0  │ NO identity. Few-shot examples only.                            │
+│            │            │      │ "Reply with ONLY the direct answer."                            │
+│            │            │      │ v238.0: Only math, spell/translate, yes/no (<8 words).          │
+│            │            │      │ "what is X?" queries moved to MODERATE.                        │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────────────────────┤
+│ MODERATE   │ 512        │ 0.3  │ JARVIS identity + "2-3 sentences. No filler."                   │
+│            │            │      │ v238.0: Default for all queries ≤15 words                       │
+│            │            │      │ (including "what is X?" and short abstract queries).            │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────────────────────┤
+│ COMPLEX    │ 2048       │ 0.5  │ JARVIS identity + "Structured and thorough."                    │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────────────────────┤
+│ ADVANCED   │ 4096       │ 0.7  │ JARVIS identity + "Detailed analysis."                          │
+├────────────┼────────────┼──────┼─────────────────────────────────────────────────────────────────┤
+│ EXPERT     │ 4096       │ 0.7  │ JARVIS identity + "Comprehensive. Edge cases."                  │
+└────────────┴────────────┴──────┴─────────────────────────────────────────────────────────────────┘
 ```
 
 #### Three Techniques for 7B Model Compliance
@@ -395,20 +399,29 @@ JARVIS Backend (macOS, port 8010)
 
 For complex queries, the same flow sends the full JARVIS identity, `max_tokens=4096`, and `temperature=0.7` — giving the model maximum room for structured, detailed analysis.
 
-#### Verified Results
+#### Verified Results (v236.0 + v238.0)
 
 ```
-┌───────────────────────────────────┬────────────┬────────┬──────┬────────────────────┐
-│ Query                             │ Complexity │ Tokens │ Temp │ Response           │
-├───────────────────────────────────┼────────────┼────────┼──────┼────────────────────┤
-│ "what is 5+5?"                    │ SIMPLE     │ 64     │ 0.0  │ 10                 │
-│ "what's 5+5?"                     │ SIMPLE     │ 64     │ 0.0  │ 10                 │
-│ "define photosynthesis"           │ SIMPLE     │ 64     │ 0.0  │ One sentence       │
-│ "capital of France?"              │ SIMPLE     │ 64     │ 0.0  │ Paris              │
-│ "explain how neural networks      │ COMPLEX    │ 2048   │ 0.5  │ Multi-paragraph    │
-│  learn"                           │            │        │      │ structured         │
-└───────────────────────────────────┴────────────┴────────┴──────┴────────────────────┘
+┌───────────────────────────────────┬────────────┬────────┬──────┬──────────────────────────────────┐
+│ Query                             │ Complexity │ Tokens │ Temp │ Response                         │
+├───────────────────────────────────┼────────────┼────────┼──────┼──────────────────────────────────┤
+│ "what is 5+5?"                    │ SIMPLE     │ 48     │ 0.0  │ 10                               │
+│ "what's 5+5?"                     │ SIMPLE     │ 48     │ 0.0  │ 10                               │
+│ "is water wet?"                   │ SIMPLE     │ 48     │ 0.0  │ Yes                              │
+│ "spell onomatopoeia"             │ SIMPLE     │ 48     │ 0.0  │ O-N-O-M-A-T-O-P-O-E-I-A         │
+│ "what is mathematics?"            │ MODERATE   │ 512    │ 0.3  │ Full definition (3 sentences)    │
+│ "what is Java?"                   │ MODERATE   │ 512    │ 0.3  │ Full definition via gcp_prime    │
+│ "define photosynthesis"           │ MODERATE   │ 512    │ 0.3  │ 2-3 sentence definition          │
+│ "capital of France?"              │ MODERATE   │ 512    │ 0.3  │ Paris / The capital is Paris.    │
+│ "explain how neural networks      │ COMPLEX    │ 2048   │ 0.5  │ Multi-paragraph structured       │
+│  learn"                           │            │        │      │                                  │
+└───────────────────────────────────┴────────────┴────────┴──────┴──────────────────────────────────┘
+
+v238.0 routing confirmed: [QUERY] Response from gcp_prime (latency: 24635.7ms)
+Source: jarvis-prime-node at 34.45.154.209 (GCP Invincible Node golden image)
 ```
+
+**v238.0 Classification Change:** Queries like `"what is X?"`, `"define X"`, `"who is X?"` were previously classified as SIMPLE (48 tokens, temp 0.0, stop sequences). This caused degenerate output (`"..."`) when the model encountered abstract concepts. v238.0 moves these to MODERATE — providing 512 tokens and temp 0.3, which is safe and cheap for all short queries while eliminating the degenerate response failure mode entirely.
 
 #### The Path Beyond Prompting: Reactor-Core Fine-Tuning
 
@@ -447,6 +460,57 @@ The key components for this pipeline already exist:
 - **`RLHFIntegration`** (Prime) — reward model training and PPO optimization
 - **`ReactorCoreBridge`** (Prime) — submits fine-tuning jobs, tracks training, deploys finished models
 - **`HotSwapManager`** (Prime) — swaps the model at runtime with zero request drops
+
+### v238.0: Degenerate Response Elimination (Defense-in-Depth)
+
+#### The Problem: "..." as a Model Response
+
+When JARVIS classified `"what is mathematics?"` as SIMPLE (48 tokens, temperature 0.0, stop sequences `\n\n`), Mistral-7B sometimes produced `"..."` followed by a double newline. The stop sequence truncated the output at `"..."`, which then passed through the entire pipeline unchecked — displayed in the UI and spoken aloud via TTS as "full stop."
+
+This is a model behavior that any self-hosted LLM can exhibit when constrained with aggressive token limits, low temperature, and stop sequences on queries that require more than a one-word answer. The model begins generating a longer response, but the constraints truncate it to meaningless punctuation.
+
+#### How v238.0 Protects the JARVIS → Prime Pipeline
+
+The fix operates at three layers — any one of which independently prevents garbage from reaching the user:
+
+```
+Layer 1: Classification (JARVIS Body — query_complexity_manager.py)
+  "what is mathematics?" → MODERATE (512 tokens, 0.3 temp, no stop sequences)
+  → Mistral-7B has room to produce a full definition
+  → Eliminates the root cause: the model was never wrong — it was starved
+
+Layer 2: Degenerate Retry (JARVIS Body — query_handler.py)
+  If Mistral-7B STILL produces punctuation-only output:
+  → Backend detects content stripped to empty string
+  → Retries once with MODERATE parameters
+  → Retry request goes to Prime at 34.45.154.209:8000
+  → Prime returns real response with sufficient token budget
+  → try/except ensures retry failure doesn't lose original content
+
+Layer 3: Client Suppression (JARVIS Body — JarvisVoice.js)
+  If "..." somehow reaches the frontend despite layers 1 and 2:
+  → Frontend detects punctuation-only response
+  → Suppresses display and TTS
+  → Re-arms zombie timeout for automatic retry
+```
+
+**Impact on Prime:** Prime itself is unchanged — it receives standard OpenAI-compatible requests and returns standard responses. The intelligence is in what JARVIS (Body) sends:
+- **Before v238.0:** `max_tokens=48, temperature=0.0` for "what is mathematics?" → Prime dutifully truncates
+- **After v238.0:** `max_tokens=512, temperature=0.3` for "what is mathematics?" → Prime generates full answer
+
+The degenerate retry (Layer 2) may send a second request to Prime if the first response is garbage. This is a normal HTTP POST — Prime processes it like any other request. The retry uses MODERATE parameters, which are safe for any query.
+
+#### Production Verification
+
+```
+Step 1: PrimeClient resolved to GCP VM: 34.45.154.209:8000 (source: JARVIS_PRIME_URL)
+Step 2: PrimeRouter: GCP VM promotion successful, routing updated → gcp_prime
+Step 3: AdaptivePromptBuilder: level=MODERATE, max_tokens=512, temp=0.3
+Step 4: [QUERY] Response from gcp_prime (latency: 24635.7ms)
+Step 5: API response: "source": "gcp_prime", "model": "jarvis-prime", "fallback_used": false
+```
+
+The 24.6s latency is consistent with CPU inference on the Mistral-7B Q4_K_M model on the e2-standard-4 Invincible Node. Response quality confirmed — full sentence definitions instead of `"..."`.
 
 ---
 
@@ -1582,7 +1646,17 @@ Savings: $154.50/month (86% reduction) 🎉
 
 ## 🗺️ Roadmap
 
-### ✅ v100.0 - Neural Orchestrator Core (Current)
+### ✅ v238.0 - Degenerate Response Elimination (Current, JARVIS Body-side)
+
+- [x] SIMPLE classification narrowed: "what is/who is/define" queries promoted to MODERATE
+- [x] Backend degenerate response detection with safe retry (MODERATE params)
+- [x] Client-side degenerate response suppression before display/TTS
+- [x] requestId echo in all backend WebSocket response dicts (enables frontend dedup)
+- [x] command_response handler aligned with response handler (dedup, ref clearing, validation)
+- [x] Defense-in-depth: 3-layer architecture (classification → backend retry → client filter)
+- [x] Production verified: "what is Java?" → gcp_prime (24.6s latency, full definition)
+
+### ✅ v100.0 - Neural Orchestrator Core
 
 - [x] Unified routing architecture consolidating all routers
 - [x] Protocol-based design with type-safe interfaces
@@ -1823,7 +1897,8 @@ MIT License - see [LICENSE](LICENSE) for details
 ### What JARVIS Prime Delivers
 
 ✅ **Self-Hosted LLM Inference** - Mistral-7B-Instruct-v0.2 (Q4_K_M) on your own GCP VM — no OpenAI, no Claude, no third-party APIs
-✅ **Adaptive Prompt System (v236.0)** - Complexity-aware inference: "5+5?" → "10" (64 tokens, temp 0.0), "design a system" → detailed analysis (4096 tokens, temp 0.7)
+✅ **Adaptive Prompt System (v236.0 + v238.0)** - Complexity-aware inference: "5+5?" → "10" (48 tokens, temp 0.0), "what is Java?" → full definition (512 tokens, temp 0.3), "design a system" → detailed analysis (4096 tokens, temp 0.7)
+✅ **Degenerate Response Defense-in-Depth (v238.0)** - 3-layer protection (classification, backend retry, client suppression) ensures meaningless LLM output ("...") never reaches the user
 ✅ **Enterprise-Grade AGI Operating System** - 7 specialized models, reasoning, multimodal fusion
 ✅ **Neural Orchestrator Core v100.0** - Unified intelligent routing, single source of truth
 ✅ **GCP Golden Image Boot** - Cold start in ~87 seconds with pre-baked model on disk
