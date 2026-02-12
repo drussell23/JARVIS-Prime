@@ -1237,6 +1237,144 @@ class CrossRepoBridge:
             payload={},
         )
 
+    # =========================================================================
+    # v240.0: GHOST DISPLAY STATE QUERIES
+    # =========================================================================
+    # Read ghost display readiness from state file published by the supervisor.
+    # Follows the same pattern as check_jarvis_body_readiness / is_jarvis_body_ready.
+    # =========================================================================
+
+    async def get_ghost_display_status(self) -> Optional[Dict[str, Any]]:
+        """
+        v240.0: Read ghost display state from Trinity Protocol state file.
+
+        Reads ~/.jarvis/trinity/state/ghost_display_state.json which is
+        published by the unified supervisor's ghost display health loop.
+
+        Returns:
+            Ghost display state dict or None if unavailable/stale
+        """
+        try:
+            state_file = Path.home() / ".jarvis" / "trinity" / "state" / "ghost_display_state.json"
+
+            if not state_file.exists():
+                return None
+
+            state_data = json.loads(state_file.read_text())
+
+            # Check staleness (>60s is stale for display state — longer than
+            # the 30s used for jarvis-body readiness because health loop runs
+            # every 30s and we allow one missed cycle)
+            timestamp = state_data.get("timestamp", 0)
+            age = time.time() - timestamp
+            if age > 60:
+                logger.debug(f"[v240.0] Ghost display state is stale ({age:.0f}s)")
+                return None
+
+            return state_data
+
+        except Exception as e:
+            logger.debug(f"[v240.0] Failed to read ghost display state: {e}")
+            return None
+
+    async def is_ghost_display_ready(self) -> bool:
+        """
+        v240.0: Check if ghost display is ready and active.
+
+        Returns True if the virtual display is alive and accepting
+        window teleportation operations.
+        """
+        state = await self.get_ghost_display_status()
+        if state is None:
+            return False
+        return state.get("is_ready", False)
+
+    async def wait_for_ghost_display(
+        self,
+        timeout: float = 60.0,
+        check_interval: float = 2.0,
+    ) -> bool:
+        """
+        v240.0: Wait for ghost display to become ready.
+
+        Polls the state file until the display is ready or timeout is reached.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check in seconds
+
+        Returns:
+            True if ghost display became ready, False on timeout
+        """
+        start_time = time.time()
+        logged_waiting = False
+
+        while (time.time() - start_time) < timeout:
+            if await self.is_ghost_display_ready():
+                if logged_waiting:
+                    elapsed = time.time() - start_time
+                    logger.info(f"[v240.0] Ghost display is now ready ({elapsed:.1f}s wait)")
+                return True
+
+            if not logged_waiting:
+                logger.info("[v240.0] Waiting for ghost display to become ready...")
+                logged_waiting = True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"[v240.0] Timeout waiting for ghost display readiness ({timeout}s)")
+        return False
+
+    # =========================================================================
+    # v250.0: VISUAL PIPELINE STATE QUERIES
+    # =========================================================================
+    # Read visual pipeline state from state file published by the supervisor.
+    # Follows the same pattern as get_ghost_display_status() above.
+    # =========================================================================
+
+    async def get_visual_pipeline_status(self) -> Optional[Dict[str, Any]]:
+        """
+        v250.0: Read visual pipeline state from Trinity Protocol state file.
+
+        Reads ~/.jarvis/trinity/state/visual_pipeline_state.json which is
+        published by the unified supervisor's visual pipeline health loop.
+
+        Returns:
+            Visual pipeline state dict or None if unavailable/stale
+        """
+        try:
+            state_file = Path.home() / ".jarvis" / "trinity" / "state" / "visual_pipeline_state.json"
+
+            if not state_file.exists():
+                return None
+
+            state_data = json.loads(state_file.read_text())
+
+            # Check staleness (>60s is stale — same threshold as ghost display)
+            timestamp = state_data.get("timestamp", 0)
+            age = time.time() - timestamp
+            if age > 60:
+                logger.debug(f"[v250.0] Visual pipeline state is stale ({age:.0f}s)")
+                return None
+
+            return state_data
+
+        except Exception as e:
+            logger.debug(f"[v250.0] Failed to read visual pipeline state: {e}")
+            return None
+
+    async def is_visual_pipeline_active(self) -> bool:
+        """
+        v250.0: Check if visual pipeline is ready and active.
+
+        Returns True if the visual processing pipeline is initialized
+        and actively monitoring.
+        """
+        state = await self.get_visual_pipeline_status()
+        if state is None:
+            return False
+        return state.get("is_ready", False)
+
     async def execute_plan(
         self,
         plan_id: str,
