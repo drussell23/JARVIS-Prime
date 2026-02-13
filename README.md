@@ -1788,6 +1788,42 @@ Savings: $154.50/month (86% reduction) 🎉
 
 ## 🗺️ Roadmap
 
+### Architectural Status Report — Cross-Repo Audit (February 2026)
+
+A comprehensive audit of the JARVIS ecosystem identified critical integration gaps that affect J-Prime's role as the cognitive layer:
+
+#### LangGraph Dependency Status
+
+**LangGraph is listed in JARVIS Body's `backend/requirements.txt` but is NOT installed.** This means:
+
+- All 9 LangGraph reasoning graphs across the JARVIS Body codebase execute their **linear fallback** paths instead of conditional graph routing
+- The `LangGraphReasoningEngine`'s 7-node graph (with loop-back on low confidence via `route_after_reflection()`) has **never executed**
+- The `JARVISCheckpointer` in `memory_integration.py` inherits from `object` instead of LangGraph's `BaseCheckpointSaver`, providing no real checkpoint persistence
+- **Impact on J-Prime:** The reasoning quality sent to J-Prime for inference is lower than designed because all reasoning is single-pass linear, not iterative
+
+**Resolution (v246.0):** Install `langgraph`, `langgraph-checkpoint`, and `langgraph-checkpoint-sqlite` in JARVIS Body to activate all 9 reasoning graphs. This will improve the quality of reasoning that feeds into J-Prime's inference pipeline.
+
+#### Google Workspace Integration (v245.0 — Fixed)
+
+The Google Workspace Agent in JARVIS Body now successfully creates real Gmail drafts, checks email, queries calendar, and performs workspace searches via the Google API. Key fixes applied:
+
+| Fix | Impact on J-Prime |
+|-----|-------------------|
+| Agent singleton cache bug (49s → 0.2s) | Workspace commands now reuse cached agent, reducing total latency |
+| Body generation via proper `ModelRequest` API | Draft email body generation now correctly calls J-Prime's inference endpoint |
+| Task-type metadata flow | Workspace commands carry `task_type` metadata, enabling J-Prime's `GCPModelSwapCoordinator` to select the optimal model |
+
+#### Planned: Unified Agent Runtime (v247.0)
+
+JARVIS Body is planning a **Unified Agent Runtime** — a persistent sense-think-act-verify-reflect loop for autonomous goal pursuit. J-Prime's role:
+
+- **THINK phase:** The Agent Runtime calls J-Prime's inference API for goal decomposition, planning, and sub-step generation
+- **Task-type routing matters more:** Multi-step autonomous goals will send a wider variety of task types (analysis, planning, code, creative) — J-Prime's specialist routing becomes critical
+- **Checkpoint-aware inference:** The Runtime will checkpoint goal state between phases; J-Prime may need to support session-context-aware inference for continuity across sub-steps
+- **Higher request volume:** Autonomous operation generates more inference requests than reactive command-response; J-Prime's sticky routing and cooldown mechanisms will be stress-tested
+
+---
+
 ### v243.0 - Ouroboros: JARVIS Self-Programming (Planned)
 
 JARVIS becomes capable of reading, understanding, and improving its own codebase autonomously using a two-model pipeline:
@@ -1858,6 +1894,25 @@ Add three 14B-class models for significantly stronger reasoning, math, and code:
 - [ ] Mark LLaVA-v1.6-Mistral-7B as `routable: true` in manifest
 - [ ] Route vision commands to self-hosted LLaVA instead of Claude Vision API
 - [ ] Eliminate last external API dependency for core features
+
+### v245.0 - Agent Runtime Inference Support (Planned)
+
+Support the JARVIS Body Unified Agent Runtime with enhanced inference capabilities:
+
+- [ ] **Session-context inference** — Accept optional `session_id` and `goal_context` in `/v1/chat/completions` metadata, enabling multi-step reasoning that remembers previous sub-steps within the same autonomous goal
+- [ ] **Batch sub-step inference** — Accept an array of related prompts (e.g., decomposition + planning + risk assessment) to reduce model swap overhead when the same model handles multiple phases
+- [ ] **Streaming progress** — Return partial results via SSE for long-running inference during autonomous THINK phases, so the Agent Runtime can checkpoint intermediate reasoning
+- [ ] **Priority queue for autonomous vs. interactive** — Interactive user commands get priority over autonomous background inference to maintain responsiveness
+- [ ] **Telemetry attribution** — Tag inference requests with `source: "agent_runtime"` vs `source: "user_command"` for separate monitoring and training data collection
+
+### v246.0 - Reactor Core Training Integration (Planned)
+
+Wire up the J-Prime → Reactor Core training data pipeline:
+
+- [ ] **Implement `ReactorCoreBridge.upload_training_data()`** — The method is defined but not implemented; this broken link means J-Prime's locally captured conversations never reach Reactor Core for fine-tuning
+- [ ] **Interaction capture in `run_server.py`** — Log every `/v1/chat/completions` request-response pair with `X-Model-Id` to disk for training data collection
+- [ ] **Per-model DPO pair generation** — When different specialist models answer the same query type with different quality, automatically generate preference pairs without human labeling
+- [ ] **Fine-tuned model deployment** — Accept GGUF files from Reactor Core via `HotSwapManager` and validate inference quality before promoting to active
 
 ### ✅ v241.0/v241.1 - Multi-Model GCP Golden Image + Task-Type Routing (Current)
 
@@ -2128,6 +2183,7 @@ MIT License - see [LICENSE](LICENSE) for details
 ✅ **Intelligent Task-Type Routing (v241.1)** - Math → Qwen2.5-Math-7B (83.6% MATH), Code → Qwen2.5-Coder-7B (70.4% HumanEval), Reasoning → DeepSeek-R1 (55.5% AIME), Simple → Phi-3.5-mini (~3s), General → Gemma-2-9B (72.3% MMLU). Automatic model selection via GCPModelSwapCoordinator.
 ✅ **Adaptive Prompt System (v236.0 + v238.0)** - Complexity-aware inference: "5+5?" → "10" (48 tokens, temp 0.0), "what is Java?" → full definition (512 tokens, temp 0.3), "design a system" → detailed analysis (4096 tokens, temp 0.7)
 ✅ **Degenerate Response Defense-in-Depth (v238.0)** - 3-layer protection (classification, backend retry, client suppression) ensures meaningless LLM output ("...") never reaches the user
+✅ **Google Workspace Body Generation (v245.0)** - Draft email body generation now correctly calls J-Prime via proper `ModelRequest` API with task-type metadata, producing AI-generated email content through the specialist model fleet
 ✅ **Enterprise-Grade AGI Operating System** - 11 specialist models, reasoning, multimodal fusion (LLaVA pre-staged)
 ✅ **Neural Orchestrator Core v100.0** - Unified intelligent routing, single source of truth
 ✅ **GCP Golden Image Boot** - Cold start in ~87 seconds with 11 pre-baked models on 80 GB SSD
@@ -2141,6 +2197,13 @@ MIT License - see [LICENSE](LICENSE) for details
 ✅ **Cross-Repo Integration** - Task-type metadata flows from JARVIS Body through PrimeClient to coordinator
 ✅ **Reactor-Core Training Loop** - DPO/RLHF pipeline to fine-tune models from real interactions, with per-model attribution
 ✅ **Battle-Tested** - 187K+ requests in production, zero failures
+
+### Known Gaps (In Roadmap)
+
+- **LangGraph not installed in JARVIS Body** — All 9 reasoning graphs use linear fallback; reasoning quality sent to J-Prime is sub-optimal (v246.0 target)
+- **`ReactorCoreBridge.upload_training_data()` not implemented** — Training data captured by J-Prime never reaches Reactor Core (v246.0 target)
+- **No Agent Runtime inference support** — J-Prime doesn't yet support session-context or batch inference for autonomous multi-step goal pursuit (v245.0 target)
+- **Single concurrent request** — CPU inference processes one request at a time; autonomous background goals may queue behind interactive commands (v245.0 priority queue target)
 
 ### v241.1 Highlights
 
