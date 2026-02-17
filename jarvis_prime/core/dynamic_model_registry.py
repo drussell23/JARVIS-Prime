@@ -2348,6 +2348,10 @@ class MacOSMemoryPressureMonitor:
 
             # Get fresh reading
             level = await self._read_memory_pressure()
+
+            # v258.4: Cross-repo CPU pressure signal augments local pressure level
+            level = self._augment_with_cpu_pressure(level)
+
             self._cached_level = level
             self._cache_time = now
 
@@ -2357,6 +2361,36 @@ class MacOSMemoryPressureMonitor:
                 self._pressure_history = self._pressure_history[-30:]
 
             return level
+
+    def _augment_with_cpu_pressure(self, level: MemoryPressureLevel) -> MemoryPressureLevel:
+        """v258.4: Elevate pressure level if supervisor CPU pressure signal is active.
+
+        Reads from ~/.jarvis/signals/cpu_pressure.json (60s TTL).
+        CPU >= 95% elevates to at least WARN.
+        Compound stress (CPU + memory) elevates to CRITICAL.
+        This biases routing toward lighter/cloud models.
+        """
+        try:
+            _cpu_signal_file = Path.home() / ".jarvis" / "signals" / "cpu_pressure.json"
+            if not _cpu_signal_file.exists():
+                return level
+
+            _cpu_data = json.loads(_cpu_signal_file.read_text())
+            _cpu_ts = _cpu_data.get("timestamp", 0)
+            if time.time() - _cpu_ts > 60.0:  # 60s TTL
+                return level
+
+            _cpu_pct = _cpu_data.get("cpu_percent", 0)
+            if _cpu_pct >= 95.0:
+                # CPU pressure active — elevate pressure level
+                if level == MemoryPressureLevel.NORMAL:
+                    level = MemoryPressureLevel.WARN
+                if _cpu_data.get("compound", False):
+                    level = MemoryPressureLevel.CRITICAL
+        except Exception:
+            pass  # Non-fatal — stale data is better than crashing
+
+        return level
 
     async def _read_memory_pressure(self) -> MemoryPressureLevel:
         """Read memory pressure from system."""

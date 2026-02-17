@@ -302,6 +302,9 @@ def _atomic_deregister_service(
 # v97.0: Global registry heartbeat task reference
 _registry_heartbeat_task: Optional[asyncio.Task] = None
 
+# v258.0: Strong references for fire-and-forget background tasks (prevents GC collection)
+_background_tasks: set = set()
+
 
 # =============================================================================
 # v138.0: HARDWARE-AWARE STARTUP STRATEGY
@@ -1458,7 +1461,7 @@ async def main():
                         try:
                             _telemetry_captured = True
                             full_response = "".join(accumulated_content)
-                            asyncio.create_task(_capture_interaction(
+                            _task = asyncio.create_task(_capture_interaction(
                                 messages=messages,
                                 response_text=full_response,
                                 model_id=_v241_active_model_id,
@@ -1466,7 +1469,9 @@ async def main():
                                 latency_ms=latency_ms,
                                 tokens_used=token_count,
                                 success=True,
-                            ))
+                            ), name="capture_stream_telemetry")
+                            _background_tasks.add(_task)
+                            _task.add_done_callback(_background_tasks.discard)
                         except Exception as e:
                             logger.debug(f"[v242.1] Stream telemetry capture failed: {e}")
 
@@ -1481,7 +1486,7 @@ async def main():
                         try:
                             _telemetry_captured = True
                             partial_response = "".join(accumulated_content)
-                            asyncio.create_task(_capture_interaction(
+                            _task = asyncio.create_task(_capture_interaction(
                                 messages=messages,
                                 response_text=partial_response,
                                 model_id=_v241_active_model_id,
@@ -1490,7 +1495,9 @@ async def main():
                                 tokens_used=token_count,
                                 success=False,
                                 error=str(e),
-                            ))
+                            ), name="capture_error_telemetry")
+                            _background_tasks.add(_task)
+                            _task.add_done_callback(_background_tasks.discard)
                         except Exception as cap_err:
                             logger.debug(f"[v242.2] Failed to capture error telemetry: {cap_err}")
 
@@ -1518,7 +1525,7 @@ async def main():
                         if _telemetry_hook:
                             try:
                                 partial_response = "".join(accumulated_content)
-                                asyncio.create_task(_capture_interaction(
+                                _task = asyncio.create_task(_capture_interaction(
                                     messages=messages,
                                     response_text=partial_response,
                                     model_id=_v241_active_model_id,
@@ -1527,7 +1534,9 @@ async def main():
                                     tokens_used=token_count,
                                     success=False,
                                     error="client_disconnect",
-                                ))
+                                ), name="capture_disconnect_telemetry")
+                                _background_tasks.add(_task)
+                                _task.add_done_callback(_background_tasks.discard)
                             except Exception:
                                 pass  # Best-effort — process may be shutting down
 
@@ -1573,7 +1582,7 @@ async def main():
                         "completion_tokens": completion_tokens,
                         "total_tokens": prompt_tokens + completion_tokens,
                     }
-                    asyncio.create_task(_capture_interaction(
+                    _task = asyncio.create_task(_capture_interaction(
                         messages=messages,
                         response_text=response,
                         model_id=_v241_active_model_id,
@@ -1581,7 +1590,9 @@ async def main():
                         latency_ms=(time.time() - _req_start) * 1000,
                         tokens_used=usage.get("total_tokens", 0),
                         success=True,
-                    ))
+                    ), name="capture_nonstream_telemetry")
+                    _background_tasks.add(_task)
+                    _task.add_done_callback(_background_tasks.discard)
                 except Exception as e:
                     logger.debug(f"[v242] Telemetry capture failed: {e}")
 
@@ -2954,7 +2965,9 @@ async def main():
         else:
             logger.warning("[v97.0] Service registry registration failed (non-fatal)")
 
-        asyncio.create_task(background_initialization())
+        _bg_init_task = asyncio.create_task(background_initialization(), name="background_initialization")
+        _background_tasks.add(_bg_init_task)
+        _bg_init_task.add_done_callback(_background_tasks.discard)
 
     # =========================================================================
     # SHUTDOWN EVENT - Clean up all components

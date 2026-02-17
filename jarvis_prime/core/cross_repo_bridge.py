@@ -52,6 +52,11 @@ TRINITY_COMMANDS_DIR = TRINITY_DIR / "commands"
 MEMORY_PRESSURE_FILE = BRIDGE_STATE_DIR / "memory_pressure.json"
 MEMORY_PRESSURE_CHECK_INTERVAL = 2.0  # Check every 2 seconds when active
 
+# v258.4: CPU pressure signal from supervisor
+CPU_PRESSURE_SIGNAL_DIR = Path.home() / ".jarvis" / "signals"
+CPU_PRESSURE_SIGNAL_FILE = CPU_PRESSURE_SIGNAL_DIR / "cpu_pressure.json"
+CPU_PRESSURE_SIGNAL_TTL = float(os.environ.get("JARVIS_CPU_PRESSURE_SIGNAL_TTL", "60.0"))  # 60s TTL
+
 # v100.0: Docker State Integration - coordinate with JARVIS Docker Manager
 DOCKER_STATE_DIR = Path.home() / ".jarvis" / "trinity" / "docker"
 DOCKER_STATE_FILE = DOCKER_STATE_DIR / "state.json"
@@ -136,6 +141,10 @@ class PrimeState:
     memory_pressure_status: str = "normal"  # normal, elevated, critical, offload_active
     paused_by_memory_defense: bool = False  # True if SIGSTOP'd by main JARVIS
     last_memory_pressure_check: str = ""
+
+    # v258.4: CPU pressure signal from supervisor
+    cpu_pressure_active: bool = False
+    cpu_pressure_data: Optional[Dict[str, Any]] = None
 
     # v100.0: Docker State Integration
     docker_available: bool = False  # True if Docker is running and healthy
@@ -725,6 +734,61 @@ class CrossRepoBridge:
             logger.warning(f"[v93.0] Error checking memory pressure: {e}")
             return None
 
+    async def check_cpu_pressure(self) -> Optional[Dict[str, Any]]:
+        """v258.4: Check supervisor CPU pressure signal.
+
+        Reads from ~/.jarvis/signals/cpu_pressure.json.
+        Returns pressure info if active, None otherwise.
+        """
+        try:
+            if not CPU_PRESSURE_SIGNAL_FILE.exists():
+                self.state.cpu_pressure_active = False
+                self.state.cpu_pressure_data = None
+                return None
+
+            content = CPU_PRESSURE_SIGNAL_FILE.read_text()
+            pressure_data = json.loads(content)
+
+            # Check if signal is still valid (not expired)
+            timestamp = pressure_data.get("timestamp", 0)
+            if time.time() - timestamp > CPU_PRESSURE_SIGNAL_TTL:
+                self.state.cpu_pressure_active = False
+                self.state.cpu_pressure_data = None
+                return None
+
+            self.state.cpu_pressure_active = True
+            self.state.cpu_pressure_data = pressure_data
+            return pressure_data
+
+        except Exception as e:
+            logger.debug(f"[v258.4] Error checking CPU pressure signal: {e}")
+            return None
+
+    async def check_supervisor_phase(self) -> Optional[Dict[str, Any]]:
+        """v258.4: Check supervisor's current startup/runtime phase.
+
+        Reads from ~/.jarvis/trinity/state/system_phase.json.
+        Returns phase data if available, None otherwise.
+        """
+        try:
+            _phase_file = TRINITY_DIR / "state" / "system_phase.json"
+            if not _phase_file.exists():
+                return None
+
+            content = _phase_file.read_text()
+            phase_data = json.loads(content)
+
+            # Check if signal is still valid (not stale from crashed supervisor)
+            timestamp = phase_data.get("timestamp", 0)
+            if time.time() - timestamp > 600:  # 10 min TTL for phase
+                return None
+
+            return phase_data
+
+        except Exception as e:
+            logger.debug(f"[v258.4] Error checking supervisor phase: {e}")
+            return None
+
     async def report_memory_defense_status(
         self,
         is_paused: bool,
@@ -763,7 +827,10 @@ class CrossRepoBridge:
         - Emergency offload requests (pause self via SIGSTOP awareness)
         - Memory pressure elevation warnings
         - Offload complete notifications
+        - v258.4: CPU pressure signals from supervisor
         """
+        _cpu_warned = False
+
         while True:
             try:
                 pressure_data = await self.check_memory_pressure()
@@ -814,8 +881,25 @@ class CrossRepoBridge:
                                 f"{pressure_data.get('used_percent', 0):.1f}%"
                             )
 
+                # v258.4: Also check CPU pressure signal
+                cpu_pressure = await self.check_cpu_pressure()
+                if cpu_pressure and not _cpu_warned:
+                    logger.warning(
+                        "[v258.4] CPU pressure detected from supervisor: %.1f%% (compound=%s, gcp_recommended=%s)",
+                        cpu_pressure.get("cpu_percent", 0),
+                        cpu_pressure.get("compound", False),
+                        cpu_pressure.get("gcp_recommended", False),
+                    )
+                    _cpu_warned = True
+                elif not cpu_pressure and _cpu_warned:
+                    logger.info("[v258.4] CPU pressure signal cleared")
+                    _cpu_warned = False
+
                 # Check more frequently if in elevated/critical state
-                if self.state.memory_pressure_status in ("elevated", "critical", "offload_active"):
+                if (
+                    self.state.memory_pressure_status in ("elevated", "critical", "offload_active")
+                    or self.state.cpu_pressure_active
+                ):
                     await asyncio.sleep(MEMORY_PRESSURE_CHECK_INTERVAL)
                 else:
                     await asyncio.sleep(HEARTBEAT_INTERVAL / 2)
@@ -827,12 +911,15 @@ class CrossRepoBridge:
                 await asyncio.sleep(5.0)
 
     def get_memory_defense_status(self) -> Dict[str, Any]:
-        """v93.0: Get current memory defense status."""
+        """v93.0: Get current memory defense status (includes v258.4 CPU pressure)."""
         return {
             "memory_pressure_status": self.state.memory_pressure_status,
             "paused_by_memory_defense": self.state.paused_by_memory_defense,
             "last_check": self.state.last_memory_pressure_check,
             "connected_to_jarvis": self.state.connected_to_jarvis,
+            # v258.4: CPU pressure signal
+            "cpu_pressure_active": self.state.cpu_pressure_active,
+            "cpu_pressure_data": self.state.cpu_pressure_data,
         }
 
     # =========================================================================

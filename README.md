@@ -505,12 +505,16 @@ The **permanent solution** is training the model itself to be concise for simple
 
 After DPO training, conciseness for simple queries is encoded **in the model's weights** — not dependent on a prompt instruction the model might ignore. The model learns *when* to be terse and *when* to be detailed from actual user interaction patterns, not from static rules.
 
-The key components for this pipeline already exist:
-- **`TelemetryEmitter`** (JARVIS) — captures every interaction, ships to Reactor-Core
+The key components for this pipeline are built and wired (v239.0, Feb 2026):
+- **`TelemetryEmitter`** (JARVIS) — captures every interaction with correlation_id, ships to Reactor-Core
+- **`ReactorCoreClient`** (JARVIS) — quality-weighted experience scoring (7-tier), resource-aware auto-trigger, training circuit breaker
+- **`DeploymentGate`** (Reactor-Core) — validates GGUF before deployment (magic bytes, version, size, inference check)
+- **`ProbationMonitor`** (Prime) — 30-min post-deployment monitoring with auto-rollback on quality regression
 - **`TrainingDataPipeline`** (Prime) — generates DPO preference pairs from conversations
 - **`RLHFIntegration`** (Prime) — reward model training and PPO optimization
 - **`ReactorCoreBridge`** (Prime) — submits fine-tuning jobs, tracks training, deploys finished models
 - **`HotSwapManager`** (Prime) — swaps the model at runtime with zero request drops
+- **`write_deployment_feedback()`** (Prime) — atomic deployment status feedback to `~/.jarvis/cross_repo/`
 
 ### v238.0: Degenerate Response Elimination (Defense-in-Depth)
 
@@ -1838,23 +1842,23 @@ JARVIS becomes capable of reading, understanding, and improving its own codebase
 **Why two models, not one:**
 A specialist 14B code model generates better code than a generalist. A specialist 14B reasoning model produces better architectural plans than a code model. The model swap (~30s) is cheaper than the quality loss of using one model for both phases. Self-programming is not latency-sensitive — correctness matters more than speed.
 
-### v242.0 - Training Data Pipeline Activation (Planned)
+### v242.0 - DPO Training from Multi-Model Telemetry (Planned)
 
-Activate the JARVIS Body → Reactor Core → fine-tuning → deployment loop. The infrastructure is ~80% built across all three repos. Key connection points need wiring:
+Activate DPO preference training using multi-model telemetry. Depends on v239.0 pipeline activation.
 
-**What's built (working):**
-- [x] `TelemetryEmitter` in JARVIS Body — emits `emit_interaction()` after every command via `UnifiedCommandProcessor`
-- [x] `TrinityExperienceReceiver` in Reactor Core — watches `~/.jarvis/` directories for event files, deduplication, ordering
-- [x] `TelemetryIngestor` in Reactor Core — reads JSONL from `~/.jarvis/telemetry/`
-- [x] `UnifiedTrainingPipeline` in Reactor Core — DPO/LoRA training, GGUF export
+**Corrected status (Feb 2026 audit) — more is built than previously reported:**
+- [x] `TelemetryEmitter` in JARVIS Body — emits `emit_interaction()` after every command. Telemetry JSONL files confirmed present in `~/.jarvis/telemetry/`.
+- [x] `TrinityExperienceReceiver` in Reactor Core — watches `~/.jarvis/` directories for event files, with deduplication and ordering
+- [x] `TelemetryIngestor` in Reactor Core — reads JSONL from `~/.jarvis/telemetry/`. **Schema verified byte-identical** to emitter output (v1.0 canonical).
+- [x] `UnifiedTrainingPipeline` in Reactor Core — DPO/LoRA training and GGUF export chain exists
 - [x] `HotSwapManager` in J-Prime — accepts fine-tuned GGUF files, zero-downtime swap
 - [x] `TrainingDataPipeline` in J-Prime — captures conversations, generates DPO pairs
+- [x] `ReactorCoreBridge.upload_training_data()` — **Fully implemented** (992 LOC, v242.0) with batch upload, fallback, job tracking. ~~Previously listed as "not implemented."~~
 
-**What's broken (needs fixing):**
-- [ ] **Fix A: JSONL format alignment** — `TelemetryEmitter` disk output must match `TelemetryIngestor`'s expected format (event_type, properties.user_input, properties.output, metrics.model_id)
-- [ ] **Fix B: J-Prime interaction capture** — `run_server.py` adds `X-Model-Id` header but doesn't log interactions for training. Every `/v1/chat/completions` request should be captured.
-- [ ] **Fix C: ReactorCoreBridge.upload_training_data()** — Called by `TrainingDataPipeline._sync_to_reactor()` but the method is **not implemented**. This broken link means J-Prime's locally captured conversations never reach Reactor Core.
+**What v242.0 adds (on top of v239.0 pipeline):**
+- [ ] **Fix B: J-Prime interaction capture** — `run_server.py` adds `X-Model-Id` header but doesn't log interactions for training. Every `/v1/chat/completions` request should be captured with full metadata.
 - [ ] **Fix D: Automatic DPO pair generation** — When the same query type gets different quality answers from different specialist models, automatically generate preference pairs without human labeling.
+- [ ] **Ground truth sources** — User corrections, Claude-as-judge evaluation, and objective metrics (code compilation, math verification) to avoid circular self-assessment in DPO pairs.
 
 **The multi-model training data advantage:**
 
@@ -1905,14 +1909,80 @@ Support the JARVIS Body Unified Agent Runtime with enhanced inference capabiliti
 - [ ] **Priority queue for autonomous vs. interactive** — Interactive user commands get priority over autonomous background inference to maintain responsiveness
 - [ ] **Telemetry attribution** — Tag inference requests with `source: "agent_runtime"` vs `source: "user_command"` for separate monitoring and training data collection
 
-### v246.0 - Reactor Core Training Integration (Planned)
+### v239.0 - Pipeline Activation: Wiring the Training Loop (Completed, Feb 2026)
 
-Wire up the J-Prime → Reactor Core training data pipeline:
+**Status: COMPLETED.** 3 commits, 51 new tests. J-Prime's role in the Reactor Core training pipeline is now fully wired: deployment feedback, post-deployment probation with auto-rollback, and cross-repo event tracing.
 
-- [ ] **Implement `ReactorCoreBridge.upload_training_data()`** — The method is defined but not implemented; this broken link means J-Prime's locally captured conversations never reach Reactor Core for fine-tuning
-- [ ] **Interaction capture in `run_server.py`** — Log every `/v1/chat/completions` request-response pair with `X-Model-Id` to disk for training data collection
+**What was built in J-Prime (this repo):**
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `write_deployment_feedback()` | `jarvis_prime/docker/reactor_core_watcher.py` | Atomic writes to `~/.jarvis/cross_repo/deployment_status.json` after GGUF deployment |
+| `ProbationStatus` enum | `reactor_core_watcher.py` | `MONITORING`, `COMMITTED`, `ROLLING_BACK`, `ROLLED_BACK` |
+| `ProbationConfig` dataclass | `reactor_core_watcher.py` | Configurable thresholds: duration (30 min), probe interval (60s), commit threshold (0.8), rollback threshold (0.5), emergency multiplier (5x) |
+| `ProbationMonitor` class | `reactor_core_watcher.py` | Full lifecycle: start → probe (latency, error rate, correction rate) → evaluate health score → COMMITTED or ROLLING_BACK. Model backup before deployment. State persistence to disk. |
+| Pipeline event logger | `reactor_core_watcher.py` | JSONL events: `model.deployed`, `probation.started`, `probation.committed`, `probation.rollback` with correlation/causation IDs |
+
+**ProbationMonitor flow:**
+```
+GGUF deployed to J-Prime
+  → Backup previous model to ~/.jarvis/reactor/model_backups/
+  → ProbationMonitor.start() [30-minute window]
+    → Probe every 60s: latency, error_rate, correction_rate
+      → health_score = weighted combination (latency 0.3, errors 0.4, corrections 0.3)
+      → health_score >= 0.8 → COMMITTED (model stays)
+      → health_score < 0.5 → ROLLING_BACK (restore backup)
+      → error_rate > 5x baseline → EMERGENCY rollback at any probe
+    → Write deployment_status.json with full metadata
+    → Emit pipeline events for cross-repo observability
+```
+
+**Deployment feedback schema:**
+```json
+{
+  "model_id": "string",
+  "deployment_status": "success | failed | rollback",
+  "deployed_at": "ISO 8601",
+  "previous_model": "string",
+  "health_check_passed": true,
+  "first_inference_latency_ms": 3200,
+  "error": null,
+  "reactor_job_id": "string"
+}
+```
+
+**Test coverage (51 tests):**
+- `test_deployment_feedback.py`: 12 tests (atomic writes, schema validation, error handling)
+- `test_probation.py`: 32 tests (lifecycle, health scoring, commit/rollback, emergency, persistence, config)
+- `test_pipeline_events.py`: 7 tests (event emission, JSONL format, correlation IDs)
+
+**Known follow-up items:**
+- `previous_model_path=None` in probation wiring — rollback currently can't restore the actual previous model file (TODO in code)
+- Zero-baseline emergency rollback gap — `5x * 0 = 0` could false-trigger when baseline error rate is 0
+- Memory not probed in probation health checks (only latency/error rate/correction rate)
+- `datetime.utcnow()` deprecated in Python 3.12+ (should use `datetime.now(timezone.utc)`)
+
+### v246.0 - Reactor Core Advanced Training Integration (Planned)
+
+Advanced training features on top of the v239.0 pipeline:
+
 - [ ] **Per-model DPO pair generation** — When different specialist models answer the same query type with different quality, automatically generate preference pairs without human labeling
-- [ ] **Fine-tuned model deployment** — Accept GGUF files from Reactor Core via `HotSwapManager` and validate inference quality before promoting to active
+- [ ] **Temporal A/B testing** — After deploying a fine-tuned model, compare metrics against the previous 2-hour window to detect regressions
+- [x] **Model lineage tracking** — **COMPLETED in v239.0.** `LineageRecord` in Reactor-Core tracks parent model, training method, dataset hash, eval scores, gate decision, probation result per training run. Stored in `~/.jarvis/reactor/models/lineage.jsonl`.
+- [ ] **Interaction capture in `run_server.py`** — Log every `/v1/chat/completions` request-response pair with `X-Model-Id` to disk for training data collection
+
+### ✅ v239.0 - Pipeline Activation: Deployment Feedback + Probation (Completed, Feb 2026)
+
+- [x] `write_deployment_feedback()` with atomic file operations
+- [x] `ProbationMonitor` with 30-min monitoring window, 60s health probes, commit/rollback thresholds
+- [x] `ProbationStatus` enum: MONITORING → COMMITTED | ROLLING_BACK → ROLLED_BACK
+- [x] Health score formula: latency (0.3 weight) + error rate (0.4) + correction rate (0.3)
+- [x] Emergency rollback: error_rate > 5x baseline at any probe
+- [x] Model backup before deployment (restore on rollback)
+- [x] Probation state persistence to disk (survives restart)
+- [x] Pipeline event logger: `model.deployed`, `probation.started`, `probation.committed`, `probation.rollback`
+- [x] Cross-repo event tracing with correlation/causation IDs
+- [x] 51 new tests (12 feedback + 32 probation + 7 events)
 
 ### ✅ v241.0/v241.1 - Multi-Model GCP Golden Image + Task-Type Routing (Current)
 
@@ -2200,8 +2270,16 @@ MIT License - see [LICENSE](LICENSE) for details
 
 ### Known Gaps (In Roadmap)
 
+**Resolved in v239.0 (Feb 2026):**
+- ~~Training pipeline never activated~~ — **RESOLVED.** Pipeline fully wired with supervisor-driven activation across all 3 repos.
+- ~~Deployment feedback loop missing~~ — **RESOLVED.** `write_deployment_feedback()` writes atomic `deployment_status.json` to `~/.jarvis/cross_repo/`.
+- ~~`ReactorCoreBridge.upload_training_data()` not implemented~~ — **CORRECTED (Feb 2026 audit):** Was already fully implemented (992 LOC, v242.0).
+
+**Remaining gaps:**
+- **`previous_model_path=None` in probation** — Rollback currently can't restore the actual previous model file. `ProbationMonitor` has model backup logic but the wiring passes `None` for the previous model path.
+- **Zero-baseline emergency rollback** — `error_rate > 5x * baseline_error_rate` false-triggers when baseline is 0 (5x * 0 = 0, any error causes emergency rollback).
+- **Memory not probed in probation** — Only latency, error rate, and correction rate are checked. Memory pressure is not monitored during post-deployment probation.
 - **LangGraph not installed in JARVIS Body** — All 9 reasoning graphs use linear fallback; reasoning quality sent to J-Prime is sub-optimal (v246.0 target)
-- **`ReactorCoreBridge.upload_training_data()` not implemented** — Training data captured by J-Prime never reaches Reactor Core (v246.0 target)
 - **No Agent Runtime inference support** — J-Prime doesn't yet support session-context or batch inference for autonomous multi-step goal pursuit (v245.0 target)
 - **Single concurrent request** — CPU inference processes one request at a time; autonomous background goals may queue behind interactive commands (v245.0 priority queue target)
 
