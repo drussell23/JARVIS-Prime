@@ -49,6 +49,61 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Pipeline Event Logger (v1.1)
+# ============================================================================
+# Simple JSONL event logger for cross-repo event tracing.
+# TrinityEventBus is not importable from jarvis-prime, so we write
+# structured events to a shared JSONL file.
+
+import uuid as _uuid_module
+
+_PIPELINE_EVENTS_DIR = Path(
+    os.environ.get("JARVIS_PIPELINE_EVENTS_DIR",
+                    str(Path.home() / ".jarvis" / "reactor" / "events"))
+)
+_PIPELINE_EVENTS_FILE = _PIPELINE_EVENTS_DIR / "pipeline_events.jsonl"
+
+
+def emit_pipeline_event(
+    topic: str,
+    payload: Optional[Dict[str, Any]] = None,
+    correlation_id: str = "",
+    causation_id: str = "",
+) -> Optional[str]:
+    """
+    Write a structured pipeline event to the shared JSONL log.
+
+    Args:
+        topic: Event topic (e.g. "model.deployed", "probation.committed").
+        payload: Event payload data.
+        correlation_id: Correlation ID for distributed tracing.
+        causation_id: ID of the event that caused this one.
+
+    Returns:
+        The event_id string, or None on failure.
+    """
+    event_id = str(_uuid_module.uuid4())
+    event = {
+        "event_id": event_id,
+        "topic": topic,
+        "source": "prime",
+        "timestamp": datetime.now().isoformat(),
+        "correlation_id": correlation_id or event_id,
+        "causation_id": causation_id,
+        "payload": payload or {},
+    }
+    try:
+        _PIPELINE_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_PIPELINE_EVENTS_FILE, "a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+        logger.debug(f"[PipelineEvent] {topic} (id={event_id[:8]})")
+        return event_id
+    except Exception as e:
+        logger.debug(f"[PipelineEvent] Failed to write event: {e}")
+        return None
+
+
+# ============================================================================
 # Cross-Repo Feedback
 # ============================================================================
 
@@ -324,6 +379,16 @@ class ProbationMonitor:
         # Persist initial state
         await self.persist_state()
 
+        # v1.1: Emit probation.started pipeline event
+        emit_pipeline_event(
+            topic="probation.started",
+            payload={
+                "model_id": model_id,
+                "duration_s": self._config.probation_duration_s,
+                "probe_interval_s": self._config.probe_interval_s,
+            },
+        )
+
         logger.info(
             f"[Probation] Started probation for {model_id}. "
             f"Duration: {self._config.probation_duration_s}s, "
@@ -529,6 +594,17 @@ class ProbationMonitor:
         # Clean up state file
         await self._cleanup_state_file()
 
+        # v1.1: Emit probation.committed pipeline event
+        emit_pipeline_event(
+            topic="probation.committed",
+            payload={
+                "model_id": self._model_id,
+                "avg_health_score": round(avg_score, 4),
+                "avg_latency_s": round(avg_latency, 4),
+                "probes_count": len(self._probe_history),
+            },
+        )
+
         logger.info(
             f"[Probation] COMMITTED {self._model_id}. "
             f"avg_score={avg_score:.3f}, probes={len(self._probe_history)}"
@@ -600,6 +676,16 @@ class ProbationMonitor:
 
         # Clean up state file
         await self._cleanup_state_file()
+
+        # v1.1: Emit probation.rollback pipeline event
+        emit_pipeline_event(
+            topic="probation.rollback",
+            payload={
+                "model_id": self._model_id,
+                "avg_health_score": round(avg_score, 4),
+                "probes_count": len(self._probe_history),
+            },
+        )
 
         logger.info(
             f"[Probation] ROLLED BACK {self._model_id}. "
@@ -1108,6 +1194,18 @@ class ReactorCoreWatcher:
                     )
                 except Exception as fb_err:
                     logger.warning(f"Failed to write deployment feedback: {fb_err}")
+
+            # v1.1: Emit model.deployed pipeline event
+            emit_pipeline_event(
+                topic="model.deployed",
+                payload={
+                    "model_id": model_id,
+                    "version": version,
+                    "file_size_mb": dest_path.stat().st_size / (1024 * 1024),
+                    "reactor_job_id": manifest.training_run_id if manifest else None,
+                },
+                correlation_id=manifest.training_run_id if manifest else "",
+            )
 
             logger.info(f"Successfully deployed: {model_id} v{version}")
 
