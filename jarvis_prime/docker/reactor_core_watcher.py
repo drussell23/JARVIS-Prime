@@ -46,6 +46,81 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Cross-Repo Feedback
+# ============================================================================
+
+def resolve_cross_repo_dir() -> Path:
+    """
+    Resolve the cross-repo directory for inter-repo communication.
+
+    Checks JARVIS_CROSS_REPO_DIR env var first, falls back to
+    ~/.jarvis/cross_repo.
+    """
+    env_dir = os.environ.get("JARVIS_CROSS_REPO_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".jarvis" / "cross_repo"
+
+
+def write_deployment_feedback(
+    cross_repo_dir: Path,
+    model_id: str,
+    status: str,  # "success", "failed", "rollback"
+    previous_model: Optional[str] = None,
+    reactor_job_id: Optional[str] = None,
+    first_inference_latency_ms: Optional[float] = None,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Write deployment feedback to cross-repo directory for Reactor-Core.
+
+    This closes the deployment feedback loop: Reactor-Core trains a model,
+    Prime deploys it, and this function reports the result back so
+    Reactor-Core knows whether its trained model deployed successfully.
+
+    The file is written atomically via a temporary file to prevent
+    partial reads by Reactor-Core.
+
+    Args:
+        cross_repo_dir: Path to the shared cross-repo directory.
+        model_id: Identifier of the deployed model.
+        status: One of "success", "failed", or "rollback".
+        previous_model: The model that was active before this deployment.
+        reactor_job_id: Reactor-Core's training job ID (for tracing).
+        first_inference_latency_ms: Latency of the first inference after deploy.
+        error: Error message if deployment failed.
+    """
+    # Ensure directory exists
+    cross_repo_dir = Path(cross_repo_dir)
+    cross_repo_dir.mkdir(parents=True, exist_ok=True)
+
+    feedback = {
+        "model_id": model_id,
+        "deployment_status": status,
+        "deployed_at": datetime.now().isoformat(),
+        "previous_model": previous_model,
+        "health_check_passed": status == "success",
+        "first_inference_latency_ms": first_inference_latency_ms,
+        "error": error,
+        "reactor_job_id": reactor_job_id,
+    }
+
+    status_file = cross_repo_dir / "deployment_status.json"
+    # Atomic write via temp file to prevent partial reads
+    tmp_file = status_file.with_suffix(".tmp")
+    try:
+        tmp_file.write_text(json.dumps(feedback, indent=2, default=str))
+        tmp_file.rename(status_file)
+    except Exception:
+        # Clean up temp file on failure
+        if tmp_file.exists():
+            tmp_file.unlink()
+        raise
+
+    logger.info(f"[ReactorWatcher] Deployment feedback written: {status} for {model_id}")
+
+
+# ============================================================================
 # Data Types
 # ============================================================================
 
@@ -189,6 +264,7 @@ class ReactorCoreWatcher:
         on_deploy_failure: Optional[Callable[[DeploymentResult], None]] = None,
         auto_deploy: bool = True,
         validation_enabled: bool = True,
+        cross_repo_dir: Optional[Path] = None,
     ):
         self.watch_dir = Path(watch_dir)
         self.models_dir = Path(models_dir)
@@ -197,6 +273,7 @@ class ReactorCoreWatcher:
         self.on_deploy_failure = on_deploy_failure
         self.auto_deploy = auto_deploy
         self.validation_enabled = validation_enabled
+        self.cross_repo_dir = Path(cross_repo_dir) if cross_repo_dir else resolve_cross_repo_dir()
 
         # State
         self._observer: Optional[Observer] = None
@@ -447,6 +524,20 @@ class ReactorCoreWatcher:
             if self.on_deploy_success:
                 self.on_deploy_success(result)
 
+            # Write deployment feedback for Reactor-Core
+            try:
+                previous_model_id = None
+                # Determine previous model from manifest lineage if available
+                write_deployment_feedback(
+                    cross_repo_dir=self.cross_repo_dir,
+                    model_id=model_id,
+                    status="success",
+                    previous_model=previous_model_id,
+                    reactor_job_id=manifest.training_run_id if manifest else None,
+                )
+            except Exception as fb_err:
+                logger.warning(f"Failed to write deployment feedback: {fb_err}")
+
             logger.info(f"Successfully deployed: {model_id} v{version}")
 
         except Exception as e:
@@ -485,6 +576,18 @@ class ReactorCoreWatcher:
         # Notify callback
         if self.on_deploy_failure:
             self.on_deploy_failure(result)
+
+        # Write deployment feedback for Reactor-Core
+        try:
+            write_deployment_feedback(
+                cross_repo_dir=self.cross_repo_dir,
+                model_id=model_id,
+                status="failed",
+                reactor_job_id=manifest.training_run_id if manifest else None,
+                error=error_message,
+            )
+        except Exception as fb_err:
+            logger.warning(f"Failed to write deployment feedback: {fb_err}")
 
         logger.error(f"Deployment failed for {model_id}: {error_message}")
 
