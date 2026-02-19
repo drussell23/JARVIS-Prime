@@ -505,16 +505,12 @@ The **permanent solution** is training the model itself to be concise for simple
 
 After DPO training, conciseness for simple queries is encoded **in the model's weights** — not dependent on a prompt instruction the model might ignore. The model learns *when* to be terse and *when* to be detailed from actual user interaction patterns, not from static rules.
 
-The key components for this pipeline are built and wired (v239.0, Feb 2026):
-- **`TelemetryEmitter`** (JARVIS) — captures every interaction with correlation_id, ships to Reactor-Core
-- **`ReactorCoreClient`** (JARVIS) — quality-weighted experience scoring (7-tier), resource-aware auto-trigger, training circuit breaker
-- **`DeploymentGate`** (Reactor-Core) — validates GGUF before deployment (magic bytes, version, size, inference check)
-- **`ProbationMonitor`** (Prime) — 30-min post-deployment monitoring with auto-rollback on quality regression
+The key components for this pipeline already exist:
+- **`TelemetryEmitter`** (JARVIS) — captures every interaction, ships to Reactor-Core
 - **`TrainingDataPipeline`** (Prime) — generates DPO preference pairs from conversations
 - **`RLHFIntegration`** (Prime) — reward model training and PPO optimization
 - **`ReactorCoreBridge`** (Prime) — submits fine-tuning jobs, tracks training, deploys finished models
 - **`HotSwapManager`** (Prime) — swaps the model at runtime with zero request drops
-- **`write_deployment_feedback()`** (Prime) — atomic deployment status feedback to `~/.jarvis/cross_repo/`
 
 ### v238.0: Degenerate Response Elimination (Defense-in-Depth)
 
@@ -1817,6 +1813,42 @@ The Google Workspace Agent in JARVIS Body now successfully creates real Gmail dr
 | Body generation via proper `ModelRequest` API | Draft email body generation now correctly calls J-Prime's inference endpoint |
 | Task-type metadata flow | Workspace commands carry `task_type` metadata, enabling J-Prime's `GCPModelSwapCoordinator` to select the optimal model |
 
+#### Real-Time Voice Conversation Infrastructure (v238.0 — JARVIS Body)
+
+JARVIS Body v238.0 introduced a full **real-time voice conversation pipeline** — continuous, bidirectional, streaming voice dialogue. J-Prime serves as the **LLM inference backend** for this pipeline, streaming tokens via SSE that are immediately converted to speech.
+
+**How J-Prime is used in voice conversation:**
+
+```
+User speaks → Mic → AEC → StreamingSTT (faster-whisper) → Text
+  → ConversationPipeline sends to J-Prime (/v1/chat/completions, stream=true)
+    → J-Prime routes to optimal specialist model (GCPModelSwapCoordinator)
+      → SSE token stream back to JARVIS Body
+        → SentenceSplitter accumulates tokens into sentences
+          → Streaming TTS (Piper) synthesizes each sentence
+            → AudioBus plays audio → User hears first word at ~300-500ms
+```
+
+**Key implications for J-Prime:**
+
+| Aspect | Before (Command Mode) | After (Conversation Mode) |
+|--------|----------------------|--------------------------|
+| **Request pattern** | Single request, wait for full response | Rapid-fire requests (every 2-8 seconds per turn) |
+| **Streaming** | Optional, usually batch | **Required** — SSE streaming mandatory for latency |
+| **Context window** | Single query | 20-turn sliding window (conversation history as messages array) |
+| **Latency target** | <10 seconds acceptable | **<500ms time-to-first-token** critical for natural feel |
+| **Model selection** | Task-type routing | Conversation defaults to Gemma-2-9B (general) with dynamic specialist routing |
+| **Sticky routing** | Helps avoid swap | **Critical** — model swaps mid-conversation add 30s latency |
+
+**What this means for J-Prime's infrastructure:**
+
+- **SSE streaming performance is now latency-critical.** Every millisecond between "user stops speaking" and "first token arrives" is perceptible. The existing `/v1/chat/completions` endpoint with `stream=true` is used directly.
+- **Sticky routing prevents thrashing.** In conversation mode, queries are mostly `general_chat` type, keeping the same model (Gemma-2-9B) loaded across turns. Task-type routing still works — if the user says "solve 5x+3=18" mid-conversation, the Math specialist handles it.
+- **Context accumulation increases prompt size.** A 20-turn conversation with 50-100 tokens per turn means 1000-2000 tokens of context per request. This is well within all models' context windows but increases per-request inference time.
+- **Barge-in creates abandoned requests.** When the user interrupts JARVIS mid-response, the SSE stream is cancelled client-side. J-Prime should handle stream cancellation gracefully (it already does via `llama-cpp-python`'s generator cleanup).
+
+**No J-Prime code changes were needed** — the existing OpenAI-compatible API with SSE streaming, sticky routing, and model swap coordination handles voice conversation natively. The entire implementation is in JARVIS Body's new `backend/audio/` package.
+
 #### Planned: Unified Agent Runtime (v247.0)
 
 JARVIS Body is planning a **Unified Agent Runtime** — a persistent sense-think-act-verify-reflect loop for autonomous goal pursuit. J-Prime's role:
@@ -1909,58 +1941,19 @@ Support the JARVIS Body Unified Agent Runtime with enhanced inference capabiliti
 - [ ] **Priority queue for autonomous vs. interactive** — Interactive user commands get priority over autonomous background inference to maintain responsiveness
 - [ ] **Telemetry attribution** — Tag inference requests with `source: "agent_runtime"` vs `source: "user_command"` for separate monitoring and training data collection
 
-### v239.0 - Pipeline Activation: Wiring the Training Loop (Completed, Feb 2026)
+### v239.0 - Pipeline Activation: Wiring the Training Loop (In Progress)
 
-**Status: COMPLETED.** 3 commits, 51 new tests. J-Prime's role in the Reactor Core training pipeline is now fully wired: deployment feedback, post-deployment probation with auto-rollback, and cross-repo event tracing.
+Connect J-Prime to the Reactor Core training pipeline. Most infrastructure is already built — this version wires the existing components together with ~200-400 lines of changes across the ecosystem.
 
-**What was built in J-Prime (this repo):**
+**Corrected status (Feb 2026 audit):**
+- [x] **`ReactorCoreBridge.upload_training_data()`** — ~~Previously reported as "not implemented"~~ **VERIFIED: Fully implemented** (992 LOC, v242.0) with batch upload, file fallback, and job tracking. No action needed.
+- [x] **Experience schemas** — Verified byte-identical across all three repos (v1.0 canonical `ExperienceEvent`). No alignment work needed.
+- [x] **`HotSwapManager`** — Accepts GGUF files for zero-downtime model swap. `ReactorCoreWatcher` in JARVIS Body detects new model files.
 
-| Component | File | Purpose |
-|-----------|------|---------|
-| `write_deployment_feedback()` | `jarvis_prime/docker/reactor_core_watcher.py` | Atomic writes to `~/.jarvis/cross_repo/deployment_status.json` after GGUF deployment |
-| `ProbationStatus` enum | `reactor_core_watcher.py` | `MONITORING`, `COMMITTED`, `ROLLING_BACK`, `ROLLED_BACK` |
-| `ProbationConfig` dataclass | `reactor_core_watcher.py` | Configurable thresholds: duration (30 min), probe interval (60s), commit threshold (0.8), rollback threshold (0.5), emergency multiplier (5x) |
-| `ProbationMonitor` class | `reactor_core_watcher.py` | Full lifecycle: start → probe (latency, error rate, correction rate) → evaluate health score → COMMITTED or ROLLING_BACK. Model backup before deployment. State persistence to disk. |
-| Pipeline event logger | `reactor_core_watcher.py` | JSONL events: `model.deployed`, `probation.started`, `probation.committed`, `probation.rollback` with correlation/causation IDs |
-
-**ProbationMonitor flow:**
-```
-GGUF deployed to J-Prime
-  → Backup previous model to ~/.jarvis/reactor/model_backups/
-  → ProbationMonitor.start() [30-minute window]
-    → Probe every 60s: latency, error_rate, correction_rate
-      → health_score = weighted combination (latency 0.3, errors 0.4, corrections 0.3)
-      → health_score >= 0.8 → COMMITTED (model stays)
-      → health_score < 0.5 → ROLLING_BACK (restore backup)
-      → error_rate > 5x baseline → EMERGENCY rollback at any probe
-    → Write deployment_status.json with full metadata
-    → Emit pipeline events for cross-repo observability
-```
-
-**Deployment feedback schema:**
-```json
-{
-  "model_id": "string",
-  "deployment_status": "success | failed | rollback",
-  "deployed_at": "ISO 8601",
-  "previous_model": "string",
-  "health_check_passed": true,
-  "first_inference_latency_ms": 3200,
-  "error": null,
-  "reactor_job_id": "string"
-}
-```
-
-**Test coverage (51 tests):**
-- `test_deployment_feedback.py`: 12 tests (atomic writes, schema validation, error handling)
-- `test_probation.py`: 32 tests (lifecycle, health scoring, commit/rollback, emergency, persistence, config)
-- `test_pipeline_events.py`: 7 tests (event emission, JSONL format, correlation IDs)
-
-**Known follow-up items:**
-- `previous_model_path=None` in probation wiring — rollback currently can't restore the actual previous model file (TODO in code)
-- Zero-baseline emergency rollback gap — `5x * 0 = 0` could false-trigger when baseline error rate is 0
-- Memory not probed in probation health checks (only latency/error rate/correction rate)
-- `datetime.utcnow()` deprecated in Python 3.12+ (should use `datetime.now(timezone.utc)`)
+**What v239.0 adds for J-Prime:**
+- [ ] **Deployment feedback** — After `HotSwapManager` loads a new model from Reactor Core, write a `deployment_status.json` feedback file to `~/.jarvis/reactor/feedback/` so Reactor Core knows the deployment succeeded or failed
+- [ ] **Health verification after swap** — After loading a new model, run a quick inference sanity check and include the result in the feedback file
+- [ ] **Interaction capture in `run_server.py`** — Log every `/v1/chat/completions` request-response pair with `X-Model-Id` to disk for training data collection (supports the DPO pair generation in Reactor Core)
 
 ### v246.0 - Reactor Core Advanced Training Integration (Planned)
 
@@ -1968,21 +1961,7 @@ Advanced training features on top of the v239.0 pipeline:
 
 - [ ] **Per-model DPO pair generation** — When different specialist models answer the same query type with different quality, automatically generate preference pairs without human labeling
 - [ ] **Temporal A/B testing** — After deploying a fine-tuned model, compare metrics against the previous 2-hour window to detect regressions
-- [x] **Model lineage tracking** — **COMPLETED in v239.0.** `LineageRecord` in Reactor-Core tracks parent model, training method, dataset hash, eval scores, gate decision, probation result per training run. Stored in `~/.jarvis/reactor/models/lineage.jsonl`.
-- [ ] **Interaction capture in `run_server.py`** — Log every `/v1/chat/completions` request-response pair with `X-Model-Id` to disk for training data collection
-
-### ✅ v239.0 - Pipeline Activation: Deployment Feedback + Probation (Completed, Feb 2026)
-
-- [x] `write_deployment_feedback()` with atomic file operations
-- [x] `ProbationMonitor` with 30-min monitoring window, 60s health probes, commit/rollback thresholds
-- [x] `ProbationStatus` enum: MONITORING → COMMITTED | ROLLING_BACK → ROLLED_BACK
-- [x] Health score formula: latency (0.3 weight) + error rate (0.4) + correction rate (0.3)
-- [x] Emergency rollback: error_rate > 5x baseline at any probe
-- [x] Model backup before deployment (restore on rollback)
-- [x] Probation state persistence to disk (survives restart)
-- [x] Pipeline event logger: `model.deployed`, `probation.started`, `probation.committed`, `probation.rollback`
-- [x] Cross-repo event tracing with correlation/causation IDs
-- [x] 51 new tests (12 feedback + 32 probation + 7 events)
+- [ ] **Model lineage tracking** — Every deployed model records: base model, training method, dataset hash, evaluation scores, so quality can be traced back to training data
 
 ### ✅ v241.0/v241.1 - Multi-Model GCP Golden Image + Task-Type Routing (Current)
 
@@ -1998,6 +1977,17 @@ Advanced training features on top of the v239.0 pipeline:
 - [x] 3 pre-staged models: LLaVA (v242 vision), TinyLlama (speculative decoding), BGE (RAG)
 - [x] v241.1: Added DeepSeek-R1-Qwen-7B (reasoning), Gemma-2-9B (general), Qwen2.5-Math-7B (math)
 - [x] Template auto-detection: qwen→chatml, deepseek→chatml, gemma-2→gemma
+
+### ✅ v238.0 — Real-Time Voice Conversation Infrastructure (JARVIS Body-side)
+
+- [x] 7-layer audio infrastructure (Layers -1 through 6) in JARVIS Body: FullDuplexDevice, AudioBus+AEC, Streaming TTS (Piper), Streaming STT (faster-whisper), Turn Detection, Barge-In, Conversation Pipeline, Mode Dispatcher
+- [x] J-Prime SSE streaming (`/v1/chat/completions`, `stream=true`) serves as the LLM backend for real-time conversation responses
+- [x] 20-turn sliding context window sent as messages array per request — no J-Prime changes needed
+- [x] Sticky routing prevents model thrashing during conversations (conversation queries are mostly `general_chat` → Gemma-2-9B stays loaded)
+- [x] SentenceSplitter in JARVIS Body accumulates J-Prime tokens into sentences → Streaming TTS yields ~300-500ms time-to-first-audio
+- [x] Barge-in creates abandoned SSE streams — J-Prime's `llama-cpp-python` generator cleanup handles cancellation gracefully
+- [x] No J-Prime code changes required — existing OpenAI-compatible API with SSE streaming handles voice conversation natively
+- [x] Two-phase bootstrap: AudioBus starts before narrator (Phase 1), full pipeline wires after Intelligence provides J-Prime client (Phase 2)
 
 ### ✅ v238.0 - Degenerate Response Elimination (JARVIS Body-side)
 
@@ -2270,16 +2260,10 @@ MIT License - see [LICENSE](LICENSE) for details
 
 ### Known Gaps (In Roadmap)
 
-**Resolved in v239.0 (Feb 2026):**
-- ~~Training pipeline never activated~~ — **RESOLVED.** Pipeline fully wired with supervisor-driven activation across all 3 repos.
-- ~~Deployment feedback loop missing~~ — **RESOLVED.** `write_deployment_feedback()` writes atomic `deployment_status.json` to `~/.jarvis/cross_repo/`.
-- ~~`ReactorCoreBridge.upload_training_data()` not implemented~~ — **CORRECTED (Feb 2026 audit):** Was already fully implemented (992 LOC, v242.0).
-
-**Remaining gaps:**
-- **`previous_model_path=None` in probation** — Rollback currently can't restore the actual previous model file. `ProbationMonitor` has model backup logic but the wiring passes `None` for the previous model path.
-- **Zero-baseline emergency rollback** — `error_rate > 5x * baseline_error_rate` false-triggers when baseline is 0 (5x * 0 = 0, any error causes emergency rollback).
-- **Memory not probed in probation** — Only latency, error rate, and correction rate are checked. Memory pressure is not monitored during post-deployment probation.
 - **LangGraph not installed in JARVIS Body** — All 9 reasoning graphs use linear fallback; reasoning quality sent to J-Prime is sub-optimal (v246.0 target)
+- ~~**`ReactorCoreBridge.upload_training_data()` not implemented**~~ — **CORRECTED (Feb 2026 audit):** Fully implemented (992 LOC, v242.0) with batch upload, file fallback, and job tracking. The real gap is operational activation — the training pipeline has never been run. See v239.0.
+- **Training pipeline never activated** — All components are built and schemas verified, but zero training jobs have ever run. `ReactorCoreWatcher` and `initialize_reactor_core()` exist in JARVIS Body but are never called during supervisor startup. Target: v239.0.
+- **Deployment feedback loop missing** — After `HotSwapManager` loads a new model, no feedback is sent to Reactor Core about success/failure/regression. One-way blind deployment. Target: v239.0.
 - **No Agent Runtime inference support** — J-Prime doesn't yet support session-context or batch inference for autonomous multi-step goal pursuit (v245.0 target)
 - **Single concurrent request** — CPU inference processes one request at a time; autonomous background goals may queue behind interactive commands (v245.0 priority queue target)
 
