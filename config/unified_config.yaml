@@ -887,11 +887,15 @@ gcp_model_routing:
         flash_attn: false
 
     llava-v1.6-mistral-7b:
-      repo: "cjpais/llava-v1.6-mistral-7b-gguf"
+      repo: "cjpais/llava-1.6-mistral-7b-gguf"  # F1: no 'v' before 1.6
       filename: "llava-v1.6-mistral-7b.Q4_K_M.gguf"
       size_gb: 4.9
-      routable: false  # Needs CLIP encoder + multimodal inference (v242)
-      role: "Vision / multimodal (pre-staged, not yet routable)"
+      routable: false  # LLaVA is served by dedicated vision_server.py, not text model swap
+      role: "Vision / multimodal (dedicated vision_server.py on port 8001)"
+      mmproj_repo: "cjpais/llava-1.6-mistral-7b-gguf"
+      mmproj_filename: "mmproj-model-f16.gguf"
+      mmproj_size_gb: 0.6
+      vision_server_port: 8001
 
     phi-3.5-mini:
       repo: "bartowski/Phi-3.5-mini-instruct-GGUF"
