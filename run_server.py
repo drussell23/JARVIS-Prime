@@ -585,7 +585,7 @@ class StartupState:
     in the background.
     """
 
-    _TOTAL_INIT_STEPS = 9  # Steps 1-9 in background_initialization()
+    _TOTAL_INIT_STEPS = 11  # Steps 1-11 in background_initialization()
 
     def __init__(self):
         self.phase = "starting"  # starting -> initializing -> loading_model -> ready | error
@@ -785,6 +785,9 @@ class StartupState:
 # =============================================================================
 _startup_state: Optional[StartupState] = None
 _bridge = None
+_reactor_bridge = None
+_training_pipeline = None
+_jarvis_bridge = None
 _neural_orchestrator = None
 _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
@@ -1044,9 +1047,28 @@ async def main():
             # Add runtime component status once initialized
             if _startup_state.phase == "ready":
                 status["bridge_enabled"] = _bridge is not None
+                status["reactor_bridge_enabled"] = _reactor_bridge is not None
+                status["training_pipeline_enabled"] = _training_pipeline is not None
+                status["jarvis_bridge_enabled"] = _jarvis_bridge is not None
                 status["trinity_enabled"] = _trinity_initialized
                 status["agi_enabled"] = _agi_hub is not None
                 status["neural_routing_enabled"] = _neural_routing_enabled
+                if _reactor_bridge:
+                    try:
+                        reactor_stats = _reactor_bridge.get_statistics()
+                        status["reactor_bridge"] = {
+                            "is_running": reactor_stats.get("is_running", False),
+                            "jobs_submitted": reactor_stats.get("jobs_submitted", 0),
+                            "jobs_completed": reactor_stats.get("jobs_completed", 0),
+                            "jobs_failed": reactor_stats.get("jobs_failed", 0),
+                        }
+                    except Exception:
+                        status["reactor_bridge"] = {"is_running": False, "error": "stats_unavailable"}
+                if _jarvis_bridge:
+                    try:
+                        status["jarvis_bridge"] = _jarvis_bridge.get_metrics()
+                    except Exception:
+                        status["jarvis_bridge"] = {"initialized": False, "error": "metrics_unavailable"}
 
                 # v150.0: Check hollow client mode for inference readiness
                 hollow_client_active = _is_hollow_client_active()
@@ -1302,12 +1324,13 @@ async def main():
         error: Optional[str] = None,
     ) -> None:
         """v242.0: Capture interaction for training data pipeline."""
-        if not _telemetry_hook:
+        if not _telemetry_hook and not _training_pipeline:
             return
 
         try:
             # Extract user's last message as prompt
             user_input = ""
+            system_prompt: Optional[str] = None
             for msg in reversed(messages):
                 if isinstance(msg, dict):
                     role = msg.get("role", "")
@@ -1317,9 +1340,11 @@ async def main():
                     content = msg.content
                 else:
                     continue
-                if role == "user":
+                if role == "user" and not user_input:
                     user_input = content
-                    break
+                    continue
+                if role == "system" and system_prompt is None:
+                    system_prompt = content
 
             metadata = {
                 "task_type": task_type,
@@ -1331,15 +1356,24 @@ async def main():
                 metadata["error"] = error
                 metadata["outcome"] = "failure"
 
-            await _telemetry_hook.log(
-                prompt=user_input,
-                completion=response_text,
-                model_version=model_id or "unknown",
-                latency_ms=latency_ms,
-                success=success,
-                task_type=task_type or "",
-                metadata=metadata,
-            )
+            if _telemetry_hook:
+                await _telemetry_hook.log(
+                    prompt=user_input,
+                    completion=response_text,
+                    model_version=model_id or "unknown",
+                    latency_ms=latency_ms,
+                    success=success,
+                    task_type=task_type or "",
+                    metadata=metadata,
+                )
+
+            if _training_pipeline:
+                await _training_pipeline.capture_conversation(
+                    user_input=user_input,
+                    assistant_response=response_text,
+                    system_prompt=system_prompt,
+                    context=metadata,
+                )
         except Exception as e:
             logger.debug(f"[v242] Telemetry record failed: {e}")
 
@@ -1697,21 +1731,40 @@ async def main():
     @app.get("/metrics")
     async def metrics():
         """Get inference and cost metrics."""
+        payload: Dict[str, Any] = {"status": "ok"}
+
         if _bridge:
             try:
                 from jarvis_prime.core.cross_repo_bridge import get_cost_summary
                 cost_summary = get_cost_summary()
                 inference_metrics = _bridge.get_metrics()
-                return {
-                    "status": "ok",
+                payload.update({
                     "cost_summary": cost_summary,
                     "inference_metrics": inference_metrics,
                     "connected_to_jarvis": _bridge.state.connected_to_jarvis,
-                }
+                })
             except Exception as e:
-                return {"status": "error", "error": str(e)}
+                payload["cross_repo_bridge_error"] = str(e)
         else:
-            return {"status": "disabled", "message": "Cross-repo bridge not enabled"}
+            payload["cross_repo_bridge"] = "disabled"
+
+        if _reactor_bridge:
+            try:
+                payload["reactor_bridge"] = _reactor_bridge.get_statistics()
+            except Exception as e:
+                payload["reactor_bridge_error"] = str(e)
+        else:
+            payload["reactor_bridge"] = "disabled"
+
+        if _jarvis_bridge:
+            try:
+                payload["jarvis_bridge"] = _jarvis_bridge.get_metrics()
+            except Exception as e:
+                payload["jarvis_bridge_error"] = str(e)
+        else:
+            payload["jarvis_bridge"] = "disabled"
+
+        return payload
 
     @app.get("/v1/models")
     async def list_models():
@@ -2211,13 +2264,17 @@ async def main():
         1. Import ML libraries (torch, sklearn - triggers warnings)
         2. Initialize cross-repo bridge
         3. Initialize Trinity bridge
-        4. Initialize AGI Hub
-        5. Initialize Neural Orchestrator
-        6. Download model if needed
-        7. Load model
-        8. Mark ready
+        4. Initialize Reactor + training data bridges
+        5. Initialize AGI Hub
+        6. Initialize JARVIS action/safety bridge
+        7. Initialize Neural Orchestrator
+        8. Download model if needed
+        9. Configure hardware
+        10. Load model
+        11. Mark ready
         """
-        global _bridge, _executor, _agi_hub, _neural_orchestrator, _model_path
+        global _bridge, _reactor_bridge, _training_pipeline, _jarvis_bridge
+        global _executor, _agi_hub, _neural_orchestrator, _model_path
         global _trinity_initialized, _trinity_record_inference, _neural_routing_enabled
         global _model_coordinator  # v241.0
         global _telemetry_hook  # v242.0
@@ -2227,7 +2284,7 @@ async def main():
             init_start = time.time()
 
             # v93.7: Enhanced step logging with timing
-            def log_step(step_name: str, step_num: int, total_steps: int = 9):
+            def log_step(step_name: str, step_num: int, total_steps: int = 11):
                 """Log step with progress indicator."""
                 _startup_state.details["step"] = step_name
                 _startup_state.details["step_num"] = step_num
@@ -2325,11 +2382,35 @@ async def main():
             _startup_state.complete_phase("initializing_trinity")
 
             # -----------------------------------------------------------------
-            # STEP 4: Initialize AGI Hub (with Hardware-Aware Configuration)
+            # STEP 4: Initialize Reactor Core Bridge + Training Pipeline
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("initializing_agi_hub", 4)
-            _startup_state.begin_phase("initializing_agi_hub", 4)
+            log_step("initializing_reactor_pipeline", 4)
+            _startup_state.begin_phase("initializing_reactor_pipeline", 4)
+            if bridge_enabled:
+                try:
+                    from jarvis_prime.core.reactor_core_bridge import get_reactor_core_bridge
+                    from jarvis_prime.core.training_data_pipeline import get_training_data_pipeline
+
+                    _reactor_bridge = await get_reactor_core_bridge()
+                    _training_pipeline = await get_training_data_pipeline()
+                    log_step_complete("Reactor bridge + training pipeline", time.time() - step_start)
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Reactor/training pipeline init failed: {e}")
+                    _reactor_bridge = None
+                    _training_pipeline = None
+            else:
+                logger.info("   ℹ️ Reactor/training pipeline disabled (--no-bridge)")
+                _reactor_bridge = None
+                _training_pipeline = None
+            _startup_state.complete_phase("initializing_reactor_pipeline")
+
+            # -----------------------------------------------------------------
+            # STEP 5: Initialize AGI Hub (with Hardware-Aware Configuration)
+            # -----------------------------------------------------------------
+            step_start = time.time()
+            log_step("initializing_agi_hub", 5)
+            _startup_state.begin_phase("initializing_agi_hub", 5)
 
             # v138.0: Perform hardware assessment BEFORE AGI Hub initialization
             global _hardware_assessment
@@ -2472,11 +2553,32 @@ async def main():
             _startup_state.complete_phase("initializing_agi_hub")
 
             # -----------------------------------------------------------------
-            # STEP 5: Initialize Neural Orchestrator
+            # STEP 6: Initialize JARVIS action/safety bridge
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("initializing_neural_orchestrator", 5)
-            _startup_state.begin_phase("initializing_neural_orchestrator", 5)
+            log_step("initializing_jarvis_bridge", 6)
+            _startup_state.begin_phase("initializing_jarvis_bridge", 6)
+            if bridge_enabled and _agi_hub:
+                try:
+                    from jarvis_prime.core.jarvis_bridge import get_jarvis_bridge
+
+                    _jarvis_bridge = await get_jarvis_bridge()
+                    log_step_complete("JARVIS action/safety bridge", time.time() - step_start)
+                except Exception as e:
+                    logger.warning(f"   ⚠️ JARVIS action/safety bridge init failed: {e}")
+                    _jarvis_bridge = None
+            else:
+                reason = "--no-bridge" if not bridge_enabled else "AGI hub unavailable"
+                logger.info(f"   ℹ️ JARVIS action/safety bridge disabled ({reason})")
+                _jarvis_bridge = None
+            _startup_state.complete_phase("initializing_jarvis_bridge")
+
+            # -----------------------------------------------------------------
+            # STEP 7: Initialize Neural Orchestrator
+            # -----------------------------------------------------------------
+            step_start = time.time()
+            log_step("initializing_neural_orchestrator", 7)
+            _startup_state.begin_phase("initializing_neural_orchestrator", 7)
             try:
                 from jarvis_prime.core.neural_orchestrator_core import (
                     NeuralOrchestratorCore,
@@ -2500,11 +2602,11 @@ async def main():
             _startup_state.complete_phase("initializing_neural_orchestrator")
 
             # -----------------------------------------------------------------
-            # STEP 6: Resolve model path and download if needed
+            # STEP 8: Resolve model path and download if needed
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("resolving_model", 6)
-            _startup_state.begin_phase("resolving_model", 6)
+            log_step("resolving_model", 8)
+            _startup_state.begin_phase("resolving_model", 8)
             _startup_state.phase = "loading_model"
 
             model_path = Path(_args.model)
@@ -2586,11 +2688,11 @@ async def main():
             _startup_state.complete_phase("resolving_model")
 
             # -----------------------------------------------------------------
-            # STEP 7: Hardware optimization and executor creation
+            # STEP 9: Hardware optimization and executor creation
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("configuring_hardware", 7)
-            _startup_state.begin_phase("configuring_hardware", 7)
+            log_step("configuring_hardware", 9)
+            _startup_state.begin_phase("configuring_hardware", 9)
             optimized_gpu_layers = _args.gpu_layers
             optimized_threads = _args.threads
             optimized_ctx_size = _args.ctx_size
@@ -2639,12 +2741,12 @@ async def main():
             _startup_state.complete_phase("configuring_hardware")
 
             # -----------------------------------------------------------------
-            # STEP 8: Load model (v93.7: with timeout and progress reporting)
+            # STEP 10: Load model (v93.7: with timeout and progress reporting)
             # v150.0: HOLLOW CLIENT CHECK - Skip local model loading entirely
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("loading_model", 8)
-            _startup_state.begin_phase("loading_model", 8)
+            log_step("loading_model", 10)
+            _startup_state.begin_phase("loading_model", 10)
             # v224.0: BUGFIX — model_load_start is set below, right before the actual
             # _executor.load() call (was previously set here, inflating elapsed time
             # by including hollow client checks and model existence validation).
@@ -2681,7 +2783,7 @@ async def main():
                 log_step_complete("Model loading (SKIPPED - Hollow Client)", time.time() - step_start)
                 _startup_state.complete_phase("loading_model")
 
-                # Skip to Step 9 - don't attempt local model loading
+                # Skip local model loading path and continue initialization
             elif model_path.exists():
                 model_size_mb = model_path.stat().st_size / (1024 * 1024)
                 logger.info(f"[Background] Loading model: {model_path} ({model_size_mb:.1f}MB)")
@@ -2827,7 +2929,7 @@ async def main():
                         pass
 
             # -----------------------------------------------------------------
-            # STEP 8b: v241.0 — Initialize GCP model swap coordinator
+            # STEP 10b: v241.0 — Initialize GCP model swap coordinator
             # -----------------------------------------------------------------
             _model_coordinator = None
             _v241_models_dir = Path(os.getenv("GCP_MODELS_DIR", "/opt/jarvis-prime/models"))
@@ -2852,7 +2954,7 @@ async def main():
                 logger.info("[v241] No model manifest found — single-model mode (backward compat)")
 
             # -----------------------------------------------------------------
-            # STEP 8c: v242.0 — Initialize telemetry hook for training data capture
+            # STEP 10c: v242.0 — Initialize telemetry hook for training data capture
             # -----------------------------------------------------------------
             _telemetry_hook = None
             try:
@@ -2866,11 +2968,11 @@ async def main():
                 logger.warning(f"[v242] Telemetry hook initialization failed (non-critical): {e}")
 
             # -----------------------------------------------------------------
-            # STEP 9: Mark ready (v93.7: with enhanced logging)
+            # STEP 11: Mark ready (v93.7: with enhanced logging)
             # -----------------------------------------------------------------
             step_start = time.time()
-            log_step("marking_ready", 9)
-            _startup_state.begin_phase("marking_ready", 9)
+            log_step("marking_ready", 11)
+            _startup_state.begin_phase("marking_ready", 11)
 
             _startup_state.phase = "ready"
             _startup_state.init_elapsed = time.time() - init_start
@@ -2908,6 +3010,14 @@ async def main():
                 logger.info(f"   ├─ JARVIS Bridge: {'Connected' if _bridge.state.connected_to_jarvis else 'Enabled (standalone)'}")
             else:
                 logger.info("   ├─ JARVIS Bridge: Disabled")
+            if _reactor_bridge:
+                logger.info("   ├─ Reactor Core Bridge: Active")
+            else:
+                logger.info("   ├─ Reactor Core Bridge: Not initialized")
+            if _jarvis_bridge:
+                logger.info("   ├─ JARVIS Action/Safety Bridge: Active")
+            else:
+                logger.info("   ├─ JARVIS Action/Safety Bridge: Not initialized")
             if _trinity_initialized:
                 logger.info("   ├─ PROJECT TRINITY: Connected (Mind component)")
             else:
@@ -2926,6 +3036,10 @@ async def main():
                 logger.info(f"   ├─ GCP Model Coordinator v241.0: {_v241_routable} routable / {len(_v241_inv)} total")
             else:
                 logger.info("   ├─ GCP Model Coordinator: Not active (single-model mode)")
+            if _training_pipeline:
+                logger.info("   ├─ Training Data Pipeline: Active")
+            else:
+                logger.info("   ├─ Training Data Pipeline: Not initialized")
             if _telemetry_hook:
                 logger.info(f"   └─ Telemetry Hook v242.0: Active ({_telemetry_hook.output_dir})")
             else:
@@ -3019,7 +3133,7 @@ async def main():
     # =========================================================================
     @app.on_event("shutdown")
     async def on_shutdown():
-        global _registry_heartbeat_task
+        global _registry_heartbeat_task, _reactor_bridge, _training_pipeline, _telemetry_hook, _jarvis_bridge
 
         logger.info("Shutting down...")
 
@@ -3052,6 +3166,15 @@ async def main():
             except Exception as e:
                 logger.warning(f"Neural Orchestrator shutdown error: {e}")
 
+        if _jarvis_bridge:
+            try:
+                from jarvis_prime.core.jarvis_bridge import shutdown_jarvis_bridge
+                await shutdown_jarvis_bridge()
+                _jarvis_bridge = None
+                logger.info("JARVIS action/safety bridge shutdown complete")
+            except Exception as e:
+                logger.warning(f"JARVIS action/safety bridge shutdown error: {e}")
+
         if _agi_hub:
             try:
                 from jarvis_prime.core.agi_integration import shutdown_agi_hub
@@ -3067,6 +3190,32 @@ async def main():
                 logger.info("PROJECT TRINITY: J-Prime disconnected")
             except Exception as e:
                 logger.warning(f"Trinity shutdown error: {e}")
+
+        if _training_pipeline:
+            try:
+                from jarvis_prime.core.training_data_pipeline import shutdown_training_data_pipeline
+                await shutdown_training_data_pipeline()
+                _training_pipeline = None
+                logger.info("Training data pipeline shutdown complete")
+            except Exception as e:
+                logger.warning(f"Training data pipeline shutdown error: {e}")
+
+        if _reactor_bridge:
+            try:
+                from jarvis_prime.core.reactor_core_bridge import shutdown_reactor_core_bridge
+                await shutdown_reactor_core_bridge()
+                _reactor_bridge = None
+                logger.info("Reactor Core bridge shutdown complete")
+            except Exception as e:
+                logger.warning(f"Reactor Core bridge shutdown error: {e}")
+
+        if _telemetry_hook:
+            try:
+                await _telemetry_hook.stop()
+                _telemetry_hook = None
+                logger.info("Telemetry hook shutdown complete")
+            except Exception as e:
+                logger.warning(f"Telemetry hook shutdown error: {e}")
 
         if _bridge:
             try:

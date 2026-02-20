@@ -143,6 +143,7 @@ from jarvis_prime.core.jarvis_bridge import (
     ProcessingMode,
     SafetyContext,
     get_jarvis_bridge,
+    shutdown_jarvis_bridge,
     process_jarvis_command,
 )
 from jarvis_prime.core.agi_persistence import (
@@ -608,6 +609,7 @@ __all__ = [
     "ProcessingMode",
     "SafetyContext",
     "get_jarvis_bridge",
+    "shutdown_jarvis_bridge",
     "process_jarvis_command",
     # AGI Persistence (v78.0)
     "AGIPersistenceManager",

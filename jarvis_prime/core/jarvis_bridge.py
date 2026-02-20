@@ -1119,6 +1119,23 @@ class JARVISPrimeBridge:
     def is_initialized(self) -> bool:
         return self._initialized
 
+    async def shutdown(self) -> None:
+        """
+        Release bridge-owned state.
+
+        The AGI hub lifecycle is owned by the server/runtime layer; this method
+        only clears bridge-local references and caches.
+        """
+        async with self._init_lock:
+            self._initialized = False
+            self._agi_hub = None
+            self._reasoning_engine = None
+            self._learning_engine = None
+            self._multimodal_engine = None
+            self._response_cache.clear()
+            self._command_history.clear()
+            self._response_history.clear()
+
 
 # =============================================================================
 # SINGLETON AND CONVENIENCE FUNCTIONS
@@ -1139,6 +1156,16 @@ async def get_jarvis_bridge(config: Optional[BridgeConfig] = None) -> JARVISPrim
             await _bridge_instance.initialize()
 
         return _bridge_instance
+
+
+async def shutdown_jarvis_bridge() -> None:
+    """Shutdown and clear the global bridge instance."""
+    global _bridge_instance
+
+    async with _bridge_lock:
+        if _bridge_instance is not None:
+            await _bridge_instance.shutdown()
+            _bridge_instance = None
 
 
 async def process_jarvis_command(
