@@ -493,6 +493,18 @@ try:
 except ImportError:
     NEURAL_ORCHESTRATOR_AVAILABLE = False
 
+# Neural Switchboard Facade v98.1 - Stable public API over split implementation
+try:
+    from jarvis_prime.core.neural_switchboard import (
+        NeuralSwitchboard,
+        NeuralSwitchboardDecision,
+        get_neural_switchboard,
+        shutdown_neural_switchboard,
+    )
+    NEURAL_SWITCHBOARD_AVAILABLE = True
+except ImportError:
+    NEURAL_SWITCHBOARD_AVAILABLE = False
+
 __all__ = [
     # Registry
     "ModelRegistry",
@@ -856,4 +868,10 @@ __all__ = [
     "set_request_context",
     "get_request_context",
     "NEURAL_ORCHESTRATOR_AVAILABLE",
+    # Neural Switchboard Facade v98.1
+    "NeuralSwitchboard",
+    "NeuralSwitchboardDecision",
+    "get_neural_switchboard",
+    "shutdown_neural_switchboard",
+    "NEURAL_SWITCHBOARD_AVAILABLE",
 ]

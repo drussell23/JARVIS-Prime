@@ -820,9 +820,14 @@ await registry.download_model(
 )
 ```
 
-### 🧠 **3. Neural Switchboard v98.0**
+### 🧠 **3. Neural Switchboard v98.1**
 
 Unified routing system with task classification, memory monitoring, and sticky routing:
+
+`jarvis_prime.core.neural_switchboard` is the stable public facade. Internally it
+delegates to `dynamic_model_registry.py` (switchboard routing) and
+`neural_orchestrator_core.py` (tier fallback/orchestration), so callers no longer
+depend on private implementation layout.
 
 #### **Features**
 - **Task Classification**: Multi-signal classification (reasoning, chat, code, creative)
@@ -835,6 +840,7 @@ Unified routing system with task classification, memory monitoring, and sticky r
 from jarvis_prime.core.neural_switchboard import NeuralSwitchboard
 
 switchboard = NeuralSwitchboard()
+await switchboard.initialize()
 
 # Classify task
 classification = await switchboard.classify_task(
@@ -843,10 +849,12 @@ classification = await switchboard.classify_task(
 )
 
 # Route request
-routing = await switchboard.route(
+decision = await switchboard.route(
     prompt="Continue the previous code",
-    context={"session_id": "abc123"}
+    context={"session_id": "abc123"},
+    strategy="auto",  # switchboard | orchestrator | auto
 )
+print(decision.to_dict())
 ```
 
 ### 🛡️ **4. Advanced Resilience Patterns**
@@ -2171,7 +2179,7 @@ docker logs -f <container-id>
 ### Version-Specific Documentation
 - **[Neural Orchestrator Core v100.0](jarvis_prime/core/neural_orchestrator_core.py)** - Unified routing architecture
 - **[Dynamic Model Registry v99.0](jarvis_prime/core/dynamic_model_registry.py)** - Auto-discovery and management
-- **[Neural Switchboard v98.0](jarvis_prime/core/neural_switchboard.py)** - Task classification and routing
+- **[Neural Switchboard v98.1](jarvis_prime/core/neural_switchboard.py)** - Stable facade over routing + orchestration
 
 ---
 

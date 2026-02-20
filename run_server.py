@@ -1035,6 +1035,11 @@ async def main():
         """
         if _startup_state:
             status = _startup_state.get_status()
+            status["websocket_paths"] = ["/ws/events"]
+            status["integration_contracts"] = {
+                "ws_events": "/api/v1/integration/contracts/ws-events",
+            }
+            status["websocket_contract_version"] = "1.0"
 
             # Add runtime component status once initialized
             if _startup_state.phase == "ready":
@@ -2067,6 +2072,46 @@ async def main():
                     _ws_subscribers.remove(ws)
                 except ValueError:
                     pass
+
+    def _build_ws_contract() -> Dict[str, Any]:
+        """Build a machine-readable websocket contract for cross-repo discovery."""
+        startup_phase = _startup_state.phase if _startup_state else "starting"
+        status = "healthy" if startup_phase == "ready" else ("error" if startup_phase == "error" else "starting")
+        return {
+            "contract_type": "jarvis_prime.ws_events",
+            "contract_version": "1.0",
+            "service": "jarvis_prime",
+            "status": status,
+            "phase": startup_phase,
+            "websocket": {
+                "primary_path": "/ws/events",
+                "paths": ["/ws/events"],
+                "heartbeat_seconds": 30.0,
+                "supports_ping_pong": True,
+                "message_format": "json",
+                "envelope_version": "v1",
+                "event_types": [
+                    "connected",
+                    "heartbeat",
+                    "inference_complete",
+                    "model_loaded",
+                    "error",
+                ],
+            },
+            "health": {
+                "paths": ["/health"],
+            },
+            "integration_contracts": {
+                "ws_events": "/api/v1/integration/contracts/ws-events",
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    @app.get("/api/v1/integration/contracts/ws-events")
+    @app.get("/api/contracts/ws-events")
+    async def ws_events_contract():
+        """Advertise websocket event contract for Reactor/Core integrations."""
+        return _build_ws_contract()
 
     @app.websocket("/ws/events")
     async def websocket_events(websocket: WebSocket):
