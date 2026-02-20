@@ -788,6 +788,7 @@ _bridge = None
 _reactor_bridge = None
 _training_pipeline = None
 _jarvis_bridge = None
+_jarvis_prime_bridge = None  # v238.0: Unified inference bridge (local-first + Claude fallback)
 _neural_orchestrator = None
 _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
@@ -1059,6 +1060,7 @@ async def main():
                 status["reactor_bridge_enabled"] = _reactor_bridge is not None
                 status["training_pipeline_enabled"] = _training_pipeline is not None
                 status["jarvis_bridge_enabled"] = _jarvis_bridge is not None
+                status["jarvis_prime_bridge_enabled"] = _jarvis_prime_bridge is not None
                 status["trinity_enabled"] = _trinity_initialized
                 status["agi_enabled"] = _agi_hub is not None
                 status["neural_routing_enabled"] = _neural_routing_enabled
@@ -1079,6 +1081,11 @@ async def main():
                         status["jarvis_bridge"] = _jarvis_bridge.get_metrics()
                     except Exception:
                         status["jarvis_bridge"] = {"initialized": False, "error": "metrics_unavailable"}
+                if _jarvis_prime_bridge:
+                    try:
+                        status["jarvis_prime_bridge"] = _jarvis_prime_bridge.get_status()
+                    except Exception:
+                        status["jarvis_prime_bridge"] = {"initialized": False, "error": "status_unavailable"}
 
                 # v150.0: Check hollow client mode for inference readiness
                 hollow_client_active = _is_hollow_client_active()
@@ -2663,6 +2670,33 @@ async def main():
             _startup_state.complete_phase("initializing_jarvis_bridge")
 
             # -----------------------------------------------------------------
+            # STEP 6b: Initialize JARVIS-Prime unified inference bridge
+            # v238.0: This bridge provides local-first inference with Claude API
+            # fallback, complexity-based task routing, and training data capture.
+            # Previously only initialized by run_supervisor.py --unified mode.
+            # No dependency on AGI Hub — uses lazy model loading.
+            # -----------------------------------------------------------------
+            step_start = time.time()
+            log_step("initializing_jarvis_prime_bridge", "6b")
+            _startup_state.begin_phase("initializing_jarvis_prime_bridge", 6)
+            if bridge_enabled:
+                try:
+                    from jarvis_prime.core.jarvis_prime_bridge import get_jarvis_prime_bridge
+
+                    _jarvis_prime_bridge = await get_jarvis_prime_bridge()
+                    log_step_complete("JARVIS-Prime unified inference bridge", time.time() - step_start)
+                except ImportError:
+                    logger.info("   ℹ️ JARVIS-Prime inference bridge not available (module missing)")
+                    _jarvis_prime_bridge = None
+                except Exception as e:
+                    logger.warning(f"   ⚠️ JARVIS-Prime inference bridge init failed: {e}")
+                    _jarvis_prime_bridge = None
+            else:
+                logger.info("   ℹ️ JARVIS-Prime inference bridge disabled (--no-bridge)")
+                _jarvis_prime_bridge = None
+            _startup_state.complete_phase("initializing_jarvis_prime_bridge")
+
+            # -----------------------------------------------------------------
             # STEP 7: Initialize Neural Orchestrator
             # -----------------------------------------------------------------
             step_start = time.time()
@@ -3295,6 +3329,15 @@ async def main():
                 logger.info("Neural Orchestrator shutdown complete")
             except Exception as e:
                 logger.warning(f"Neural Orchestrator shutdown error: {e}")
+
+        if _jarvis_prime_bridge:
+            try:
+                from jarvis_prime.core.jarvis_prime_bridge import shutdown_jarvis_prime_bridge
+                await shutdown_jarvis_prime_bridge()
+                _jarvis_prime_bridge = None
+                logger.info("JARVIS-Prime inference bridge shutdown complete")
+            except Exception as e:
+                logger.warning(f"JARVIS-Prime inference bridge shutdown error: {e}")
 
         if _jarvis_bridge:
             try:
