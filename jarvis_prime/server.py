@@ -40,6 +40,8 @@ Hardware Detection:
 
 import argparse
 import asyncio
+import functools
+import importlib.util
 import json
 import logging
 import os
@@ -50,7 +52,7 @@ import uuid
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from enum import Enum, auto
 
 # v96.0: Process fingerprinting for enhanced service registry
@@ -2259,6 +2261,84 @@ async def shutdown(
     if server:
         server.should_exit = True
     logger.info("Shutdown complete")
+
+
+# =============================================================================
+# ENTRYPOINT UNIFICATION
+# =============================================================================
+#
+# Root-cause hardening:
+# - run_server.py is the authoritative full-featured Prime server surface.
+# - jarvis_prime.server must resolve to the same runtime behavior when started
+#   as `python -m jarvis_prime.server` (or when `main()` is called directly).
+#
+# We keep the in-package implementation as a fallback only for environments
+# where repository-level run_server.py is unavailable.
+
+_legacy_main = main
+
+
+@functools.lru_cache(maxsize=1)
+def _load_authoritative_main() -> Optional[Callable[[], Awaitable[Any]]]:
+    """Load authoritative run_server.main from repository root if available."""
+    run_server_path = Path(__file__).resolve().parents[1] / "run_server.py"
+    if not run_server_path.exists():
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "jarvis_prime_authoritative_run_server",
+            run_server_path,
+        )
+        if spec is None or spec.loader is None:
+            return None
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("jarvis_prime_authoritative_run_server", module)
+        spec.loader.exec_module(module)
+
+        candidate = getattr(module, "main", None)
+        if asyncio.iscoroutinefunction(candidate):
+            return candidate
+    except Exception as exc:
+        logger.warning(
+            "[Entrypoint] Failed to load authoritative run_server.main: %s",
+            exc,
+        )
+
+    return None
+
+
+async def main() -> Any:
+    """
+    Unified Prime entrypoint.
+
+    Delegates to the authoritative full-server implementation in run_server.py
+    when present, guaranteeing capability parity across startup paths.
+    """
+    authoritative_main = _load_authoritative_main()
+    if authoritative_main is not None:
+        logger.info("[Entrypoint] Delegating to authoritative run_server.main")
+        return await authoritative_main()
+
+    allow_legacy = os.getenv(
+        "JARVIS_PRIME_ALLOW_LEGACY_SERVER_FALLBACK",
+        "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if allow_legacy:
+        logger.warning(
+            "[Entrypoint] run_server.py not found; using legacy in-package server implementation "
+            "(JARVIS_PRIME_ALLOW_LEGACY_SERVER_FALLBACK=true)",
+        )
+        return await _legacy_main()
+
+    message = (
+        "Authoritative Prime entrypoint unavailable: run_server.py not found. "
+        "Refusing to start degraded jarvis_prime.server path. "
+        "Set JARVIS_PRIME_ALLOW_LEGACY_SERVER_FALLBACK=true to bypass."
+    )
+    logger.error("[Entrypoint] %s", message)
+    raise RuntimeError(message)
 
 
 if __name__ == "__main__":

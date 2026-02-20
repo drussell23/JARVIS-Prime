@@ -1167,14 +1167,15 @@ JARVIS-Prime is the **Mind** in the three-repo Trinity architecture. It is **sta
 
 - During model loading: `model_load_progress_pct` (0–100), `model_loading_in_progress`, `phase` (e.g. `loading_model`), `model_load_elapsed_seconds`.
 - When ready: `model_loaded`, `ready_for_inference`, `phase: "ready"`.
-- `jarvis_prime/server.py` and `run_server.py` both expose this contract (v221.0 ensures `server.py` reports progress for cross-repo coordination).
+- `run_server.py` is the authoritative full server.
+- `jarvis_prime/server.py` (module entry) now delegates to `run_server.py` so both startup paths expose the same contract and capabilities.
 
 ### Model Loading Progress & Handoff (v221.0)
 
 When the JARVIS unified supervisor uses **Early Prime pre-warm**, Prime starts early and a background monitor polls `/health` and updates the dashboard. When the **Trinity phase** takes over, it adopts the running Prime process and clears the early-Prime env var; the Early Prime monitor then stops. **v221.0** ensures:
 
 - **No progress regression:** The supervisor’s `update_model_loading(active=False, handoff=True)` preserves `max_progress_seen`. Progress never drops (e.g. 18% → 0%).
-- **Prime health:** Prime’s `/health` must report `model_load_progress_pct` (and related fields) so the Trinity monitor can continue from the preserved progress. Both `run_server.py` and `jarvis_prime/server.py` support this (v221.0).
+- **Prime health:** Prime’s `/health` must report `model_load_progress_pct` (and related fields) so the Trinity monitor can continue from the preserved progress. Module startup and script startup now resolve to the same full server path.
 
 See JARVIS-AI-Agent `memory/2026-02-04.md` (or equivalent) for the full root-cause analysis and fix summary.
 
@@ -1246,9 +1247,11 @@ pip install -e ".[server,gcs,telemetry,agi,neural-orchestrator]"
 
 | Entry Point | Purpose | When to Use |
 |-------------|---------|-------------|
-| **`run_server.py`** | Full server with startup state, progress reporting, and health endpoint | **Recommended** — used by unified supervisor; reports `model_load_progress_pct`, `startup_progress`, `model_loading_in_progress` |
-| **`jarvis_prime/server.py`** (module) | Alternative FastAPI server with immediate HTTP startup and background model load | When running Prime as a module; v221.0 adds `model_load_progress_pct` to health for cross-repo coordination |
+| **`run_server.py`** | Authoritative full server with startup state, progress reporting, AGI/neural orchestration, and cross-repo bridges | **Recommended** — used by unified supervisor; reports `model_load_progress_pct`, `startup_progress`, `model_loading_in_progress` |
+| **`jarvis_prime/server.py`** (module) | Unified module entrypoint that delegates to `run_server.py` | Use when launching with `python -m jarvis_prime.server`; behavior is now capability-equivalent to `run_server.py` |
 | **Unified Supervisor (JARVIS)** | `python3 unified_supervisor.py` in JARVIS-AI-Agent | **Recommended for full ecosystem** — starts Body + Prime + Reactor-Core with Trinity coordination |
+
+`jarvis_prime/server.py` now **fails fast by default** if `run_server.py` is unavailable (to avoid degraded startup). Emergency override: set `JARVIS_PRIME_ALLOW_LEGACY_SERVER_FALLBACK=true`.
 
 The **health endpoint** (`GET /health`) must expose `model_load_progress_pct` (and optionally `startup_progress`, `loading_progress`, `model_loading_in_progress`) so the JARVIS unified supervisor can track loading progress and avoid regression during Early Prime → Trinity handoff (v221.0).
 
