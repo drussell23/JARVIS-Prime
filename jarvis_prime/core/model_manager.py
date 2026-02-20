@@ -379,6 +379,13 @@ class PrimeModelManager:
         self._tier_1_count = 0
         self._error_count = 0
 
+        # v238.0: Reasoning engine (lazy-initialized on first high-complexity request)
+        self._reasoning_engine = None
+        self._reasoning_engine_init_attempted = False
+        self._reasoning_complexity_threshold = float(
+            os.getenv("JARVIS_REASONING_COMPLEXITY_THRESHOLD", "0.7")
+        )
+
         logger.info("PrimeModelManager initialized")
 
     async def start(
@@ -598,6 +605,56 @@ class PrimeModelManager:
                 force_tier=forced_tier,
             )
 
+            # v238.0: Reasoning engine enhancement for high-complexity requests
+            # When complexity exceeds threshold, invoke structured reasoning (CoT/ToT/
+            # self-reflection) to augment the prompt before model execution. The
+            # reasoning result provides chain-of-thought scaffolding that significantly
+            # improves response quality for multi-step, analytical, or domain-specific
+            # requests. Fire-and-forget initialization; degrades gracefully.
+            if (
+                decision.complexity_score >= self._reasoning_complexity_threshold
+                and os.getenv("JARVIS_REASONING_ENGINE", "true").lower() == "true"
+            ):
+                try:
+                    # Lazy-init reasoning engine on first use
+                    if self._reasoning_engine is None and not self._reasoning_engine_init_attempted:
+                        self._reasoning_engine_init_attempted = True
+                        try:
+                            from jarvis_prime.core.reasoning_engine import ReasoningEngine
+                            self._reasoning_engine = ReasoningEngine(executor=None)
+                            await self._reasoning_engine.initialize()
+                            logger.info("[Reasoning] Engine initialized on first high-complexity request")
+                        except Exception as _re_init_err:
+                            logger.debug(f"[Reasoning] Init skipped: {_re_init_err}")
+
+                    if self._reasoning_engine is not None:
+                        _reasoning_result = await asyncio.wait_for(
+                            self._reasoning_engine.reason(
+                                input_text=prompt,
+                                context=request.metadata,
+                                use_cache=True,
+                                use_rag=True,
+                            ),
+                            timeout=float(os.getenv("JARVIS_REASONING_TIMEOUT", "10.0")),
+                        )
+                        # Augment prompt with reasoning chain if confidence is sufficient
+                        if _reasoning_result.confidence >= 0.4 and _reasoning_result.output_text:
+                            prompt = (
+                                f"<reasoning_context>\n"
+                                f"{_reasoning_result.output_text}\n"
+                                f"</reasoning_context>\n\n"
+                                f"{prompt}"
+                            )
+                            logger.debug(
+                                f"[Reasoning] Augmented prompt with "
+                                f"{_reasoning_result.strategy.value} reasoning "
+                                f"(confidence={_reasoning_result.confidence:.2f})"
+                            )
+                except asyncio.TimeoutError:
+                    logger.debug("[Reasoning] Timed out — proceeding without augmentation")
+                except Exception as _re_err:
+                    logger.debug(f"[Reasoning] Enhancement skipped: {_re_err}")
+
             # Execute based on tier
             if decision.tier in (TierClassification.TIER_0, TierClassification.TIER_0_PREFERRED):
                 # Voice announcement: Tier 0 routing (optional, low priority)
@@ -693,6 +750,40 @@ class PrimeModelManager:
                 complexity_score=decision.complexity_score,
                 latency_ms=latency_ms,
             )
+
+            # v238.0: Post-inference continuous learning hook
+            # Fire-and-forget — records interaction for experience replay / EWC
+            # without blocking the response path. Feedback defaults to neutral (0.0);
+            # explicit user feedback updates it later via the feedback API.
+            if os.getenv("JARVIS_CONTINUOUS_LEARNING", "true").lower() == "true":
+                try:
+                    from jarvis_prime.models.continual_learning_system import (
+                        get_continual_learner,
+                    )
+
+                    async def _learn_from_this_interaction() -> None:
+                        try:
+                            learner = await get_continual_learner()
+                            await learner.learn_from_interaction(
+                                prompt=prompt,
+                                response=completion,
+                                feedback=0.0,  # Neutral default — updated by feedback API
+                                task_type=getattr(decision, "task_type", "general"),
+                                metadata={
+                                    "model_version": self._current_version or "unknown",
+                                    "tier_used": tier_used,
+                                    "complexity_score": decision.complexity_score,
+                                    "latency_ms": latency_ms,
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                },
+                            )
+                        except Exception as _cl_err:
+                            logger.debug(f"Continuous learning hook error: {_cl_err}")
+
+                    asyncio.create_task(_learn_from_this_interaction())
+                except ImportError:
+                    pass  # Continuous learning module not available
 
             return response
 
