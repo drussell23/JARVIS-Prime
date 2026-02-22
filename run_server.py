@@ -840,6 +840,17 @@ class _PhiCircuitBreaker:
                 self.state = "open"
 
 _phi_circuit = _PhiCircuitBreaker()
+
+# v242.1: Classification observability counters
+_classification_metrics = {
+    "total": 0,
+    "successes": 0,
+    "failures": 0,
+    "circuit_trips": 0,
+    "self_served": 0,
+    "latency_sum_ms": 0,
+}
+
 _agi_hub = None
 _trinity_initialized = False
 _trinity_record_inference = None
@@ -1125,6 +1136,8 @@ async def main():
                 status["agi_enabled"] = _agi_hub is not None
                 status["neural_routing_enabled"] = _neural_routing_enabled
                 status["tier2_capabilities"] = _tier2_capability_status
+                # v242.1: Classification observability counters
+                status["classification_metrics"] = dict(_classification_metrics)
                 if _reactor_bridge:
                     try:
                         reactor_stats = _reactor_bridge.get_statistics()
@@ -1471,6 +1484,7 @@ async def main():
         _classification_ms = 0
 
         if _classifier_loaded and _phi_circuit.can_execute():
+            _classification_metrics["total"] += 1
             _t0 = time.monotonic()
             try:
                 _classification = await _executor.classify(
@@ -1479,6 +1493,8 @@ async def main():
                 )
                 _phi_circuit.record_success()
                 _classification_ms = int((time.monotonic() - _t0) * 1000)
+                _classification_metrics["successes"] += 1
+                _classification_metrics["latency_sum_ms"] += _classification_ms
                 _v241_task_type = DOMAIN_TO_TASK_TYPE.get(
                     _classification.get("domain", "general"), "general_chat"
                 )
@@ -1490,6 +1506,7 @@ async def main():
                 )
             except Exception as _cls_err:
                 _phi_circuit.record_failure()
+                _classification_metrics["failures"] += 1
                 logger.warning(
                     f"[v242.1] Phi classification failed (circuit: {_phi_circuit.state}): {_cls_err}"
                 )
@@ -1498,6 +1515,9 @@ async def main():
         else:
             # Fallback: use Body's metadata hint (pre-v242 compatibility)
             _v241_task_type = request.metadata.get("task_type") if request.metadata else None
+            # v242.1: Track circuit breaker trips
+            if _classifier_loaded and not _phi_circuit.can_execute():
+                _classification_metrics["circuit_trips"] += 1
 
         # v242.1: Circuit breaker fallback — skip classification, use default routing
         if _classification is None and _classifier_loaded and _phi_circuit.state == "open":
@@ -1560,6 +1580,7 @@ async def main():
                 )
                 _phi_gen_ms = int((time.monotonic() - _phi_t0) * 1000)
                 _phi_self_served = True
+                _classification_metrics["self_served"] += 1
                 logger.debug(
                     f"[v242.1] Phi self-serve: domain={_classification.get('domain')}, "
                     f"ms={_phi_gen_ms}, len={len(_phi_content)}"
