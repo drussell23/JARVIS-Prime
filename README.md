@@ -2,7 +2,7 @@
 
 **The Mind of the AGI OS — LLM inference, Neural Orchestrator Core, and cross-repo coordination**
 
-🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation | 🎯 v236.0 Adaptive Prompt System | 🛡️ v238.0 Degenerate Response Defense-in-Depth | 🤖 v241.1 Multi-Model Task-Type Routing (11 Models)
+🚀 v100.0 Neural Orchestrator Core | 🧠 Unified Intelligent Routing | ⚡ Zero Hardcoding | 🔥 Async by Default | 🛡️ Safety-Aware | 🔄 Zero-Downtime Hot Swap | 💪 Production-Grade Resilience | 🌐 Cross-Repo Integration | 📊 v221.0 Model Loading Progress Preservation | 🎯 v236.0 Adaptive Prompt System | 🛡️ v238.0 Degenerate Response Defense-in-Depth | 🤖 v241.1 Multi-Model Task-Type Routing (11 Models) | 📡 v243.0 Command Lifecycle Events | 🧹 v244.0 Brain Vacuum Classification Fix
 
 JARVIS Prime is the **cognitive layer** of the JARVIS AGI ecosystem. It runs **11 self-hosted specialist LLMs** (~40.4 GB, Q4_K_M quantized) on a dedicated GCP Invincible Node — **not OpenAI, not Claude, not any third-party API**. All inference happens on your own infrastructure with zero per-token costs and complete data privacy. As of v241.1, J-Prime intelligently routes queries to the optimal model based on task type: math queries go to Qwen2.5-Math-7B (83.6% MATH benchmark), code queries go to Qwen2.5-Coder-7B (70.4% HumanEval), reasoning queries go to DeepSeek-R1 (explicit chain-of-thought), and simple queries go to Phi-3.5-mini (~3s latency). Prime also provides the **Neural Orchestrator Core** (unified routing), AGI models, reasoning engines, and **first-class integration** with JARVIS (Body) and Reactor-Core (Nerves). It is started either **standalone** or by the **unified supervisor** in JARVIS; during startup, model loading progress is preserved across Early Prime → Trinity handoff (v221.0).
 
@@ -1871,7 +1871,61 @@ JARVIS Body is planning a **Unified Agent Runtime** — a persistent sense-think
 
 ---
 
-### v243.0 - Ouroboros: JARVIS Self-Programming (Planned)
+### ✅ v243.0/v243.1 — Command Lifecycle Events + Event Bus Lifecycle (COMPLETED — JARVIS Body-side)
+
+v243.0/v243.1 shipped as **Command Lifecycle Events and Event Infrastructure Lifecycle Management** in the JARVIS Body repo. This affects J-Prime because command lifecycle events now flow through TrinityEventBus, providing visibility into how J-Prime's inference results are used downstream.
+
+**What this means for J-Prime:**
+
+- **Command outcomes are now observable.** When JARVIS Body classifies a user query, routes it to J-Prime for inference, and receives a response, the full lifecycle is published as events (`command.received` → `command.classified` → `command.completed`/`command.failed`). NeuralMesh's Knowledge Graph consumes these events to build semantic memory of command patterns.
+- **Boot-order races resolved.** TrinityEventBus is now explicitly started in the supervisor's Phase 4 (Intelligence) before any subscriber connects. Previously, NeuralMesh needed a 10s delayed retry because the bus might not exist when subscribers tried to connect.
+- **Health monitoring.** HealthAggregator now tracks TrinityEventBus metrics (events published/delivered/failed, active subscriptions) and ProactiveEventStream state. J-Prime health endpoints can surface this data.
+- **Graceful shutdown.** Event buses are stopped AFTER subscribers (AGI OS, NeuralMesh) but BEFORE broad task cancellation, preventing orphaned handlers.
+
+**Files modified (all in JARVIS Body repo):**
+- `unified_supervisor.py` — Event state tracking, explicit startup, health checks, DMS progress, shutdown
+- `backend/core/trinity_event_bus.py` — Command lifecycle event types
+- `backend/api/unified_command_processor.py` — Event emission at each command stage
+- `backend/neural_mesh/neural_mesh_coordinator.py` — Knowledge Graph subscription
+
+**Impact on J-Prime roadmap:** Command lifecycle telemetry creates richer training signals for the v242.0 DPO pipeline — the system now knows not just what J-Prime returned, but whether the command succeeded or failed downstream.
+
+---
+
+### ✅ v244.0 — Startup Warning Root Fix + Brain Vacuum Classification (COMPLETED — JARVIS Body-side)
+
+v244.0 shipped three fix categories in the JARVIS Body repo. The third — **brain vacuum classification** — directly affects J-Prime's fallback behavior:
+
+**Brain Vacuum Classification Fix:**
+
+When J-Prime is unreachable (network issue, GCP VM down, model loading), JARVIS Body falls back to Claude API or Gemini via `_brain_vacuum_fallback()` in `jarvis_prime_client.py`. **Before v244.0**, this fallback hardcoded `intent="answer"` for all responses — meaning action commands like "lock my screen" or "open Safari" became text explanations instead of executing the action.
+
+**After v244.0**, the fallback includes a classification prompt prefix:
+
+```
+User: "lock my screen"
+  → J-Prime unreachable → brain vacuum fallback
+    → Claude API invoked with classification prompt prefix
+      → Response: CLASSIFICATION: {"intent": "action", "domain": "system",
+                   "requires_action": true, "suggested_actions": ["lock_screen"]}
+      → StructuredResponse.intent = "action"  (NOT "answer")
+      → Command pipeline executes lock_screen
+```
+
+**Valid classifications:**
+- **Intents:** `answer`, `conversation`, `action`, `vision_needed`, `multi_step_action`, `clarify`
+- **Domains:** `general`, `system`, `security`, `workspace`, `development`, `media`, `smart_home`
+- **Fallback:** If classification parsing fails, defaults to `intent="answer"` (safe default)
+
+**Other v244.0 changes (not J-Prime specific):**
+- 858 lines of dead code removed (orphaned tiered routing system imports/endpoints/tests)
+- Cloud SQL proxy startup reduced from ~47s to ~3-5s (redundant settling delay eliminated)
+
+**File modified:** `backend/core/jarvis_prime_client.py` — `_brain_vacuum_fallback()`, `_parse_classification()`, `_strip_classification_line()`
+
+---
+
+### Ouroboros: JARVIS Self-Programming (Planned — Future Version)
 
 JARVIS becomes capable of reading, understanding, and improving its own codebase autonomously using a two-model pipeline:
 
@@ -1935,12 +1989,14 @@ Add three 14B-class models for significantly stronger reasoning, math, and code:
 - [ ] Update golden image builder and `manifest.json` for 14 total models
 - [ ] Disk impact: +24.3 GB → total ~64.7 GB on 80 GB SSD (~15.3 GB headroom)
 
-### v244.0 - LLaVA Vision Integration (Planned)
+### LLaVA Vision Integration (Planned — Future Version)
 
 - [ ] Build CLIP vision encoder pipeline in J-Prime (multimodal inference path)
 - [ ] Mark LLaVA-v1.6-Mistral-7B as `routable: true` in manifest
 - [ ] Route vision commands to self-hosted LLaVA instead of Claude Vision API
 - [ ] Eliminate last external API dependency for core features
+
+> **Note:** v244.0 shipped as the Startup Warning Root Fix + Brain Vacuum Classification Fix in the JARVIS Body repo. See [§ v244.0](#-v2440--startup-warning-root-fix--brain-vacuum-classification-completed--jarvis-body-side) above.
 
 ### v245.0 - Agent Runtime Inference Support (Planned)
 
