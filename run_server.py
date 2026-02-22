@@ -795,6 +795,53 @@ _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
 _classifier_loaded = False  # v242.0: Phi classifier state
 _classifier_system_prompt = ""  # v242.0: Cached system prompt
 _telemetry_hook = None  # v242.0: Training data capture
+
+# v242.1: Phi classifier circuit breaker (thread-safe)
+import threading as _threading
+
+class _PhiCircuitBreaker:
+    """Thread-safe circuit breaker for Phi classification.
+
+    When Phi fails repeatedly, the circuit opens and classification
+    is skipped -- requests fall through to the currently loaded specialist
+    model with domain=general.
+    """
+    __slots__ = ("failure_count", "last_failure", "threshold", "timeout", "state", "_lock")
+
+    def __init__(self):
+        self.failure_count = 0
+        self.last_failure = 0.0
+        self.threshold = int(os.getenv("JPRIME_PHI_CIRCUIT_THRESHOLD", "3"))
+        self.timeout = float(os.getenv("JPRIME_PHI_CIRCUIT_TIMEOUT", "30.0"))
+        self.state = "closed"  # closed | open | half_open
+        self._lock = _threading.Lock()
+
+    def can_execute(self) -> bool:
+        with self._lock:
+            if self.state == "closed":
+                return True
+            if self.state == "open":
+                import time
+                if time.time() - self.last_failure > self.timeout:
+                    self.state = "half_open"
+                    return True
+                return False
+            return True  # half_open: allow one probe attempt
+
+    def record_success(self):
+        with self._lock:
+            self.failure_count = 0
+            self.state = "closed"
+
+    def record_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            import time
+            self.last_failure = time.time()
+            if self.failure_count >= self.threshold:
+                self.state = "open"
+
+_phi_circuit = _PhiCircuitBreaker()
 _agi_hub = None
 _trinity_initialized = False
 _trinity_record_inference = None
@@ -1412,13 +1459,14 @@ async def main():
         _classification = None
         _classification_ms = 0
 
-        if _classifier_loaded:
+        if _classifier_loaded and _phi_circuit.can_execute():
             _t0 = time.monotonic()
             try:
                 _classification = await _executor.classify(
                     query=request.messages[-1].content if request.messages else "",
                     system_prompt=_classifier_system_prompt,
                 )
+                _phi_circuit.record_success()
                 _classification_ms = int((time.monotonic() - _t0) * 1000)
                 _v241_task_type = DOMAIN_TO_TASK_TYPE.get(
                     _classification.get("domain", "general"), "general_chat"
@@ -1429,12 +1477,30 @@ async def main():
                     f"confidence={_classification.get('confidence', 0):.2f}, "
                     f"ms={_classification_ms}"
                 )
-            except Exception as _v242_cls_err:
-                logger.warning(f"[v242] Phi classification failed: {_v242_cls_err}. Falling back.")
+            except Exception as _cls_err:
+                _phi_circuit.record_failure()
+                logger.warning(
+                    f"[v242.1] Phi classification failed (circuit: {_phi_circuit.state}): {_cls_err}"
+                )
+                _classification = None
                 _v241_task_type = request.metadata.get("task_type") if request.metadata else None
         else:
             # Fallback: use Body's metadata hint (pre-v242 compatibility)
             _v241_task_type = request.metadata.get("task_type") if request.metadata else None
+
+        # v242.1: Circuit breaker fallback — skip classification, use default routing
+        if _classification is None and _classifier_loaded and _phi_circuit.state == "open":
+            logger.info("[v242.1] Phi circuit OPEN — using default routing (domain=general)")
+            _classification = {
+                "schema_version": 1,
+                "intent": "answer",
+                "domain": "general",
+                "complexity": "simple",
+                "confidence": 0.0,
+                "requires_vision": False,
+                "requires_action": False,
+                "escalate_to_claude": False,
+            }
 
         # v242.0: Escalation signal — return early if Phi says Claude should handle this
         if (_classification
