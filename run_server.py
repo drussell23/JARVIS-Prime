@@ -821,7 +821,6 @@ class _PhiCircuitBreaker:
             if self.state == "closed":
                 return True
             if self.state == "open":
-                import time
                 if time.time() - self.last_failure > self.timeout:
                     self.state = "half_open"
                     return True
@@ -836,7 +835,6 @@ class _PhiCircuitBreaker:
     def record_failure(self):
         with self._lock:
             self.failure_count += 1
-            import time
             self.last_failure = time.time()
             if self.failure_count >= self.threshold:
                 self.state = "open"
@@ -1491,6 +1489,7 @@ async def main():
         # v242.1: Circuit breaker fallback — skip classification, use default routing
         if _classification is None and _classifier_loaded and _phi_circuit.state == "open":
             logger.info("[v242.1] Phi circuit OPEN — using default routing (domain=general)")
+            _v241_task_type = "general_chat"  # Align task type with fallback domain
             _classification = {
                 "schema_version": 1,
                 "intent": "answer",

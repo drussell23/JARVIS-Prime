@@ -1124,7 +1124,7 @@ class LlamaCppExecutor:
                     f"(~{model_path.stat().st_size / (1024**3):.1f} GB)"
                 )
 
-        await loop.run_in_executor(self._executor, _load_sync)
+        await loop.run_in_executor(self._classifier_executor, _load_sync)
 
     async def classify(self, query: str, system_prompt: str) -> dict:
         """
@@ -1453,8 +1453,7 @@ class LlamaCppExecutor:
                 gc.collect()
                 logger.info("Phi classifier unloaded (full shutdown)")
         self._executor.shutdown(wait=True)
-        if hasattr(self, '_classifier_executor'):
-            self._classifier_executor.shutdown(wait=False)
+        self._classifier_executor.shutdown(wait=True)
 
 
 class LlamaCppModelLoader:
