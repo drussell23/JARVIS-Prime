@@ -794,10 +794,13 @@ _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
 _classifier_loaded = False  # v242.0: Phi classifier state
 _classifier_system_prompt = ""  # v242.0: Cached system prompt
+_prompt_lock = None  # v242.1: Set after threading import below; guards _classifier_system_prompt
 _telemetry_hook = None  # v242.0: Training data capture
 
 # v242.1: Phi classifier circuit breaker (thread-safe)
 import threading as _threading
+
+_prompt_lock = _threading.Lock()  # v242.1: Guards _classifier_system_prompt updates
 
 class _PhiCircuitBreaker:
     """Thread-safe circuit breaker for Phi classification.
@@ -2489,6 +2492,58 @@ async def main():
         )
         return {"status": "ok"}
 
+    # =========================================================================
+    # v242.1: Capability Registry — Body registers available actions for Phi
+    # =========================================================================
+    @app.post("/v1/capabilities/register")
+    async def register_capabilities(request: Request):
+        """
+        v242.1: Register Body capabilities so Phi knows what actions are available.
+
+        The Body sends a dict of {action_name: description} pairs.  This rebuilds
+        the Phi classifier system prompt with the action list so classification
+        output can reference concrete actions the Body supports.
+
+        Thread-safe: _prompt_lock guards the write since classify() reads
+        _classifier_system_prompt from a ThreadPoolExecutor.  (CPython string
+        assignment is GIL-atomic, so stale reads are harmless — the lock
+        serializes the rebuild itself.)
+        """
+        global _classifier_system_prompt
+        from fastapi.responses import JSONResponse as _JSONResp
+
+        if not _classifier_loaded:
+            return _JSONResp(
+                status_code=503,
+                content={"error": "Phi classifier not loaded yet"},
+            )
+
+        try:
+            capabilities = await request.json()
+        except Exception:
+            return _JSONResp(
+                status_code=400,
+                content={"error": "invalid JSON body"},
+            )
+
+        if not isinstance(capabilities, dict):
+            return _JSONResp(
+                status_code=400,
+                content={"error": "body must be a JSON object mapping action names to descriptions"},
+            )
+
+        from jarvis_prime.core.classification_schema import build_classifier_system_prompt
+
+        with _prompt_lock:
+            _classifier_system_prompt = build_classifier_system_prompt(
+                action_registry=capabilities,
+            )
+
+        logger.info(
+            f"[v242.1] Registered {len(capabilities)} capabilities from Body"
+        )
+        return {"status": "ok", "actions_registered": len(capabilities)}
+
     @app.websocket("/ws/events")
     async def websocket_events(websocket: WebSocket):
         """
@@ -3392,7 +3447,8 @@ async def main():
             if _v242_phi_path.exists():
                 try:
                     await _executor.load_classifier(_v242_phi_path, CLASSIFICATION_SCHEMA)
-                    _classifier_system_prompt = build_classifier_system_prompt()
+                    with _prompt_lock:
+                        _classifier_system_prompt = build_classifier_system_prompt()
                     _classifier_loaded = True
                     logger.info("[v242] Phi-3.5-mini classifier loaded (permanently resident)")
                 except Exception as _v242_cls_err:
