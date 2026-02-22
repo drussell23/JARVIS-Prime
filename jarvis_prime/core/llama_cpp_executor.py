@@ -810,7 +810,8 @@ class LlamaCppExecutor:
 
         # Thread safety
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llama-cpp")
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llama-gen")
+        self._classifier_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llama-cls")
 
         # Chat template (will be updated on model load)
         self._chat_template = CHAT_TEMPLATES.get(
@@ -1165,7 +1166,7 @@ class LlamaCppExecutor:
                 raw = result["choices"][0]["message"]["content"]
                 return json.loads(raw)
 
-        return await loop.run_in_executor(self._executor, _classify_sync)
+        return await loop.run_in_executor(self._classifier_executor, _classify_sync)
 
     # =========================================================================
     # SPECIALIST MODEL — hot-swappable
@@ -1405,6 +1406,8 @@ class LlamaCppExecutor:
                 gc.collect()
                 logger.info("Phi classifier unloaded (full shutdown)")
         self._executor.shutdown(wait=True)
+        if hasattr(self, '_classifier_executor'):
+            self._classifier_executor.shutdown(wait=False)
 
 
 class LlamaCppModelLoader:
