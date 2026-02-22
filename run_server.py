@@ -957,6 +957,19 @@ def _find_available_port(host: str, preferred_port: int, max_attempts: int = 10)
     return None
 
 
+# =============================================================================
+# v243.0: Reflex Inhibition Publisher — atomic writes + API key auth
+# =============================================================================
+_INHIBIT_API_KEY = os.getenv("JPRIME_INHIBIT_API_KEY", "")
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically via temp-file-rename (POSIX atomic)."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.rename(path)  # Atomic on POSIX
+
+
 async def main():
     """
     v93.2: Main entry point with IMMEDIATE HTTP server startup.
@@ -1023,7 +1036,7 @@ async def main():
     # v197.1: RESILIENT DEPENDENCY LOADING - Auto-install or graceful degradation
     # =========================================================================
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import StreamingResponse, JSONResponse
         from pydantic import BaseModel
@@ -1031,7 +1044,7 @@ async def main():
     except ImportError as e:
         logger.error(f"Missing dependencies: {e}")
         logger.error("Install with: pip install fastapi uvicorn pydantic")
-        
+
         # v197.1: Attempt auto-installation before giving up
         logger.info("[v197.1] Attempting auto-installation of missing dependencies...")
         try:
@@ -1045,7 +1058,7 @@ async def main():
             if result.returncode == 0:
                 logger.info("[v197.1] ✅ Auto-installation successful! Retrying import...")
                 # Retry the imports
-                from fastapi import FastAPI, HTTPException
+                from fastapi import FastAPI, HTTPException, Request
                 from fastapi.middleware.cors import CORSMiddleware
                 from fastapi.responses import StreamingResponse, JSONResponse
                 from pydantic import BaseModel
@@ -2409,6 +2422,51 @@ async def main():
         """Advertise websocket event contract for Reactor/Core integrations."""
         return _build_ws_contract()
 
+    # =========================================================================
+    # v243.0: Reflex Inhibition Endpoint — atomic file write + API key auth
+    # =========================================================================
+    @app.post("/v1/reflex/inhibit")
+    async def inhibit_reflex(request: Request):
+        """
+        v243.0: Allow Mind (J-Prime) to publish reflex inhibition state.
+
+        The Body reads ~/.jarvis/trinity/reflex_inhibition.json to check
+        whether certain reflexes should be suppressed.  This endpoint lets
+        any authenticated caller write that file atomically.
+
+        Auth: Bearer token checked against JPRIME_INHIBIT_API_KEY env var.
+              If the env var is empty/unset, the endpoint is open (dev mode).
+        """
+        from datetime import datetime, timezone
+        from fastapi.responses import JSONResponse as _JSONResp
+
+        # --- Auth gate ---
+        if _INHIBIT_API_KEY:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {_INHIBIT_API_KEY}":
+                return _JSONResp(status_code=403, content={"error": "unauthorized"})
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _JSONResp(status_code=400, content={"error": "invalid JSON body"})
+
+        inhibit_path = Path.home() / ".jarvis" / "trinity" / "reflex_inhibition.json"
+        inhibit_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _atomic_write_json(inhibit_path, {
+            "version": 1,
+            "inhibit_reflexes": body.get("reflex_ids", []),
+            "reason": body.get("reason", ""),
+            "published_at": datetime.now(timezone.utc).isoformat(),
+            "ttl_seconds": body.get("ttl_seconds", 300),
+        })
+        logger.info(
+            f"[v243] Reflex inhibition updated: {body.get('reflex_ids', [])} "
+            f"reason={body.get('reason', '')!r} ttl={body.get('ttl_seconds', 300)}s"
+        )
+        return {"status": "ok"}
+
     @app.websocket("/ws/events")
     async def websocket_events(websocket: WebSocket):
         """
@@ -3342,6 +3400,7 @@ async def main():
 
             # -----------------------------------------------------------------
             # STEP 10d: v242.0 — Publish reflex manifest to shared state
+            #           v243.0 — Atomic writes + inhibition file bootstrap
             # -----------------------------------------------------------------
             try:
                 from datetime import datetime, timezone
@@ -3355,10 +3414,22 @@ async def main():
                 if seed_manifest.exists():
                     manifest_data = json.loads(seed_manifest.read_text())
                     manifest_data["published_at"] = datetime.now(timezone.utc).isoformat()
-                    target_manifest.write_text(json.dumps(manifest_data, indent=2))
+                    _atomic_write_json(target_manifest, manifest_data)
                     logger.info(f"[v242] Reflex manifest published to {target_manifest}")
                 else:
                     logger.warning(f"[v242] Seed reflex manifest not found at {seed_manifest}")
+
+                # v243.0: Bootstrap empty inhibition file if absent
+                inhibition_path = trinity_dir / "reflex_inhibition.json"
+                if not inhibition_path.exists():
+                    _atomic_write_json(inhibition_path, {
+                        "version": 1,
+                        "inhibit_reflexes": [],
+                        "reason": "",
+                        "published_at": datetime.now(timezone.utc).isoformat(),
+                        "ttl_seconds": 0,
+                    })
+                    logger.info(f"[v243] Reflex inhibition file bootstrapped at {inhibition_path}")
             except Exception as e:
                 logger.warning(f"[v242] Reflex manifest publish failed (non-critical): {e}")
 
