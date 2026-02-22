@@ -1528,11 +1528,68 @@ async def main():
                 },
             })
 
-        # v242.0: Phi self-serve for trivial domains (no specialist swap needed)
-        # TODO(v242.1): Implement generate_from_classifier() in LlamaCppExecutor
-        # to allow free-text generation from the classifier model without grammar.
-        # For now, always fall through to specialist routing.
+        # v242.1: Phi self-serve for conversation domain (no specialist swap needed).
+        # If the query is a greeting / small talk and Phi is confident, generate
+        # a response directly from the classifier model — saving 500ms-2s of
+        # specialist model swap latency.  Falls through to normal routing on
+        # any failure (graceful degradation).
         _phi_self_served = False
+
+        if (_classification
+                and _classification.get("domain") in PHI_SELF_SERVE_DOMAINS
+                and _classification.get("confidence", 0) >= MIN_CONFIDENCE_THRESHOLD
+                and not _classification.get("escalate_to_claude")
+                and not _classification.get("requires_action")):
+            try:
+                _phi_t0 = time.monotonic()
+                _phi_content = await _executor.generate_from_classifier(
+                    prompt=request.messages[-1].content if request.messages else "",
+                    max_tokens=min(request.max_tokens or 256, 256),
+                )
+                _phi_gen_ms = int((time.monotonic() - _phi_t0) * 1000)
+                _phi_self_served = True
+                logger.debug(
+                    f"[v242.1] Phi self-serve: domain={_classification.get('domain')}, "
+                    f"ms={_phi_gen_ms}, len={len(_phi_content)}"
+                )
+            except Exception as _phi_err:
+                logger.warning(f"[v242.1] Phi self-serve failed, falling through: {_phi_err}")
+                _phi_self_served = False
+
+        if _phi_self_served:
+            _phi_completion_tokens = len(_phi_content.split())
+            _record_inference_metrics(prompt_tokens, _phi_completion_tokens, _phi_gen_ms, True)
+            _response_dict = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "jarvis-prime",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": _phi_content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": _phi_completion_tokens,
+                    "total_tokens": prompt_tokens + _phi_completion_tokens,
+                },
+                "x_jarvis_routing": {
+                    "schema_version": _classification.get("schema_version", 1),
+                    "intent": _classification.get("intent", "conversation"),
+                    "domain": _classification.get("domain", "conversation"),
+                    "complexity": _classification.get("complexity", "trivial"),
+                    "confidence": _classification.get("confidence", 0.0),
+                    "requires_vision": False,
+                    "requires_action": False,
+                    "escalate_to_claude": False,
+                    "source": "phi_self_serve",
+                    "classifier_model": "phi-3.5-mini-q4km",
+                    "classification_ms": _classification_ms,
+                    "generation_ms": _phi_gen_ms,
+                },
+            }
+            return _response_dict
 
         # v241.0: Pre-hook — ensure correct model loaded for task type.
         # This swaps the model in _executor in-place. All existing code below

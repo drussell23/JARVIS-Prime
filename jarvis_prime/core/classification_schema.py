@@ -66,7 +66,9 @@ DOMAIN_TO_TASK_TYPE: Dict[str, str] = {
 }
 
 # Domains where Phi can both classify AND respond (no specialist needed)
-PHI_SELF_SERVE_DOMAINS = frozenset({"conversation", "system"})
+# v242.1: Narrowed to conversation only — system commands need the action
+# executor, not a text response from the classifier model.
+PHI_SELF_SERVE_DOMAINS = frozenset({"conversation"})
 
 # Minimum confidence to trust classification (below this -> escalate)
 MIN_CONFIDENCE_THRESHOLD = float(

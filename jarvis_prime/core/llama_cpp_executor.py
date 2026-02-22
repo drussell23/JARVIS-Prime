@@ -1168,6 +1168,53 @@ class LlamaCppExecutor:
 
         return await loop.run_in_executor(self._classifier_executor, _classify_sync)
 
+    async def generate_from_classifier(
+        self,
+        prompt: str,
+        system_prompt: str = "You are JARVIS, a helpful AI assistant. Be concise and friendly.",
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+    ) -> str:
+        """Generate a response using the Phi classifier model (no specialist swap needed).
+
+        v242.1: Used for conversation-domain self-serve — Phi handles greetings
+        and small talk directly without requiring specialist model swap.
+
+        Uses ``_classifier_executor`` (the dedicated classifier thread pool) and
+        ``_classifier_lock`` to serialize against concurrent classify() calls.
+        The specialist ``_model`` / ``_executor`` are NOT touched.
+
+        Args:
+            prompt:        User message to respond to.
+            system_prompt: System-level instruction for the generation.
+            max_tokens:    Maximum tokens to generate (capped at 256 for Phi).
+            temperature:   Sampling temperature.
+
+        Returns:
+            Generated text response.
+
+        Raises:
+            RuntimeError: If the Phi classifier has not been loaded yet.
+        """
+        if self._classifier is None:
+            raise RuntimeError("Phi classifier not loaded")
+
+        loop = asyncio.get_event_loop()
+
+        def _gen_sync() -> str:
+            with self._classifier_lock:
+                result = self._classifier.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                return result["choices"][0]["message"]["content"]
+
+        return await loop.run_in_executor(self._classifier_executor, _gen_sync)
+
     # =========================================================================
     # SPECIALIST MODEL — hot-swappable
     # =========================================================================
