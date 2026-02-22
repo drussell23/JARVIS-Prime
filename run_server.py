@@ -792,6 +792,8 @@ _jarvis_prime_bridge = None  # v238.0: Unified inference bridge (local-first + C
 _neural_orchestrator = None
 _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
+_classifier_loaded = False  # v242.0: Phi classifier state
+_classifier_system_prompt = ""  # v242.0: Cached system prompt
 _telemetry_hook = None  # v242.0: Training data capture
 _agi_hub = None
 _trinity_initialized = False
@@ -978,7 +980,7 @@ async def main():
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import StreamingResponse
+        from fastapi.responses import StreamingResponse, JSONResponse
         from pydantic import BaseModel
         import uvicorn
     except ImportError as e:
@@ -1000,7 +1002,7 @@ async def main():
                 # Retry the imports
                 from fastapi import FastAPI, HTTPException
                 from fastapi.middleware.cors import CORSMiddleware
-                from fastapi.responses import StreamingResponse
+                from fastapi.responses import StreamingResponse, JSONResponse
                 from pydantic import BaseModel
                 import uvicorn
                 logger.info("[v197.1] ✅ Dependencies loaded successfully after auto-install")
@@ -1404,13 +1406,67 @@ async def main():
         if _is_hollow_client_active():
             return await _route_to_gcp_chat_completions(request)
 
-        # v241.0: Extract task_type from metadata for model swap routing
+        # v242.0: Phi-first classification (replaces Body's keyword hints)
         _v241_task_type = None
         _v241_active_model_id = None
-        if request.metadata:
-            _v241_task_type = request.metadata.get("task_type")
-            if _v241_task_type:
-                logger.debug(f"[v241] Task type hint from JARVIS Body: {_v241_task_type}")
+        _classification = None
+        _classification_ms = 0
+
+        if _classifier_loaded:
+            _t0 = time.monotonic()
+            try:
+                _classification = await _executor.classify(
+                    query=request.messages[-1].content if request.messages else "",
+                    system_prompt=_classifier_system_prompt,
+                )
+                _classification_ms = int((time.monotonic() - _t0) * 1000)
+                _v241_task_type = DOMAIN_TO_TASK_TYPE.get(
+                    _classification.get("domain", "general"), "general_chat"
+                )
+                logger.debug(
+                    f"[v242] Phi classified: intent={_classification.get('intent')}, "
+                    f"domain={_classification.get('domain')}, "
+                    f"confidence={_classification.get('confidence', 0):.2f}, "
+                    f"ms={_classification_ms}"
+                )
+            except Exception as _v242_cls_err:
+                logger.warning(f"[v242] Phi classification failed: {_v242_cls_err}. Falling back.")
+                _v241_task_type = request.metadata.get("task_type") if request.metadata else None
+        else:
+            # Fallback: use Body's metadata hint (pre-v242 compatibility)
+            _v241_task_type = request.metadata.get("task_type") if request.metadata else None
+
+        # v242.0: Escalation signal — return early if Phi says Claude should handle this
+        if (_classification
+                and _classification.get("escalate_to_claude")
+                and _classification.get("confidence", 0) > MIN_CONFIDENCE_THRESHOLD):
+            return JSONResponse({
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "jarvis-prime",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "escalated",
+                }],
+                "x_jarvis_routing": {
+                    "schema_version": 1,
+                    "intent": _classification.get("intent", "answer"),
+                    "domain": _classification.get("domain", "general"),
+                    "escalate_to_claude": True,
+                    "escalation_reason": _classification.get("escalation_reason", "complexity"),
+                    "confidence": _classification.get("confidence", 0.0),
+                    "classifier_model": "phi-3.5-mini-q4km",
+                    "classification_ms": _classification_ms,
+                },
+            })
+
+        # v242.0: Phi self-serve for trivial domains (no specialist swap needed)
+        # TODO(v242.1): Implement generate_from_classifier() in LlamaCppExecutor
+        # to allow free-text generation from the classifier model without grammar.
+        # For now, always fall through to specialist routing.
+        _phi_self_served = False
 
         # v241.0: Pre-hook — ensure correct model loaded for task type.
         # This swaps the model in _executor in-place. All existing code below
@@ -1506,6 +1562,26 @@ async def main():
                             "finish_reason": "stop",
                         }],
                     }
+
+                    # v242.0: Attach x_jarvis_routing to final SSE chunk
+                    _stream_generation_ms = int((time.time() - start) * 1000)
+                    if _classification:
+                        final_chunk["x_jarvis_routing"] = {
+                            "schema_version": _classification.get("schema_version", 1),
+                            "intent": _classification.get("intent", "answer"),
+                            "domain": _classification.get("domain", "general"),
+                            "complexity": _classification.get("complexity", "simple"),
+                            "confidence": _classification.get("confidence", 0.0),
+                            "requires_vision": _classification.get("requires_vision", False),
+                            "requires_action": _classification.get("requires_action", False),
+                            "escalate_to_claude": _classification.get("escalate_to_claude", False),
+                            "classifier_model": "phi-3.5-mini-q4km",
+                            "generator_model": _v241_active_model_id or "unknown",
+                            "classification_ms": _classification_ms,
+                            "generation_ms": _stream_generation_ms,
+                            "suggested_actions": _classification.get("suggested_actions", []),
+                        }
+
                     yield f"data: {json.dumps(final_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
 
@@ -1652,7 +1728,8 @@ async def main():
                 except Exception as e:
                     logger.debug(f"[v242] Telemetry capture failed: {e}")
 
-            return {
+            _generation_ms = int(latency_ms)
+            _response_dict = {
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": created,
@@ -1671,6 +1748,26 @@ async def main():
                 "x_routing": routing_metadata,
                 "x_model_id": _v241_active_model_id,  # v241.0: per-model telemetry
             }
+
+            # v242.0: Attach x_jarvis_routing metadata to response
+            if _classification:
+                _response_dict["x_jarvis_routing"] = {
+                    "schema_version": _classification.get("schema_version", 1),
+                    "intent": _classification.get("intent", "answer"),
+                    "domain": _classification.get("domain", "general"),
+                    "complexity": _classification.get("complexity", "simple"),
+                    "confidence": _classification.get("confidence", 0.0),
+                    "requires_vision": _classification.get("requires_vision", False),
+                    "requires_action": _classification.get("requires_action", False),
+                    "escalate_to_claude": _classification.get("escalate_to_claude", False),
+                    "classifier_model": "phi-3.5-mini-q4km",
+                    "generator_model": _v241_active_model_id or "unknown",
+                    "classification_ms": _classification_ms,
+                    "generation_ms": _generation_ms,
+                    "suggested_actions": _classification.get("suggested_actions", []),
+                }
+
+            return _response_dict
         except Exception as e:
             logger.error(f"Chat error: {e}")
             _record_inference_metrics(0, 0, 0, False)
@@ -3075,6 +3172,37 @@ async def main():
                     _model_coordinator = None
             else:
                 logger.info("[v241] No model manifest found — single-model mode (backward compat)")
+
+            # -----------------------------------------------------------------
+            # STEP 10b.1: v242.0 — Load Phi-3.5-mini as permanent classifier
+            # -----------------------------------------------------------------
+            global _classifier_loaded, _classifier_system_prompt
+
+            from jarvis_prime.core.classification_schema import (
+                CLASSIFICATION_SCHEMA,
+                build_classifier_system_prompt,
+                DOMAIN_TO_TASK_TYPE,
+                PHI_SELF_SERVE_DOMAINS,
+                MIN_CONFIDENCE_THRESHOLD,
+            )
+
+            _v242_phi_path = _v241_models_dir / "phi-3.5-mini-instruct.Q4_K_M.gguf"
+            if _v242_phi_path.exists():
+                try:
+                    await _executor.load_classifier(_v242_phi_path, CLASSIFICATION_SCHEMA)
+                    _classifier_system_prompt = build_classifier_system_prompt()
+                    _classifier_loaded = True
+                    logger.info("[v242] Phi-3.5-mini classifier loaded (permanently resident)")
+                except Exception as _v242_cls_err:
+                    logger.warning(
+                        f"[v242] Phi classifier failed to load: {_v242_cls_err}. "
+                        "Falling back to metadata hints."
+                    )
+            else:
+                logger.warning(
+                    f"[v242] Phi model not found at {_v242_phi_path}. "
+                    "Using metadata hints."
+                )
 
             # -----------------------------------------------------------------
             # STEP 10c: v242.0 — Initialize telemetry hook for training data capture
