@@ -1199,6 +1199,9 @@ class LlamaCppExecutor:
         if self._classifier is None:
             raise RuntimeError("Phi classifier not loaded")
 
+        # Enforce cap — Phi is small, don't let it ramble
+        max_tokens = min(max_tokens, 256)
+
         loop = asyncio.get_event_loop()
 
         def _gen_sync() -> str:

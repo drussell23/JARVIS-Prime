@@ -1569,8 +1569,9 @@ async def main():
                 _phi_self_served = False
 
         if _phi_self_served:
-            _phi_completion_tokens = len(_phi_content.split())
-            _record_inference_metrics(prompt_tokens, _phi_completion_tokens, _phi_gen_ms, True)
+            _phi_prompt_tokens = sum(len((m.content or "").split()) for m in request.messages)
+            _phi_completion_tokens = len(_phi_content.split()) if _phi_content else 0
+            _record_inference_metrics(_phi_prompt_tokens, _phi_completion_tokens, _phi_gen_ms, True)
             _response_dict = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
@@ -1578,13 +1579,13 @@ async def main():
                 "model": "jarvis-prime",
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": _phi_content},
+                    "message": {"role": "assistant", "content": _phi_content or ""},
                     "finish_reason": "stop",
                 }],
                 "usage": {
-                    "prompt_tokens": prompt_tokens,
+                    "prompt_tokens": _phi_prompt_tokens,
                     "completion_tokens": _phi_completion_tokens,
-                    "total_tokens": prompt_tokens + _phi_completion_tokens,
+                    "total_tokens": _phi_prompt_tokens + _phi_completion_tokens,
                 },
                 "x_jarvis_routing": {
                     "schema_version": _classification.get("schema_version", 1),
