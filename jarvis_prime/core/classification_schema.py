@@ -30,7 +30,7 @@ CLASSIFICATION_SCHEMA: Dict[str, Any] = {
             "enum": [
                 "math", "code", "reasoning", "creative", "general",
                 "system", "vision", "agentic", "translation",
-                "conversation", "surveillance",
+                "conversation", "surveillance", "workspace",
             ],
         },
         "complexity": {
@@ -62,6 +62,7 @@ DOMAIN_TO_TASK_TYPE: Dict[str, str] = {
     "translation": "translate",
     "conversation": "greeting",
     "surveillance": "voice_command",
+    "workspace": "voice_command",
 }
 
 # Domains where Phi can both classify AND respond (no specialist needed)
@@ -92,7 +93,7 @@ Output JSON with these fields:
   - "vision_needed": user is asking about something visual (screen content, image analysis)
   - "clarify": query is ambiguous, ask user to clarify
   - "conversation": greeting, small talk, or casual interaction
-- domain: one of [math, code, reasoning, creative, general, system, vision, agentic, translation, conversation, surveillance]
+- domain: one of [math, code, reasoning, creative, general, system, vision, agentic, translation, conversation, surveillance, workspace]
 - complexity: one of [trivial, simple, moderate, complex, expert]
 - requires_vision: true if the query needs to see the screen or an image
 - requires_action: true if the query needs the Body to execute a system action
@@ -106,4 +107,7 @@ Examples:
 - "what's the derivative of x squared" -> intent=answer, domain=math, complexity=moderate, confidence=0.93
 - "open Safari and go to GitHub" -> intent=multi_step_action, domain=agentic, escalate_to_claude=true, confidence=0.88
 - "hello" -> intent=conversation, domain=conversation, complexity=trivial, confidence=0.99
-- "watch all Chrome windows for changes" -> intent=action, domain=surveillance, requires_action=true, confidence=0.91"""
+- "watch all Chrome windows for changes" -> intent=action, domain=surveillance, requires_action=true, confidence=0.91
+- "check my email" -> intent=action, domain=workspace, complexity=simple, confidence=0.93
+- "what's on my calendar today" -> intent=action, domain=workspace, complexity=simple, confidence=0.91
+- "send an email to John" -> intent=action, domain=workspace, complexity=moderate, confidence=0.90"""
