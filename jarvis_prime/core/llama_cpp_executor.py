@@ -826,6 +826,12 @@ class LlamaCppExecutor:
         # Hardware info (cached)
         self._hardware = HardwareDetector.detect()
 
+        # Phi classifier (permanently resident, never swapped)
+        self._classifier: Optional["Llama"] = None
+        self._classifier_grammar: Optional["LlamaGrammar"] = None
+        self._classifier_model_path: Optional[Path] = None
+        self._classifier_lock = threading.RLock()
+
         logger.info(f"LlamaCppExecutor initialized")
         logger.info(f"  Backend: {self._hardware.backend.name}")
         logger.info(f"  GPU Layers: {self.config.n_gpu_layers}")
@@ -1040,13 +1046,145 @@ class LlamaCppExecutor:
         }
         return type_map.get(type_str.lower(), 1)  # Default to f16
 
+    # =========================================================================
+    # PHI CLASSIFIER — permanently resident, never swapped
+    # =========================================================================
+
+    @property
+    def classifier_loaded(self) -> bool:
+        """Return True if the Phi classifier model is loaded."""
+        return self._classifier is not None
+
+    async def load_classifier(self, model_path: Path, schema: dict) -> None:
+        """
+        Load the Phi-3.5-mini classifier model with a JSON grammar.
+
+        The classifier is permanently resident and is **not** unloaded during
+        specialist model swaps.  Calling this method when the classifier is
+        already loaded is a no-op (idempotent).
+
+        Args:
+            model_path: Path to Phi-3.5-mini GGUF file.
+            schema:     JSON-Schema dict that constrains classifier output.
+
+        Raises:
+            FileNotFoundError: If *model_path* does not exist.
+            ImportError:       If llama-cpp-python is not installed.
+            RuntimeError:      If model loading fails.
+        """
+        if self._classifier is not None:
+            logger.debug("Phi classifier already loaded — skipping")
+            return
+
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Classifier model not found: {model_path}")
+
+        loop = asyncio.get_event_loop()
+
+        def _load_sync() -> None:
+            try:
+                from llama_cpp import Llama, LlamaGrammar
+            except ImportError:
+                raise ImportError(
+                    "llama-cpp-python required for the Phi classifier!\n"
+                    "Install with Metal support:\n"
+                    "  CMAKE_ARGS='-DLLAMA_METAL=on' pip install "
+                    "llama-cpp-python --force-reinstall --no-cache-dir"
+                )
+
+            with self._classifier_lock:
+                # Double-check after acquiring the lock (another coroutine
+                # may have loaded the classifier while we were waiting).
+                if self._classifier is not None:
+                    return
+
+                logger.info("=" * 60)
+                logger.info(f"Loading Phi classifier: {model_path.name}")
+                logger.info("=" * 60)
+
+                grammar = LlamaGrammar.from_json_schema(json.dumps(schema))
+
+                model = Llama(
+                    model_path=str(model_path),
+                    n_ctx=1024,
+                    n_gpu_layers=-1,
+                    n_threads=2,
+                    verbose=False,
+                    chat_format="chatml",
+                )
+
+                self._classifier = model
+                self._classifier_grammar = grammar
+                self._classifier_model_path = model_path
+
+                logger.info(
+                    "Phi classifier loaded successfully "
+                    f"(~{model_path.stat().st_size / (1024**3):.1f} GB)"
+                )
+
+        await loop.run_in_executor(self._executor, _load_sync)
+
+    async def classify(self, query: str, system_prompt: str) -> dict:
+        """
+        Run the Phi classifier on *query* and return structured JSON.
+
+        The output is guaranteed to conform to the JSON schema that was
+        provided to :meth:`load_classifier`.
+
+        Args:
+            query:         The user query to classify.
+            system_prompt: System-level instruction for the classifier.
+
+        Returns:
+            Parsed JSON dict from the classifier.
+
+        Raises:
+            RuntimeError: If the classifier has not been loaded yet.
+        """
+        if self._classifier is None:
+            raise RuntimeError(
+                "Phi classifier is not loaded. "
+                "Call load_classifier() before classify()."
+            )
+
+        loop = asyncio.get_event_loop()
+
+        def _classify_sync() -> dict:
+            with self._classifier_lock:
+                result = self._classifier.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": query},
+                    ],
+                    max_tokens=256,
+                    temperature=0.0,
+                    grammar=self._classifier_grammar,
+                )
+
+                raw = result["choices"][0]["message"]["content"]
+                return json.loads(raw)
+
+        return await loop.run_in_executor(self._executor, _classify_sync)
+
+    # =========================================================================
+    # SPECIALIST MODEL — hot-swappable
+    # =========================================================================
+
     async def unload(self) -> None:
-        """Unload the model from memory."""
+        """Unload the specialist model from memory.
+
+        Note: The Phi classifier is **not** affected — it remains loaded.
+        """
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self._executor, self._unload_sync)
 
     def _unload_sync(self) -> None:
-        """Synchronous model unloading."""
+        """Synchronous specialist-model unloading.
+
+        The permanently-resident Phi classifier is intentionally left
+        untouched so it survives model swaps.
+        """
         with self._lock:
             if self._model:
                 del self._model
@@ -1056,7 +1194,7 @@ class LlamaCppExecutor:
                 import gc
                 gc.collect()
 
-                logger.info("Model unloaded")
+                logger.info("Specialist model unloaded (classifier retained)")
 
     async def validate(self) -> bool:
         """Validate the model by running a simple generation."""
@@ -1255,8 +1393,17 @@ class LlamaCppExecutor:
         return stats
 
     async def close(self) -> None:
-        """Clean up resources."""
+        """Clean up all resources including the classifier."""
         await self.unload()
+        # Also release the permanently-resident classifier on full shutdown
+        with self._classifier_lock:
+            if self._classifier is not None:
+                del self._classifier
+                self._classifier = None
+                self._classifier_grammar = None
+                self._classifier_model_path = None
+                gc.collect()
+                logger.info("Phi classifier unloaded (full shutdown)")
         self._executor.shutdown(wait=True)
 
 
