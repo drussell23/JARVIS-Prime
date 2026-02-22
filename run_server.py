@@ -3219,6 +3219,28 @@ async def main():
                 logger.warning(f"[v242] Telemetry hook initialization failed (non-critical): {e}")
 
             # -----------------------------------------------------------------
+            # STEP 10d: v242.0 — Publish reflex manifest to shared state
+            # -----------------------------------------------------------------
+            try:
+                from datetime import datetime, timezone
+
+                trinity_dir = Path.home() / ".jarvis" / "trinity"
+                trinity_dir.mkdir(parents=True, exist_ok=True)
+
+                seed_manifest = Path(__file__).parent / "jarvis_prime" / "config" / "seed_reflex_manifest.json"
+                target_manifest = trinity_dir / "reflex_manifest.json"
+
+                if seed_manifest.exists():
+                    manifest_data = json.loads(seed_manifest.read_text())
+                    manifest_data["published_at"] = datetime.now(timezone.utc).isoformat()
+                    target_manifest.write_text(json.dumps(manifest_data, indent=2))
+                    logger.info(f"[v242] Reflex manifest published to {target_manifest}")
+                else:
+                    logger.warning(f"[v242] Seed reflex manifest not found at {seed_manifest}")
+            except Exception as e:
+                logger.warning(f"[v242] Reflex manifest publish failed (non-critical): {e}")
+
+            # -----------------------------------------------------------------
             # STEP 11: Mark ready (v93.7: with enhanced logging)
             # -----------------------------------------------------------------
             step_start = time.time()

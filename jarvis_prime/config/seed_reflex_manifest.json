@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "published_by": "jarvis-prime",
+  "published_at": null,
+  "reflexes": {
+    "lock_screen": {
+      "patterns": ["lock my screen", "lock screen", "lock the screen", "lock my mac", "lock my computer"],
+      "action": "system_command",
+      "executor": "macos_controller.lock_screen",
+      "requires_auth": false
+    },
+    "volume_up": {
+      "patterns": ["volume up", "turn it up", "louder"],
+      "action": "system_command",
+      "executor": "macos_controller.volume_up",
+      "requires_auth": false
+    },
+    "volume_down": {
+      "patterns": ["volume down", "turn it down", "quieter"],
+      "action": "system_command",
+      "executor": "macos_controller.volume_down",
+      "requires_auth": false
+    },
+    "mute_toggle": {
+      "patterns": ["mute", "unmute"],
+      "action": "system_command",
+      "executor": "macos_controller.mute_toggle",
+      "requires_auth": false
+    },
+    "brightness_up": {
+      "patterns": ["brighter", "brightness up"],
+      "action": "system_command",
+      "executor": "macos_controller.brightness_up",
+      "requires_auth": false
+    },
+    "brightness_down": {
+      "patterns": ["dimmer", "brightness down"],
+      "action": "system_command",
+      "executor": "macos_controller.brightness_down",
+      "requires_auth": false
+    },
+    "greeting": {
+      "patterns": ["hello jarvis", "hi jarvis", "hey jarvis", "good morning jarvis", "good evening jarvis"],
+      "action": "canned_response",
+      "response_pool": ["Hello, Sir.", "At your service.", "Good to see you, Sir."],
+      "requires_auth": false
+    }
+  }
+}
