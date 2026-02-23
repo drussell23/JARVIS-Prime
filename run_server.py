@@ -1527,7 +1527,7 @@ async def main():
             logger.info("[v242.1] Phi circuit OPEN — using default routing (domain=general)")
             _v241_task_type = "general_chat"  # Align task type with fallback domain
             _classification = {
-                "schema_version": 1,
+                "schema_version": SCHEMA_VERSION,
                 "intent": "answer",
                 "domain": "general",
                 "complexity": "simple",
@@ -1535,6 +1535,7 @@ async def main():
                 "requires_vision": False,
                 "requires_action": False,
                 "escalate_to_claude": False,
+                "suggested_actions": [],
             }
 
         # v242.0: Escalation signal — return early if Phi says Claude should handle this
@@ -1552,7 +1553,7 @@ async def main():
                     "finish_reason": "escalated",
                 }],
                 "x_jarvis_routing": {
-                    "schema_version": 1,
+                    "schema_version": SCHEMA_VERSION,
                     "intent": _classification.get("intent", "answer"),
                     "domain": _classification.get("domain", "general"),
                     "escalate_to_claude": True,
@@ -1560,6 +1561,7 @@ async def main():
                     "confidence": _classification.get("confidence", 0.0),
                     "classifier_model": "phi-3.5-mini-q4km",
                     "classification_ms": _classification_ms,
+                    "suggested_actions": _classification.get("suggested_actions", []),
                 },
             })
 
@@ -1612,7 +1614,7 @@ async def main():
                     "total_tokens": _phi_prompt_tokens + _phi_completion_tokens,
                 },
                 "x_jarvis_routing": {
-                    "schema_version": _classification.get("schema_version", 1),
+                    "schema_version": _classification.get("schema_version", SCHEMA_VERSION),
                     "intent": _classification.get("intent", "conversation"),
                     "domain": _classification.get("domain", "conversation"),
                     "complexity": _classification.get("complexity", "trivial"),
@@ -1624,6 +1626,7 @@ async def main():
                     "classifier_model": "phi-3.5-mini-q4km",
                     "classification_ms": _classification_ms,
                     "generation_ms": _phi_gen_ms,
+                    "suggested_actions": _classification.get("suggested_actions", []),
                 },
             }
             return _response_dict
@@ -1727,7 +1730,7 @@ async def main():
                     _stream_generation_ms = int((time.time() - start) * 1000)
                     if _classification:
                         final_chunk["x_jarvis_routing"] = {
-                            "schema_version": _classification.get("schema_version", 1),
+                            "schema_version": _classification.get("schema_version", SCHEMA_VERSION),
                             "intent": _classification.get("intent", "answer"),
                             "domain": _classification.get("domain", "general"),
                             "complexity": _classification.get("complexity", "simple"),
@@ -1912,7 +1915,7 @@ async def main():
             # v242.0: Attach x_jarvis_routing metadata to response
             if _classification:
                 _response_dict["x_jarvis_routing"] = {
-                    "schema_version": _classification.get("schema_version", 1),
+                    "schema_version": _classification.get("schema_version", SCHEMA_VERSION),
                     "intent": _classification.get("intent", "answer"),
                     "domain": _classification.get("domain", "general"),
                     "complexity": _classification.get("complexity", "simple"),
@@ -3441,6 +3444,7 @@ async def main():
                 DOMAIN_TO_TASK_TYPE,
                 PHI_SELF_SERVE_DOMAINS,
                 MIN_CONFIDENCE_THRESHOLD,
+                SCHEMA_VERSION,
             )
 
             _v242_phi_path = _v241_models_dir / "phi-3.5-mini-instruct.Q4_K_M.gguf"
