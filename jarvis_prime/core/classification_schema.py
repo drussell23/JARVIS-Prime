@@ -41,6 +41,10 @@ CLASSIFICATION_SCHEMA: Dict[str, Any] = {
         "requires_action": {"type": "boolean"},
         "escalate_to_claude": {"type": "boolean"},
         "confidence": {"type": "number"},
+        "suggested_actions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
     "required": [
         "schema_version", "intent", "domain", "complexity",
@@ -100,7 +104,10 @@ Output JSON with these fields:
 - requires_vision: true if the query needs to see the screen or an image
 - requires_action: true if the query needs the Body to execute a system action
 - escalate_to_claude: true if this query is too complex for a 7B local model (multi-step agentic planning, computer use, safety-critical decisions)
-- confidence: 0.0 to 1.0, how confident you are in this classification{actions_section}
+- confidence: 0.0 to 1.0, how confident you are in this classification
+- suggested_actions: optional list of specific action names the Body should execute. Use for action/multi_step_action intents.
+  System actions: ["lock_screen"], ["unlock_screen"], ["open_browser"], ["volume_up"], ["volume_down"]
+  Workspace actions: ["fetch_unread_emails"], ["check_calendar_events"], ["send_email"], ["draft_email_reply"], ["create_calendar_event"], ["daily_briefing"], ["workspace_summary"], ["get_contacts"], ["create_document"]{actions_section}
 
 Examples:
 - "what's today" -> intent=answer, domain=general, complexity=trivial, confidence=0.95
@@ -110,6 +117,9 @@ Examples:
 - "open Safari and go to GitHub" -> intent=multi_step_action, domain=agentic, escalate_to_claude=true, confidence=0.88
 - "hello" -> intent=conversation, domain=conversation, complexity=trivial, confidence=0.99
 - "watch all Chrome windows for changes" -> intent=action, domain=surveillance, requires_action=true, confidence=0.91
-- "check my email" -> intent=action, domain=workspace, complexity=simple, confidence=0.93
-- "what's on my calendar today" -> intent=action, domain=workspace, complexity=simple, confidence=0.91
-- "send an email to John" -> intent=action, domain=workspace, complexity=moderate, confidence=0.90"""
+- "check my email" -> intent=action, domain=workspace, complexity=simple, confidence=0.93, suggested_actions=["fetch_unread_emails"]
+- "what's on my calendar today" -> intent=action, domain=workspace, complexity=simple, confidence=0.91, suggested_actions=["check_calendar_events"]
+- "send an email to John" -> intent=action, domain=workspace, complexity=moderate, confidence=0.90, suggested_actions=["send_email"]
+- "draft a reply to that email" -> intent=action, domain=workspace, complexity=moderate, confidence=0.88, suggested_actions=["draft_email_reply"]
+- "schedule a meeting for tomorrow" -> intent=action, domain=workspace, complexity=moderate, confidence=0.89, suggested_actions=["create_calendar_event"]
+- "give me my morning briefing" -> intent=action, domain=workspace, complexity=simple, confidence=0.92, suggested_actions=["daily_briefing"]"""
