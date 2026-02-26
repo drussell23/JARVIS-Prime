@@ -1393,14 +1393,22 @@ class StartupState:
                 result["stage"] = self.stage
                 result["current_step"] = self.current_step
 
+            # v270.1: Always include ``ready_for_inference`` so PrimeClient's
+            # health schema validation (v276.0) doesn't block hot-swap.
+            # Previously this field was only present when APARS had it,
+            # causing the schema check to always fail during normal operation.
+            result.setdefault("ready_for_inference", self.phase == "ready")
+            result.setdefault("model_loaded", self.phase == "ready")
+
             # v235.2: Attach APARS payload if available (golden-image startup)
             apars_payload = self._read_apars_file()
             if apars_payload:
                 result["apars"] = apars_payload
+                # APARS values override the defaults set above
                 if "ready_for_inference" in apars_payload:
-                    result.setdefault("ready_for_inference", apars_payload.get("ready_for_inference"))
+                    result["ready_for_inference"] = apars_payload["ready_for_inference"]
                 if "model_loaded" in apars_payload:
-                    result.setdefault("model_loaded", apars_payload.get("model_loaded"))
+                    result["model_loaded"] = apars_payload["model_loaded"]
 
             return result
 
