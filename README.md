@@ -2393,5 +2393,38 @@ User Request → JARVIS Body (Backend)
 
 ---
 
+## Autonomous Gmail Triage Integration (Mind Role)
+
+In Gmail autonomy, JARVIS-Prime is the semantic intelligence layer used by Body-side triage. Prime does not directly execute Gmail actions; it provides structured extraction and reasoning signals that drive safe policy outcomes.
+
+### Prime's Responsibilities in Triage
+
+- Produce structured semantic extraction for unread emails (keywords, urgency, sender-frequency signals).
+- Provide robust fallback behavior when extraction contracts degrade.
+- Preserve deterministic interfaces so Body-side scoring and policy remain stable.
+- Emit model-attribution metadata so Reactor-Core can learn from outcomes later.
+
+### Cross-Repo Runtime Path
+
+```mermaid
+flowchart LR
+    A[JARVIS Body runtime cycle] --> B[Request semantic extraction]
+    B --> C[JARVIS-Prime routing layer]
+    C --> D[Best-fit specialist model]
+    D --> E[Structured output contract]
+    E --> F[Body scoring + policy]
+    F --> G[Notifications + UI updates]
+    F --> H[Outcome telemetry to Reactor-Core]
+```
+
+### What to Expect in Testing
+
+- Prime improves tier quality when extraction contracts validate.
+- If Prime output is invalid/unavailable, Body degrades to heuristic extraction without stalling triage.
+- User-visible behavior remains stable: command responses still work; freshness determines whether triage metadata is attached.
+- Frontend receives proactive notifications from Body-side notification bridge; Prime contributes semantic quality, not direct UI transport.
+
+---
+
 Built with ❤️ by Derek Russell
 Powered by self-hosted LLM fleet (Qwen, DeepSeek, Gemma, Llama, Mistral, Phi), llama-cpp-python, and the JARVIS Ecosystem
