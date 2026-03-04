@@ -1162,6 +1162,60 @@ JARVIS-Prime is the **Mind** in the three-repo Trinity architecture. It is **sta
 - **Inference:** Reactor can call Prime’s OpenAI-compatible API for generation during training or evaluation.
 - **Model deployment:** Trained/updated models can be deployed to Prime (e.g. hot swap, model registry).
 - **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Prime participates in Trinity state sync.
+- **Autonomy Policy (Phase 2):** JARVIS Body sends `autonomy_policy` on `JARVISCommand` with allowed/denied action lists and risk thresholds. Prime validates proposed actions against the policy, builds a structured `action_plan` in `PrimeResponse`, and returns `policy_compatible: bool` and `contract_version` for boot contract checking.
+
+### Phase 2: Trinity Autonomy Wiring (Prime Role)
+
+Prime serves as the **policy gate** in the autonomy pipeline. When Body's Google Workspace Agent proposes an autonomous action, Prime validates it against the attached policy and returns a structured plan.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              PRIME AUTONOMY ROLE                         │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  Inbound (from Body):                                   │
+│  ┌────────────────────────────────────────┐             │
+│  │ JARVISCommand                          │             │
+│  │   .autonomy_policy = {                 │             │
+│  │       "allowed_actions": [...],        │             │
+│  │       "denied_actions": [...],         │             │
+│  │       "max_risk_level": "medium",      │             │
+│  │       "require_confirmation": false    │             │
+│  │   }                                    │             │
+│  └─────────────────┬──────────────────────┘             │
+│                     │                                    │
+│                     ▼                                    │
+│  ┌────────────────────────────────────────┐             │
+│  │ Policy Validation                      │             │
+│  │   • Check action against allowed list  │             │
+│  │   • Check action against denied list   │             │
+│  │   • Validate risk level                │             │
+│  └─────────────────┬──────────────────────┘             │
+│                     │                                    │
+│                     ▼                                    │
+│  Outbound (to Body):                                    │
+│  ┌────────────────────────────────────────┐             │
+│  │ PrimeResponse                          │             │
+│  │   .action_plan = {                     │             │
+│  │       "steps": [...],                  │             │
+│  │       "risk_assessment": "low"         │             │
+│  │   }                                    │             │
+│  │   .policy_compatible = true            │             │
+│  │   .contract_version = "1.0"            │             │
+│  │   .autonomy_schema_version = "1.0"     │             │
+│  └────────────────────────────────────────┘             │
+│                                                          │
+│  Health endpoint additions:                              │
+│  GET /health → { autonomy_schema_version: "1.0",        │
+│                   contract_version: "1.0" }              │
+│  (Used by Supervisor boot contract check)                │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Files modified:**
+- `jarvis_prime/core/jarvis_bridge.py` — `autonomy_policy` on `JARVISCommand`, `action_plan`/`policy_compatible`/`contract_version` on `PrimeResponse`
+- `jarvis_prime/server.py` — `autonomy_schema_version` and `contract_version` in health endpoint
 
 **Health endpoint contract for supervisor:**
 
