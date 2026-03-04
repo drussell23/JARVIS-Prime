@@ -1400,6 +1400,10 @@ class StartupState:
             result.setdefault("ready_for_inference", self.phase == "ready")
             result.setdefault("model_loaded", self.phase == "ready")
 
+            # v300.0: Phase 2 — Autonomy contract versions for boot check
+            result["autonomy_schema_version"] = "1.0"
+            result["contract_version"] = "1.0"
+
             # v235.2: Attach APARS payload if available (golden-image startup)
             apars_payload = self._read_apars_file()
             if apars_payload:

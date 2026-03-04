@@ -241,6 +241,9 @@ class JARVISCommand:
     max_actions: int = 10
     timeout_seconds: float = 30.0
 
+    # v300.0: Phase 2 — Autonomy policy constraints from Body
+    autonomy_policy: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class PrimeResponse:
@@ -271,8 +274,17 @@ class PrimeResponse:
     # Error info
     error: Optional[str] = None
 
+    # v300.0: Phase 2 — Structured autonomy plan output
+    action_plan: Optional[List[Dict[str, Any]]] = None
+    policy_compatible: bool = True
+    contract_version: str = "1.0"
+    autonomy_schema_version: str = "1.0"
+
+    # Warning field (may be set by cache fallback)
+    warning: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "command_id": self.command_id,
             "success": self.success,
             "response_text": self.response_text,
@@ -286,6 +298,15 @@ class PrimeResponse:
             "processing_time_ms": self.processing_time_ms,
             "error": self.error,
         }
+        # v300.0: Include autonomy plan metadata when present
+        if self.action_plan is not None:
+            result["action_plan"] = self.action_plan
+            result["policy_compatible"] = self.policy_compatible
+            result["contract_version"] = self.contract_version
+            result["autonomy_schema_version"] = self.autonomy_schema_version
+        if self.warning:
+            result["warning"] = self.warning
+        return result
 
 
 @dataclass
@@ -631,6 +652,40 @@ class JARVISPrimeBridge:
                 if risk.value > self._config.risk_auto_confirm.value:
                     response.requires_confirmation = True
                     self._confirmations_requested += 1
+
+            # v300.0: Phase 2 — Autonomy policy validation & structured plan
+            if command.autonomy_policy is not None:
+                response.autonomy_schema_version = "1.0"
+                response.contract_version = "1.0"
+                policy = command.autonomy_policy
+                allowed = set(policy.get("allowed_actions", []))
+                denied = set(policy.get("denied_actions", []))
+
+                # Build structured action_plan from response actions
+                plan_items = []
+                compatible = True
+                for act in response.actions:
+                    act_name = act.get("action", act.get("type", "unknown"))
+                    act_risk = act.get("risk", "write")
+                    is_denied = act_name in denied
+                    is_allowed = (not allowed) or (act_name in allowed)
+                    needs_approval = is_denied or (
+                        act_risk == "high_risk_write"
+                        and not policy.get("high_risk_enabled", False)
+                    )
+                    if is_denied:
+                        compatible = False
+                    plan_items.append({
+                        "action": act_name,
+                        "risk": act_risk,
+                        "target": act.get("target", ""),
+                        "idempotency_key": act.get("idempotency_key", ""),
+                        "requires_approval": needs_approval,
+                        "policy_allowed": is_allowed and not is_denied,
+                    })
+
+                response.action_plan = plan_items
+                response.policy_compatible = compatible
 
             # Record metrics
             response.processing_time_ms = (time.time() - start_time) * 1000
