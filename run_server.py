@@ -2141,6 +2141,27 @@ async def main():
                 except Exception as e:
                     logger.warning(f"Failed to notify Trinity: {e}")
 
+            # Sync model registry so version tracking stays consistent
+            try:
+                from jarvis_prime.core.dynamic_model_registry import get_dynamic_model_registry
+                _dmr = await get_dynamic_model_registry()
+                if _dmr:
+                    model_id = request.model_version or new_model_path.stem
+                    # Estimate memory from file size (GGUF ~= file size in RAM)
+                    try:
+                        _mem_gb = new_model_path.stat().st_size / (1024 ** 3)
+                    except OSError:
+                        _mem_gb = 0.0
+                    await _dmr.register_loaded(
+                        model_id=model_id,
+                        memory_gb=_mem_gb,
+                    )
+                    logger.info(f"[reload] Synced model registry: {model_id} ({_mem_gb:.1f}GB)")
+            except ImportError:
+                logger.debug("[reload] DynamicModelRegistry not available")
+            except Exception as e:
+                logger.warning(f"[reload] Failed to sync model registry: {e}")
+
             logger.info(f"Model reloaded in {load_time:.2f}s: {_model_path}")
 
             return {

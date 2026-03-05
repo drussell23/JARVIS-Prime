@@ -421,15 +421,19 @@ class ModelRegistry:
                 logger.error(f"Failed to load registry: {e}")
 
     def _save_registry(self) -> None:
-        """Persist registry state to disk"""
+        """Persist registry state to disk (atomic write via tmp+rename)."""
         try:
             data = {
                 "lineages": [l.to_dict() for l in self.lineages.values()],
                 "updated_at": datetime.now().isoformat(),
             }
 
-            with open(self.registry_file, "w") as f:
+            tmp_file = self.registry_file.with_suffix(".tmp")
+            with open(tmp_file, "w") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_file.rename(self.registry_file)
 
             logger.debug("Registry saved to disk")
         except Exception as e:
