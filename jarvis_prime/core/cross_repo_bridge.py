@@ -1502,7 +1502,10 @@ class CrossRepoBridge:
             self.state.last_heartbeat = datetime.now().isoformat()
             # v93.3: Atomic write to prevent partial state reads
             temp_file = PRIME_STATE_FILE.with_suffix(".tmp")
-            temp_file.write_text(json.dumps(self.state.to_dict(), indent=2))
+            with open(temp_file, "w") as f:
+                json.dump(self.state.to_dict(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             temp_file.replace(PRIME_STATE_FILE)
         except Exception as e:
             logger.warning(f"Failed to write state: {e}")
@@ -1590,6 +1593,8 @@ class CrossRepoBridge:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
                     json.dump(services, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
