@@ -1183,6 +1183,28 @@ async def main():
         return {"status": "starting", "phase": "pre-init"}
 
     # =========================================================================
+    # CAPABILITY MANIFEST - Contract gate for cross-repo version validation
+    # =========================================================================
+    @app.get("/capabilities")
+    async def get_capabilities():
+        """Publish capability manifest for JARVIS contract gate.
+
+        v290.1: Consumed by JARVIS _validate_cross_repo_contracts()
+        to verify version compatibility at startup.
+        """
+        import time as _cap_time
+        return {
+            "provider_id": "jprime",
+            "capabilities": sorted(list({
+                "chat", "reasoning", "code", "vision", "multimodal",
+                "embedding", "tool_use", "function_calling",
+            })),
+            "contract_version": [0, 3, 0],
+            "policy_hash": "",  # Populated when Prime has its own contract package
+            "timestamp": _cap_time.time(),
+        }
+
+    # =========================================================================
     # PLACEHOLDER ENDPOINTS - Return 503 until initialization completes
     # =========================================================================
 
