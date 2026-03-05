@@ -202,7 +202,7 @@ class ComponentConfig:
     health_endpoint: str = "/health"
 
     # Process management
-    auto_restart: bool = True
+    auto_restart: bool = not os.environ.get("JARVIS_ROOT_MANAGED", "").lower() == "true"
     max_restarts: int = 3
     restart_delay_seconds: float = 5.0
 
@@ -617,6 +617,7 @@ class UnifiedSupervisor:
         self._running = False
         self._health_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
+        self._managed_exit_code: Optional[int] = None
         self._cognitive_router = None
 
         # Ensure directories exist
@@ -1027,6 +1028,17 @@ class UnifiedSupervisor:
                             await manager.restart()
                         else:
                             logger.error(f"{name} exceeded max restarts")
+                    elif not healthy and os.environ.get("JARVIS_ROOT_MANAGED", "").lower() == "true":
+                        from managed_mode import EXIT_RUNTIME_FATAL
+                        logger.critical(
+                            "Component unhealthy in managed mode - exiting for root restart",
+                            extra={"event": "fatal", "exit_code": EXIT_RUNTIME_FATAL,
+                                   "component": name,
+                                   "session_id": os.environ.get("JARVIS_ROOT_SESSION_ID", "")}
+                        )
+                        self._shutdown_event.set()
+                        self._managed_exit_code = EXIT_RUNTIME_FATAL
+                        return
 
                 # Update state
                 await self._write_state()

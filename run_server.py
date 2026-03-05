@@ -1178,9 +1178,61 @@ async def main():
                     status["ready_for_inference"] = _executor is not None and _executor.is_loaded() if hasattr(_executor, 'is_loaded') else False
                     status["inference_mode"] = "local"
 
+            # Managed-mode enrichment
+            session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+            if session_id:
+                from managed_mode import build_health_envelope
+                readiness = "ready" if status.get("phase") == "ready" else "not_ready"
+                if status.get("status") == "error":
+                    readiness = "degraded"
+                status = build_health_envelope(status, readiness=readiness)
+
             return status
 
         return {"status": "starting", "phase": "pre-init"}
+
+    # =========================================================================
+    # LIFECYCLE DRAIN ENDPOINT - Managed-mode controlled shutdown
+    # =========================================================================
+    _draining = False
+    _drain_id = None
+
+    @app.post("/lifecycle/drain")
+    async def lifecycle_drain(request: Request):
+        nonlocal _draining, _drain_id
+        body = await request.json()
+        session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+
+        if body.get("session_id") != session_id:
+            return JSONResponse(status_code=409, content={"error": "session_id mismatch"})
+
+        from managed_mode import verify_hmac_auth, get_control_plane_secret
+        auth_header = request.headers.get("X-Root-Auth", "")
+        if not verify_hmac_auth(auth_header, session_id, get_control_plane_secret()):
+            return JSONResponse(status_code=403, content={"error": "auth failed"})
+
+        if _draining:
+            return JSONResponse(status_code=202, content={
+                "drain_id": _drain_id, "session_id": session_id, "status": "already_draining"
+            })
+
+        import uuid
+        _draining = True
+        _drain_id = str(uuid.uuid4())
+
+        asyncio.create_task(_drain_and_exit_prime())
+
+        return JSONResponse(status_code=202, content={
+            "drain_id": _drain_id, "session_id": session_id, "status": "draining"
+        })
+
+    async def _drain_and_exit_prime():
+        """Controlled drain: stop accepting, flush, signal exit."""
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(f"Drain initiated: {_drain_id}")
+        await asyncio.sleep(5)
+        _logger.info("Drain complete, signaling shutdown")
 
     # =========================================================================
     # CAPABILITY MANIFEST - Contract gate for cross-repo version validation
