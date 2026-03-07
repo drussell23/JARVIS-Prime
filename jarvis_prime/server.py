@@ -1408,11 +1408,17 @@ class StartupState:
             apars_payload = self._read_apars_file()
             if apars_payload:
                 result["apars"] = apars_payload
-                # APARS values override the defaults set above
+                # APARS values override the defaults set above.
+                # v303.0: Coerce to bool — the progress file can contain
+                # null when update_apars() is called without explicit
+                # model_loaded/ready args.  None would fail PrimeClient's
+                # v276.0 health schema validation ("expected bool got NoneType").
                 if "ready_for_inference" in apars_payload:
-                    result["ready_for_inference"] = apars_payload["ready_for_inference"]
+                    _val = apars_payload["ready_for_inference"]
+                    result["ready_for_inference"] = bool(_val) if _val is not None else result["ready_for_inference"]
                 if "model_loaded" in apars_payload:
-                    result["model_loaded"] = apars_payload["model_loaded"]
+                    _val = apars_payload["model_loaded"]
+                    result["model_loaded"] = bool(_val) if _val is not None else result["model_loaded"]
 
             return result
 
