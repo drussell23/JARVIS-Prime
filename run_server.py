@@ -1127,6 +1127,12 @@ async def main():
                 "ws_events": "/api/v1/integration/contracts/ws-events",
             }
             status["websocket_contract_version"] = "1.0"
+            # v291.2: Expose autonomy schema version for cross-repo contract
+            # validation.  Without this, the unified supervisor's boot-time
+            # check_autonomy_contracts() sees prime_schema=None → prime_compatible=False
+            # → contract_mismatch → Autonomy Contract ⚠️ permanently.
+            status["autonomy_schema_version"] = "1.0"
+            status["contract_version"] = "1.0"
 
             # Add runtime component status once initialized
             if _startup_state.phase == "ready":
