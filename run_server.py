@@ -3793,6 +3793,7 @@ async def main():
     async def on_shutdown():
         global _registry_heartbeat_task, _reactor_bridge, _training_pipeline, _telemetry_hook, _jarvis_bridge
         global _tier2_capability_task, _continual_learner, _self_modifier, _tier2_capability_status
+        global _jarvis_prime_bridge  # v301.1: Fix UnboundLocalError on shutdown
 
         logger.info("Shutting down...")
 
