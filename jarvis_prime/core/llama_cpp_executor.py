@@ -594,13 +594,27 @@ class LlamaCppConfig:
         """
         Auto-detect hardware and create optimal configuration.
 
+        Dynamic context sizing: reads ``JARVIS_PRIME_N_CTX`` env var first,
+        then falls back to a RAM-aware calculation — no more hard-coded 2048
+        CPU cap.  Formula for CPU: reserve 2 GB for OS + model weights already
+        in RAM, then allocate ~0.5 MB per 1024-token KV-cache slot
+        (conservative for Q4_K_M 7B).
+
         Args:
-            context_size: Desired context window size
+            context_size: Desired context window size (used as upper bound).
 
         Returns:
-            Config optimized for detected hardware
+            Config optimized for detected hardware.
         """
+        import os
+
         hw = HardwareDetector.detect()
+
+        # Env override takes highest priority (all backends honour it)
+        env_ctx = os.environ.get("JARVIS_PRIME_N_CTX", "").strip()
+        if env_ctx.isdigit():
+            context_size = int(env_ctx)
+            logger.info(f"Context size overridden by JARVIS_PRIME_N_CTX={context_size}")
 
         if hw.backend == HardwareBackend.METAL:
             logger.info("Auto-detected Apple Silicon - using Metal GPU acceleration")
@@ -615,8 +629,23 @@ class LlamaCppConfig:
                 flash_attn=True,
             )
         else:
-            logger.info("Using CPU-only inference")
-            return cls.for_cpu(min(context_size, 2048))
+            # CPU path: derive context from available RAM instead of a hard cap.
+            available_gb = 0.0
+            try:
+                import psutil
+                available_gb = psutil.virtual_memory().available / (1024 ** 3)
+                # Reserve 2 GB headroom; 0.5 MB KV cache per 1024-token slot.
+                usable_gb = max(0.0, available_gb - 2.0)
+                ram_budget_ctx = int((usable_gb * 1024) / 0.5) * 1024
+                cpu_ctx = max(2048, min(context_size, ram_budget_ctx))
+            except Exception:
+                cpu_ctx = min(context_size, 4096)
+
+            logger.info(
+                f"CPU inference: context={cpu_ctx} "
+                f"(requested={context_size}, available_ram={available_gb:.1f}GB)"
+            )
+            return cls.for_cpu(cpu_ctx)
 
 
 CHAT_TEMPLATES = {
