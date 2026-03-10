@@ -85,15 +85,18 @@ class ModelDispatcher:
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """Load catalogue. Call once at server startup."""
-        self._catalogue = _load_catalogue()
-        models = self._catalogue.get("models", {})
-        logger.info(
-            "[ModelDispatcher] Initialized with %d catalogue entries (models_dir=%s)",
-            len(models),
-            self._models_dir,
-        )
-        self._initialized = True
+        """Load catalogue. Idempotent — safe to call multiple times; only runs once."""
+        async with self._lock:
+            if self._initialized:
+                return
+            self._catalogue = _load_catalogue()
+            models = self._catalogue.get("models", {})
+            logger.info(
+                "[ModelDispatcher] Initialized with %d catalogue entries (models_dir=%s)",
+                len(models),
+                self._models_dir,
+            )
+            self._initialized = True
 
     async def get_executor(
         self,

@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -138,10 +139,11 @@ def _download_model(
             local_dir=str(models_dir),
             local_dir_use_symlinks=False,
         )
-        # hf_hub_download may place files in subdirs — move to flat models_dir
+        # hf_hub_download may place files in subdirs — move to flat models_dir.
+        # Use shutil.move() (not Path.rename()) to handle cross-device moves.
         downloaded_path = Path(downloaded)
         if downloaded_path != dest and downloaded_path.exists():
-            downloaded_path.rename(dest)
+            shutil.move(str(downloaded_path), str(dest))
 
         size_mb = dest.stat().st_size / (1024 * 1024)
         logger.info("[%s] Downloaded: %s (%.0f MB)", model_name, dest.name, size_mb)
