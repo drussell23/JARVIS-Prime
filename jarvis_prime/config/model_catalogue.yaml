@@ -1,0 +1,88 @@
+# J-Prime Multi-Model Catalogue
+# ==============================
+# Synchronized with JARVIS brain_selection_policy.yaml (Prong 1, Task 5).
+# Each entry maps a model alias (used in API requests) to its GGUF filename
+# and HuggingFace source for golden-image provisioning.
+#
+# Used by:
+#   - scripts/provision_models.py  — golden image download script
+#   - jarvis_prime/core/model_dispatcher.py — runtime lazy-load routing
+
+schema_version: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Canonical model definitions
+# model_name: must match the value sent in PrimeRequest.model / task_profile.model
+# ---------------------------------------------------------------------------
+models:
+
+  llama-3.2-1b:
+    brain_id: phi3_lightweight
+    gguf_file: Llama-3.2-1B-Instruct-Q4_K_M.gguf
+    hf_repo: bartowski/Llama-3.2-1B-Instruct-GGUF
+    hf_filename: Llama-3.2-1B-Instruct-Q4_K_M.gguf
+    max_context: 4096
+    temperature: 0.1
+    description: "Lightweight for trivial ops and single-line changes"
+
+  qwen-2.5-coder-7b:
+    brain_id: qwen_coder
+    gguf_file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    hf_repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+    hf_filename: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    max_context: 8192
+    temperature: 0.2
+    description: "Coding specialist: heavy refactor, feature implementation"
+
+  deepseek-r1-qwen-7b:
+    brain_id: deepseek_r1
+    gguf_file: DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf
+    hf_repo: bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF
+    hf_filename: DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf
+    max_context: 8192
+    temperature: 0.0
+    description: "Reasoning specialist: segfault analysis, architecture design"
+
+  mistral-7b:
+    brain_id: mistral_7b_fallback
+    gguf_file: mistral-7b-instruct-v0.2.Q4_K_M.gguf
+    hf_repo: TheBloke/Mistral-7B-Instruct-v0.2-GGUF
+    hf_filename: mistral-7b-instruct-v0.2.Q4_K_M.gguf
+    max_context: 8192
+    temperature: 0.2
+    description: "General-purpose fallback: bug fixes, light refactors"
+
+  phi-3.5-mini:
+    brain_id: phi3_lightweight
+    gguf_file: Phi-3.5-mini-instruct-Q4_K_M.gguf
+    hf_repo: bartowski/Phi-3.5-mini-instruct-GGUF
+    hf_filename: Phi-3.5-mini-instruct-Q4_K_M.gguf
+    max_context: 4096
+    temperature: 0.1
+    description: "Alt lightweight model for trivial ops (already provisioned)"
+
+# ---------------------------------------------------------------------------
+# Golden-image provisioning targets (subset downloaded at bake time)
+# ---------------------------------------------------------------------------
+provision:
+  required:
+    - llama-3.2-1b
+    - qwen-2.5-coder-7b
+    - deepseek-r1-qwen-7b
+  optional:
+    - mistral-7b
+    - phi-3.5-mini
+  destination: /opt/jarvis-prime/models   # overridable via JPRIME_MODELS_DIR
+  dev_destination: ~/.jarvis/prime/models # used when running locally
+
+# ---------------------------------------------------------------------------
+# Runtime dispatch defaults
+# ---------------------------------------------------------------------------
+defaults:
+  model: jarvis-prime                     # alias when no model specified
+  fallback_chain:
+    - qwen-2.5-coder-7b
+    - mistral-7b
+    - llama-3.2-1b
+  max_parallel_models: 2                  # max GGUFs loaded simultaneously
+  evict_on_pressure: true                 # unload LRU model under RAM pressure
