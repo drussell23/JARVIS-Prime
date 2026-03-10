@@ -59,6 +59,7 @@ class CompletionRequest:
     force_tier: Optional[str] = None  # "tier_0" or "tier_1"
     session_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    task_profile: Optional[Dict[str, Any]] = None  # forwarded from JARVIS governance
 
 
 @dataclass
@@ -361,6 +362,7 @@ class PrimeModelManager:
         self._hot_swap = None
         self._router = None
         self._telemetry = None
+        self._dispatcher = None  # ModelDispatcher — initialized in start()
 
         # State
         self._running = False
@@ -457,6 +459,11 @@ class PrimeModelManager:
         self._registry.on_new_version(self._on_new_version)
         self._registry.on_activation(self._on_activation)
         self._hot_swap.on_swap_complete(self._on_swap_complete)
+
+        # Multi-model dispatcher (Task 6: dynamic GGUF routing)
+        from jarvis_prime.core.model_dispatcher import ModelDispatcher
+        self._dispatcher = ModelDispatcher(models_dir=self.models_dir)
+        await self._dispatcher.initialize()
 
         # v93.0: Mark as running BEFORE model loading so health checks work
         self._running = True
@@ -655,6 +662,11 @@ class PrimeModelManager:
                 except Exception as _re_err:
                     logger.debug(f"[Reasoning] Enhancement skipped: {_re_err}")
 
+            # Resolve requested model from task_profile (Task 6: dynamic dispatch)
+            _requested_model: Optional[str] = None
+            if request.task_profile:
+                _requested_model = request.task_profile.get("model") or None
+
             # Execute based on tier
             if decision.tier in (TierClassification.TIER_0, TierClassification.TIER_0_PREFERRED):
                 # Voice announcement: Tier 0 routing (optional, low priority)
@@ -668,7 +680,7 @@ class PrimeModelManager:
                 except Exception:
                     pass
 
-                completion = await self._execute_tier_0(prompt, request)
+                completion = await self._execute_tier_0(prompt, request, requested_model=_requested_model)
                 tier_used = "tier_0"
                 self._tier_0_count += 1
             else:
@@ -698,7 +710,7 @@ class PrimeModelManager:
                     except Exception:
                         pass
 
-                    completion = await self._execute_tier_0(prompt, request)
+                    completion = await self._execute_tier_0(prompt, request, requested_model=_requested_model)
                     tier_used = "tier_0_fallback"
                     self._tier_0_count += 1
 
@@ -804,9 +816,28 @@ class PrimeModelManager:
 
             raise
 
-    async def _execute_tier_0(self, prompt: str, request: CompletionRequest) -> str:
-        """Execute on local model (Tier 0)"""
-        async with self._hot_swap.acquire() as executor:
+    async def _execute_tier_0(
+        self,
+        prompt: str,
+        request: CompletionRequest,
+        requested_model: Optional[str] = None,
+    ) -> str:
+        """Execute on local model (Tier 0).
+
+        If *requested_model* is provided and the ModelDispatcher has a matching
+        GGUF loaded (or can load it), that executor is used instead of the
+        default hot-swap model.  Falls back to the hot-swap executor on any
+        failure so the call path is always safe.
+        """
+        async with self._hot_swap.acquire() as default_executor:
+            if requested_model and self._dispatcher is not None:
+                executor = await self._dispatcher.get_executor(
+                    model_name=requested_model,
+                    default_executor=default_executor,
+                )
+            else:
+                executor = default_executor
+
             return await executor.generate(
                 prompt=prompt,
                 max_tokens=request.max_tokens,
@@ -1012,6 +1043,7 @@ try:
         # Extensions
         force_tier: Optional[str] = None
         session_id: Optional[str] = None
+        task_profile: Optional[Dict[str, Any]] = None
 
 except ImportError:
     # Pydantic not available — models will be created at runtime in create_api_app
@@ -1066,6 +1098,7 @@ def create_api_app(manager: PrimeModelManager):
                 user=request.user,
                 force_tier=request.force_tier,
                 session_id=request.session_id,
+                task_profile=request.task_profile,
             )
 
             response = await manager.complete(completion_request)
