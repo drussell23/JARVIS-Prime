@@ -2193,15 +2193,22 @@ async def main():
         declared in brain_selection_policy.yaml.
 
         Response shape (contract-stable):
-            schema_version       : semver string  e.g. "1.0.0"
+            schema_version       : semver string  e.g. "1.0"
             contract_version     : semver string  e.g. "1.0.0"
             model_loaded         : bool
             context_window       : int   (maximum prompt tokens this server accepts)
             host_id              : str   (stable machine identifier)
             host_binding         : str   "host:port"
             generated_at_epoch_s : int   (unix timestamp of this response)
+            compute_class        : str   one of cpu|gpu_t4|gpu_l4|gpu_v100|gpu_a100
+            model_id             : str   human-readable model name (no quant suffix)
+            model_artifact       : str   basename of the loaded GGUF file
+            gpu_layers           : int   n_gpu_layers on the loaded model
+            tok_s_estimate       : float tokens-per-second estimate (0 if unknown)
+            host                 : str   socket.gethostname()
         """
         import platform
+        import re
         import socket
 
         model_loaded: bool = False
@@ -2229,14 +2236,76 @@ async def main():
         _port = getattr(_args, "port", 8000) if _args else 8000
         host_binding = f"{_host}:{_port}"
 
+        # --- compute_class / model fields -----------------------------------
+        # _executor is a LlamaCppExecutor whose raw Llama object lives at
+        # _executor._model.  We derive everything from the executor to avoid
+        # reaching into private llama-cpp-python internals.
+        gpu_layers: int = 0
+        model_artifact: str = ""
+        model_id: str = ""
+        compute_class: str = "cpu"
+
+        if _executor is not None:
+            try:
+                gpu_layers = int(_executor.config.n_gpu_layers)
+            except Exception:
+                gpu_layers = 0
+
+            try:
+                _mp = _executor._model_path  # Path | None
+                if _mp is not None:
+                    model_artifact = Path(_mp).name
+                    # Strip quantisation suffix and .gguf extension to get a
+                    # clean human-readable model_id, e.g.:
+                    #   "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+                    #   → "qwen2.5-coder-7b-instruct"
+                    model_id = re.sub(
+                        r"[-_]Q\d.*$",
+                        "",
+                        model_artifact.replace(".gguf", "").replace(".GGUF", ""),
+                        flags=re.IGNORECASE,
+                    )
+            except Exception:
+                pass
+
+            # Derive compute_class from gpu_layers and JARVIS_GPU_TYPE env var
+            if gpu_layers == -1 or gpu_layers > 0:
+                _gpu_type = os.environ.get("JARVIS_GPU_TYPE", "").lower().strip()
+                _gpu_type_map = {
+                    "l4": "gpu_l4",
+                    "v100": "gpu_v100",
+                    "a100": "gpu_a100",
+                }
+                compute_class = _gpu_type_map.get(_gpu_type, "gpu_t4")
+            else:
+                compute_class = "cpu"
+
+        # tok_s_estimate: optional throughput hint stored on the app object
+        tok_s_estimate: float = float(
+            getattr(app, "_tok_s_estimate", 0) or 0
+        )
+
+        hostname: str = "unknown"
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            pass
+
         return {
-            "schema_version": "1.0.0",
+            "schema_version": "1.0",
             "contract_version": "1.0.0",
             "model_loaded": model_loaded,
             "context_window": context_window,
             "host_id": host_id,
             "host_binding": host_binding,
             "generated_at_epoch_s": int(time.time()),
+            # --- Ouroboros compute-admission fields (schema_version 1.0) ---
+            "compute_class": compute_class,
+            "model_id": model_id,
+            "model_artifact": model_artifact,
+            "gpu_layers": gpu_layers,
+            "tok_s_estimate": tok_s_estimate,
+            "host": hostname,
         }
 
     # =========================================================================
