@@ -32,7 +32,25 @@ models:
     hf_filename: qwen2.5-coder-7b-instruct-q4_k_m.gguf
     max_context: 8192
     temperature: 0.2
-    description: "Coding specialist: heavy refactor, feature implementation"
+    description: "Coding specialist: bug fixes, light refactors"
+
+  qwen-2.5-coder-14b:
+    brain_id: qwen_coder_14b
+    gguf_file: Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
+    hf_repo: bartowski/Qwen2.5-Coder-14B-Instruct-GGUF
+    hf_filename: Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
+    max_context: 12288
+    temperature: 0.2
+    description: "Mid-tier coding: multi-file features, API redesign"
+
+  qwen-2.5-coder-32b:
+    brain_id: qwen_coder_32b
+    gguf_file: Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf
+    hf_repo: bartowski/Qwen2.5-Coder-32B-Instruct-GGUF
+    hf_filename: Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf
+    max_context: 16384
+    temperature: 0.2
+    description: "Heavy coding: refactoring, architecture, cross-repo patches (92.7% HumanEval)"
 
   deepseek-r1-qwen-7b:
     brain_id: deepseek_r1
@@ -68,6 +86,8 @@ provision:
   required:
     - llama-3.2-1b
     - qwen-2.5-coder-7b
+    - qwen-2.5-coder-14b
+    - qwen-2.5-coder-32b
     - deepseek-r1-qwen-7b
   optional:
     - mistral-7b
@@ -81,8 +101,9 @@ provision:
 defaults:
   model: jarvis-prime                     # alias when no model specified
   fallback_chain:
+    - qwen-2.5-coder-32b
+    - qwen-2.5-coder-14b
     - qwen-2.5-coder-7b
-    - mistral-7b
     - llama-3.2-1b
   max_parallel_models: 2                  # max GGUFs loaded simultaneously
   evict_on_pressure: true                 # unload LRU model under RAM pressure
