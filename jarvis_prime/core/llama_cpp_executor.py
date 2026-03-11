@@ -1376,8 +1376,23 @@ class LlamaCppExecutor:
             if not self._model:
                 raise RuntimeError("Model not loaded")
 
-            # Merge stop tokens
-            stop_tokens = list(stop or []) + self.config.stop_tokens
+            # Stop tokens: when caller provides explicit stop list, use it
+            # exclusively (the caller is taking precise control — e.g. codegen
+            # must NOT include "\n\n\n" which truncates JSON with blank lines).
+            # Otherwise merge with config defaults for backward compatibility.
+            if stop:
+                stop_tokens = list(stop)
+            else:
+                stop_tokens = list(self.config.stop_tokens)
+
+            # Forward llama-cpp-compatible kwargs (repeat_penalty, top_k, etc.)
+            model_kwargs: Dict[str, Any] = {}
+            _forwarded = {"repeat_penalty", "top_k", "presence_penalty",
+                          "frequency_penalty", "mirostat_mode", "mirostat_tau",
+                          "mirostat_eta", "seed"}
+            for k in _forwarded:
+                if k in kwargs:
+                    model_kwargs[k] = kwargs[k]
 
             output = self._model(
                 prompt,
@@ -1386,6 +1401,7 @@ class LlamaCppExecutor:
                 top_p=top_p,
                 stop=stop_tokens,
                 echo=False,
+                **model_kwargs,
             )
 
             self._generation_count += 1
@@ -1412,7 +1428,21 @@ class LlamaCppExecutor:
                     queue.put_nowait(StopIteration)
                     return
 
-                stop_tokens = list(stop or []) + self.config.stop_tokens
+                # Same stop-token logic as _generate_sync: caller-provided
+                # stop list is exclusive (no merging with defaults).
+                if stop:
+                    stop_tokens = list(stop)
+                else:
+                    stop_tokens = list(self.config.stop_tokens)
+
+                # Forward llama-cpp-compatible kwargs
+                model_kwargs: Dict[str, Any] = {}
+                _forwarded = {"repeat_penalty", "top_k", "presence_penalty",
+                              "frequency_penalty", "mirostat_mode", "mirostat_tau",
+                              "mirostat_eta", "seed"}
+                for k in _forwarded:
+                    if k in kwargs:
+                        model_kwargs[k] = kwargs[k]
 
                 for output in self._model(
                     prompt,
@@ -1422,6 +1452,7 @@ class LlamaCppExecutor:
                     stop=stop_tokens,
                     echo=False,
                     stream=True,
+                    **model_kwargs,
                 ):
                     token = output["choices"][0]["text"]
                     asyncio.run_coroutine_threadsafe(

@@ -1745,13 +1745,24 @@ async def main():
                 "source shown above — not line numbers from your training data."
             ),
         )
+        # Detect codegen requests from Ouroboros — identified by "schema_version"
+        # in the system message content.  When detected:
+        #   1. Append anchoring suffix to system prompt
+        #   2. Override stop tokens to exclude "\n\n\n" which prematurely
+        #      terminates JSON output containing blank lines
+        #   3. Force repeat_penalty=1.0 so the model can copy verbatim source
+        _is_codegen_request = False
         if _codegen_suffix:
+            for m in messages:
+                if m.role == "system" and "schema_version" in (m.content or ""):
+                    _is_codegen_request = True
+                    break
             messages = [
                 ChatMessage(
                     role=m.role,
                     content=(
                         m.content + _codegen_suffix
-                        if m.role == "system" and "schema_version" in (m.content or "")
+                        if m.role == "system" and _is_codegen_request and "schema_version" in (m.content or "")
                         else m.content
                     ),
                 )
@@ -1797,6 +1808,13 @@ async def main():
             except Exception as e:
                 logger.warning(f"Neural routing failed, using default: {e}")
 
+        # Codegen requests: override stop tokens and repeat penalty so the
+        # model can output JSON with blank lines and copy verbatim source.
+        _gen_kwargs: Dict[str, Any] = {}
+        if _is_codegen_request:
+            _gen_kwargs["stop"] = ["</s>", "<|eot_id|>", "<|end_of_text|>", "<|im_end|>"]
+            _gen_kwargs["repeat_penalty"] = 1.0  # allow verbatim source copying
+
         # v74.0: Streaming Response (SSE format)
         if request.stream:
             async def stream_generator():
@@ -1810,6 +1828,7 @@ async def main():
                         prompt=prompt,
                         max_tokens=request.max_tokens,
                         temperature=request.temperature,
+                        **(_gen_kwargs if _is_codegen_request else {}),
                     ):
                         token_count += 1
                         accumulated_content.append(token)
@@ -1968,6 +1987,7 @@ async def main():
                 prompt=prompt,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
+                **_gen_kwargs,
             )
 
             latency_ms = (time.time() - start) * 1000
