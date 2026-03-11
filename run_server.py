@@ -2219,6 +2219,11 @@ async def main():
         _ctx = getattr(_args, "ctx_size", 8192) if _args else 8192
         context_window = int(os.environ.get("JARVIS_PRIME_CONTEXT_WINDOW", str(_ctx)))
 
+        try:
+            _hostname = socket.gethostname()
+        except Exception:
+            _hostname = "unknown"
+
         host_id: str = ""
         try:
             _mid = Path("/etc/machine-id")
@@ -2228,9 +2233,9 @@ async def main():
             pass
         if not host_id:
             try:
-                host_id = socket.gethostname()
+                host_id = _hostname or platform.node() or "unknown"
             except Exception:
-                host_id = platform.node() or "unknown"
+                host_id = "unknown"
 
         _host = getattr(_args, "host", "0.0.0.0") if _args else "0.0.0.0"
         _port = getattr(_args, "port", 8000) if _args else 8000
@@ -2285,12 +2290,6 @@ async def main():
             getattr(app, "_tok_s_estimate", 0) or 0
         )
 
-        hostname: str = "unknown"
-        try:
-            hostname = socket.gethostname()
-        except Exception:
-            pass
-
         return {
             "schema_version": "1.0",
             "contract_version": "1.0.0",
@@ -2305,7 +2304,7 @@ async def main():
             "model_artifact": model_artifact,
             "gpu_layers": gpu_layers,
             "tok_s_estimate": tok_s_estimate,
-            "host": hostname,
+            "host": _hostname,
         }
 
     # =========================================================================

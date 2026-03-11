@@ -1570,15 +1570,22 @@ async def main():
             declared in brain_selection_policy.yaml.
 
             Response shape (contract-stable):
-                schema_version       : semver string  e.g. "1.0.0"
+                schema_version       : semver string  e.g. "1.0"
                 contract_version     : semver string  e.g. "1.0.0"
                 model_loaded         : bool
                 context_window       : int   (maximum prompt tokens this server accepts)
                 host_id              : str   (stable machine identifier)
                 host_binding         : str   "host:port"
                 generated_at_epoch_s : int   (unix timestamp of this response)
+                compute_class        : str   one of cpu|gpu_t4|gpu_l4|gpu_v100|gpu_a100
+                model_id             : str   human-readable model name (no quant suffix)
+                model_artifact       : str   basename of the loaded GGUF file
+                gpu_layers           : int   n_gpu_layers on the loaded model
+                tok_s_estimate       : float tokens-per-second estimate (0 if unknown)
+                host                 : str   socket.gethostname()
             """
             import platform
+            import re
             import socket
 
             model_loaded: bool = False
@@ -1588,6 +1595,11 @@ async def main():
 
             # context_window: honour env override, else use server default 8192
             context_window = int(os.environ.get("JARVIS_PRIME_CONTEXT_WINDOW", "8192"))
+
+            try:
+                _hostname = socket.gethostname()
+            except Exception:
+                _hostname = "unknown"
 
             # Stable host identifier: prefer machine-id, fall back to hostname
             host_id: str = ""
@@ -1599,21 +1611,85 @@ async def main():
                 pass
             if not host_id:
                 try:
-                    host_id = socket.gethostname()
+                    host_id = _hostname or platform.node() or "unknown"
                 except Exception:
-                    host_id = platform.node() or "unknown"
+                    host_id = "unknown"
 
             # Derive host_binding from listen address
             host_binding = f"{args.host}:{args.port}"
 
+            # --- compute_class / model fields -----------------------------------
+            # The executor is a LlamaCppExecutor stored inside the hot-swap
+            # manager's loader.  We access it defensively so that early
+            # capability checks (before model loads) still return valid data.
+            gpu_layers: int = 0
+            model_artifact: str = ""
+            model_id: str = ""
+            compute_class: str = "cpu"
+
+            _manager = getattr(_startup_state, "manager", None) if _startup_state else None
+            _executor = None
+            if _manager is not None:
+                try:
+                    _executor = _manager._hot_swap._loader._executor
+                except Exception:
+                    _executor = None
+
+            if _executor is not None:
+                try:
+                    gpu_layers = int(_executor.config.n_gpu_layers)
+                except Exception:
+                    gpu_layers = 0
+
+                try:
+                    _mp = _executor._model_path  # Path | None
+                    if _mp is not None:
+                        model_artifact = Path(_mp).name
+                        # Strip quantisation suffix and .gguf extension to get a
+                        # clean human-readable model_id, e.g.:
+                        #   "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+                        #   → "qwen2.5-coder-7b-instruct"
+                        model_id = re.sub(
+                            r"[-_]Q\d.*$",
+                            "",
+                            model_artifact.replace(".gguf", "").replace(".GGUF", ""),
+                            flags=re.IGNORECASE,
+                        )
+                except Exception:
+                    pass
+
+                # Derive compute_class from gpu_layers and JARVIS_GPU_TYPE env var
+                if gpu_layers == -1 or gpu_layers > 0:
+                    _gpu_type = os.environ.get("JARVIS_GPU_TYPE", "").lower().strip()
+                    _gpu_type_map = {
+                        "l4": "gpu_l4",
+                        "v100": "gpu_v100",
+                        "a100": "gpu_a100",
+                    }
+                    compute_class = _gpu_type_map.get(_gpu_type, "gpu_t4")
+                else:
+                    compute_class = "cpu"
+
+            # tok_s_estimate: optional throughput hint stored on the app object
+            tok_s_estimate: float = float(
+                getattr(app, "_tok_s_estimate", 0) or 0
+            )
+
             return {
-                "schema_version": "1.0.0",
+                "schema_version": "1.0",
                 "contract_version": "1.0.0",
                 "model_loaded": model_loaded,
                 "context_window": context_window,
                 "host_id": host_id,
                 "host_binding": host_binding,
                 "generated_at_epoch_s": int(time.time()),
+                # --- Ouroboros compute-admission fields (schema_version 1.0) ---
+                "compute_class": compute_class,
+                "model_id": model_id,
+                "model_artifact": model_artifact,
+                "gpu_layers": gpu_layers,
+                "tok_s_estimate": tok_s_estimate,
+                "host": _hostname,
             }
 
         @app.get("/trinity/status")
