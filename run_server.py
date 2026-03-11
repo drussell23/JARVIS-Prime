@@ -2148,6 +2148,66 @@ async def main():
         }
 
     # =========================================================================
+    # CAPABILITY CONTRACT ENDPOINT - Ouroboros boot-time assertion
+    # =========================================================================
+    @app.get("/v1/capability")
+    async def capability():
+        """
+        Dedicated capability contract endpoint (NOT /health overload).
+
+        Returns the server's static capability contract for boot-time
+        assertion by unified_supervisor. Callers assert contract_version
+        is within [min_runtime_contract_version, max_runtime_contract_version]
+        declared in brain_selection_policy.yaml.
+
+        Response shape (contract-stable):
+            schema_version       : semver string  e.g. "1.0.0"
+            contract_version     : semver string  e.g. "1.0.0"
+            model_loaded         : bool
+            context_window       : int   (maximum prompt tokens this server accepts)
+            host_id              : str   (stable machine identifier)
+            host_binding         : str   "host:port"
+            generated_at_epoch_s : int   (unix timestamp of this response)
+        """
+        import platform
+        import socket
+
+        model_loaded: bool = False
+        if _startup_state:
+            phase = getattr(_startup_state, "phase", "")
+            model_loaded = phase == "ready"
+
+        _ctx = getattr(_args, "ctx_size", 8192) if _args else 8192
+        context_window = int(os.environ.get("JARVIS_PRIME_CONTEXT_WINDOW", str(_ctx)))
+
+        host_id: str = ""
+        try:
+            _mid = Path("/etc/machine-id")
+            if _mid.exists():
+                host_id = _mid.read_text().strip()
+        except Exception:
+            pass
+        if not host_id:
+            try:
+                host_id = socket.gethostname()
+            except Exception:
+                host_id = platform.node() or "unknown"
+
+        _host = getattr(_args, "host", "0.0.0.0") if _args else "0.0.0.0"
+        _port = getattr(_args, "port", 8000) if _args else 8000
+        host_binding = f"{_host}:{_port}"
+
+        return {
+            "schema_version": "1.0.0",
+            "contract_version": "1.0.0",
+            "model_loaded": model_loaded,
+            "context_window": context_window,
+            "host_id": host_id,
+            "host_binding": host_binding,
+            "generated_at_epoch_s": int(time.time()),
+        }
+
+    # =========================================================================
     # MODEL HOT-RELOAD ENDPOINT - Reactor-Core Integration
     # =========================================================================
     class ModelReloadRequest(BaseModel):
