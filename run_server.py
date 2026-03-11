@@ -1726,6 +1726,38 @@ async def main():
         # Format messages
         from jarvis_prime.core.model_manager import ChatMessage
         messages = [ChatMessage(role=m.role, content=m.content) for m in request.messages]
+
+        # Defense-in-depth: append critical diff rules to the system prompt when this is
+        # a codegen request from Ouroboros (detected by "schema_version" in system content).
+        # The suffix is configurable via JPRIME_CODEGEN_SYSTEM_PROMPT_SUFFIX env var.
+        _codegen_suffix = os.environ.get(
+            "JPRIME_CODEGEN_SYSTEM_PROMPT_SUFFIX",
+            (
+                "\n\nCRITICAL DIFF RULES:\n"
+                "1. Context lines in unified_diff MUST be VERBATIM copies of lines from "
+                "the ## Source Snapshot shown above. Never reconstruct from memory.\n"
+                "2. Echo the source_sha256 value from the file header back in your JSON "
+                'response as "source_sha256": "<value>".\n'
+                "3. If the requested change is ALREADY present in the source file, respond "
+                'with {"schema_version": "2b.1-noop", "reason": "<why already done>"} '
+                "instead of generating a diff.\n"
+                "4. Line numbers in @@ headers must match the 1-based line numbers in the "
+                "source shown above — not line numbers from your training data."
+            ),
+        )
+        if _codegen_suffix:
+            messages = [
+                ChatMessage(
+                    role=m.role,
+                    content=(
+                        m.content + _codegen_suffix
+                        if m.role == "system" and "schema_version" in (m.content or "")
+                        else m.content
+                    ),
+                )
+                for m in messages
+            ]
+
         prompt = _executor.format_messages(messages)
         prompt_tokens = len(prompt.split())
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
