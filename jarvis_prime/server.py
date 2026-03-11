@@ -1644,7 +1644,8 @@ async def main():
                 try:
                     _mp = _executor._model_path  # Path | None
                     if _mp is not None:
-                        model_artifact = Path(_mp).name
+                        # Resolve symlinks so "current.gguf" → real filename
+                        model_artifact = Path(_mp).resolve().name
                         # Strip quantisation suffix and .gguf extension to get a
                         # clean human-readable model_id, e.g.:
                         #   "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
