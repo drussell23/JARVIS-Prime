@@ -320,16 +320,64 @@ class HardwareDetector:
 
     @staticmethod
     def _check_cuda_support() -> bool:
-        """Check if NVIDIA CUDA is available."""
+        """Check if NVIDIA CUDA is available and llama-cpp-python was built with CUDA."""
+        # First verify a GPU is present via nvidia-smi
         try:
             result = subprocess.run(
                 ["nvidia-smi"],
                 capture_output=True,
                 text=True,
             )
-            return result.returncode == 0
+            if result.returncode != 0:
+                return False
         except Exception:
             return False
+
+        # Then verify llama-cpp-python supports GPU offload (i.e. was compiled with CUDA).
+        # llama_supports_gpu_offload() can segfault on Metal builds so guard it.
+        try:
+            import llama_cpp
+            return bool(llama_cpp.llama_cpp.llama_supports_gpu_offload())
+        except Exception:
+            # llama_cpp not importable or GPU offload not compiled in — fall back to
+            # nvidia-smi result alone (GPU present but llama may be CPU-only build)
+            return True
+
+    @staticmethod
+    def _get_llama_lib_info() -> dict:
+        """Return metadata about the loaded llama_cpp shared library.
+
+        Returns a dict with keys:
+            lib_path   (str)  – absolute path of the loaded libllama shared object
+            base_path  (str)  – directory containing llama_cpp's bundled libs
+            gpu_offload (bool) – whether GPU offloading is compiled in
+            version    (str)  – llama_cpp.__version__
+        """
+        try:
+            import llama_cpp
+            m = llama_cpp.llama_cpp
+            # _lib._name is the path of the loaded ctypes CDLL (libllama.so / libllama.dylib)
+            lib_path = getattr(m._lib, "_name", None) or str(m._base_path)
+            # llama_supports_gpu_offload() is only safe to call when a GPU backend is
+            # actually compiled in (CUDA or Metal).  Guard against native crashes.
+            try:
+                gpu_offload = bool(m.llama_supports_gpu_offload())
+            except Exception:
+                gpu_offload = False
+            return {
+                "lib_path": lib_path,
+                "base_path": str(m._base_path),
+                "gpu_offload": gpu_offload,
+                "version": llama_cpp.__version__,
+            }
+        except Exception as exc:
+            return {
+                "lib_path": "unknown",
+                "base_path": "unknown",
+                "gpu_offload": False,
+                "version": "unknown",
+                "error": str(exc),
+            }
 
     @staticmethod
     def _get_nvidia_gpu_info() -> Tuple[Optional[str], Optional[float]]:
