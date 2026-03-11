@@ -1559,6 +1559,63 @@ async def main():
             
             return _startup_state.get_startup_status()
 
+        @app.get("/v1/capability")
+        async def capability():
+            """
+            Dedicated capability contract endpoint (NOT /health overload).
+
+            Returns the server's static capability contract for boot-time
+            assertion by unified_supervisor.  Callers assert contract_version
+            is within [min_runtime_contract_version, max_runtime_contract_version]
+            declared in brain_selection_policy.yaml.
+
+            Response shape (contract-stable):
+                schema_version       : semver string  e.g. "1.0.0"
+                contract_version     : semver string  e.g. "1.0.0"
+                model_loaded         : bool
+                context_window       : int   (maximum prompt tokens this server accepts)
+                host_id              : str   (stable machine identifier)
+                host_binding         : str   "host:port"
+                generated_at_epoch_s : int   (unix timestamp of this response)
+            """
+            import platform
+            import socket
+
+            model_loaded: bool = False
+            if _startup_state:
+                status = _startup_state.get_status()
+                model_loaded = bool(status.get("model_loaded", False))
+
+            # context_window: honour env override, else use server default 8192
+            context_window = int(os.environ.get("JARVIS_PRIME_CONTEXT_WINDOW", "8192"))
+
+            # Stable host identifier: prefer machine-id, fall back to hostname
+            host_id: str = ""
+            try:
+                _mid = Path("/etc/machine-id")
+                if _mid.exists():
+                    host_id = _mid.read_text().strip()
+            except Exception:
+                pass
+            if not host_id:
+                try:
+                    host_id = socket.gethostname()
+                except Exception:
+                    host_id = platform.node() or "unknown"
+
+            # Derive host_binding from listen address
+            host_binding = f"{args.host}:{args.port}"
+
+            return {
+                "schema_version": "1.0.0",
+                "contract_version": "1.0.0",
+                "model_loaded": model_loaded,
+                "context_window": context_window,
+                "host_id": host_id,
+                "host_binding": host_binding,
+                "generated_at_epoch_s": int(time.time()),
+            }
+
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""
