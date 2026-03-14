@@ -816,6 +816,12 @@ _jarvis_prime_bridge = None  # v238.0: Unified inference bridge (local-first + C
 _neural_orchestrator = None
 _executor = None
 _model_coordinator = None  # v241.0: GCP multi-model swap coordinator
+
+# Adaptive Quantization Engine (v2.0)
+_aqe_transition_manager = None
+_aqe_vram_monitor = None
+_aqe_vram_authority = None
+_aqe_monitor_task = None
 _classifier_loaded = False  # v242.0: Phi classifier state
 _classifier_system_prompt = ""  # v242.0: Cached system prompt
 _prompt_lock = None  # v242.1: Set after threading import below; guards _classifier_system_prompt
@@ -3740,6 +3746,97 @@ async def main():
                 logger.info("[v241] No model manifest found — single-model mode (backward compat)")
 
             # -----------------------------------------------------------------
+            # STEP 10c: Adaptive Quantization Engine
+            # -----------------------------------------------------------------
+            global _aqe_transition_manager, _aqe_vram_monitor, _aqe_vram_authority, _aqe_monitor_task
+            try:
+                from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor, VRAMMonitorConfig
+                from jarvis_prime.core.model_transition_manager import (
+                    ModelTransitionManager, VRAMBudgetAuthority, TransitionPolicy,
+                )
+                from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+
+                # Use existing hardware assessment for VRAM -- NOT hardcoded L4
+                _aqe_total_vram = 0
+                if _hardware_assessment and _hardware_assessment.has_gpu:
+                    try:
+                        import subprocess as _sp
+                        _nv = _sp.run(
+                            ["nvidia-smi", "--query-gpu=memory.total",
+                             "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if _nv.returncode == 0:
+                            _aqe_total_vram = int(float(_nv.stdout.strip()) * 1024 * 1024)
+                    except Exception:
+                        pass
+                if _aqe_total_vram == 0:
+                    logger.warning("[AQE] No GPU VRAM detected, skipping AQE wiring")
+                    raise RuntimeError("No GPU VRAM -- AQE requires GPU")
+
+                _aqe_vram_authority = VRAMBudgetAuthority(total_vram_bytes=_aqe_total_vram)
+                _aqe_vram_monitor = VRAMPressureMonitor(
+                    config=VRAMMonitorConfig(),
+                    node_id=os.getenv("JARVIS_HOST_ID", "gcp-jarvis-prime-stable"),
+                )
+                _models_dir = Path(os.getenv("GCP_MODELS_DIR", "models"))
+                if not _models_dir.is_absolute():
+                    _models_dir = Path(__file__).parent / _models_dir
+
+                _aqe_transition_manager = ModelTransitionManager(
+                    executor=_executor,
+                    vram_authority=_aqe_vram_authority,
+                    model_dir=_models_dir,
+                )
+
+                def _on_vram_pressure(event):
+                    """Handle pressure zone change -- generate proposal if warranted."""
+                    from jarvis_prime.core.vram_pressure_monitor import VRAMPressureZone
+                    if event.node_id != _aqe_vram_monitor._node_id:
+                        return
+                    if event.zone in (VRAMPressureZone.RED, VRAMPressureZone.CRITICAL):
+                        async def _handle_pressure():
+                            try:
+                                families = await scan_inventory(_models_dir)
+                                proposal = await propose_optimal(
+                                    families=families,
+                                    vram_budget_bytes=_aqe_vram_authority.available_bytes,
+                                    target_context=4096,
+                                    task_complexity="light",
+                                    current_model=None,
+                                    trigger="pressure",
+                                )
+                                if proposal:
+                                    await _aqe_transition_manager.accept(proposal)
+                            except Exception as e:
+                                logger.warning(f"[AQE] Pressure response failed: {e}")
+                        _task = asyncio.create_task(_handle_pressure())
+                        _background_tasks.add(_task)
+                        _task.add_done_callback(_background_tasks.discard)
+
+                _aqe_vram_monitor.on_pressure_change(_on_vram_pressure)
+
+                if _startup_state:
+                    _startup_state.transition_manager = _aqe_transition_manager
+                    _startup_state.vram_monitor = _aqe_vram_monitor
+
+                _aqe_monitor_task = asyncio.create_task(
+                    _aqe_vram_monitor.start(), name="aqe_vram_monitor"
+                )
+                _background_tasks.add(_aqe_monitor_task)
+                _aqe_monitor_task.add_done_callback(_background_tasks.discard)
+
+                logger.info(
+                    f"[AQE] Adaptive Quantization Engine wired: "
+                    f"VRAM={_aqe_total_vram / (1024**3):.1f}GB, "
+                    f"node={_aqe_vram_monitor._node_id}"
+                )
+            except ImportError as e:
+                logger.info(f"[AQE] Adaptive Quantization Engine not available: {e}")
+            except Exception as e:
+                logger.warning(f"[AQE] Failed to wire Adaptive Quantization Engine: {e}")
+
+            # -----------------------------------------------------------------
             # STEP 10b.1: v242.0 — Load Phi-3.5-mini as permanent classifier
             # -----------------------------------------------------------------
             global _classifier_loaded, _classifier_system_prompt
@@ -4001,6 +4098,16 @@ async def main():
         global _jarvis_prime_bridge  # v301.1: Fix UnboundLocalError on shutdown
 
         logger.info("Shutting down...")
+
+        # Adaptive Quantization Engine shutdown
+        if _aqe_monitor_task and not _aqe_monitor_task.done():
+            _aqe_monitor_task.cancel()
+            try:
+                await _aqe_monitor_task
+            except asyncio.CancelledError:
+                pass
+        if _aqe_vram_monitor:
+            await _aqe_vram_monitor.stop()
 
         # v97.0: Stop registry heartbeat and deregister
         if _registry_heartbeat_task and not _registry_heartbeat_task.done():
