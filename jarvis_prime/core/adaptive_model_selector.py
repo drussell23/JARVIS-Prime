@@ -248,3 +248,53 @@ async def propose_optimal(
         inventory_digest=digest,
         timestamp=time.time(),
     )
+
+
+# =============================================================================
+# PHASE 1 DOWNLOAD INTEGRITY (minimum guardrails)
+# =============================================================================
+
+import hashlib as _hashlib
+
+
+def verify_model_integrity(
+    model_path: Path,
+    expected_sha256: Optional[str] = None,
+    expected_size_bytes: Optional[int] = None,
+    tolerance: float = 0.01,  # 1% size tolerance for sparse files
+) -> Tuple[bool, str]:
+    """
+    Verify a model file's integrity.
+
+    Returns (ok, reason). Does NOT delete -- caller decides.
+    Phase 1: size check + optional SHA256. Phase 2 adds GGUF header validation.
+    """
+    if not model_path.exists():
+        return False, f"File not found: {model_path}"
+
+    actual_size = model_path.stat().st_size
+
+    # Size check (if expected size known)
+    if expected_size_bytes is not None:
+        lower = int(expected_size_bytes * (1 - tolerance))
+        upper = int(expected_size_bytes * (1 + tolerance))
+        if not (lower <= actual_size <= upper):
+            return False, (
+                f"Size mismatch: expected ~{expected_size_bytes:,} bytes, "
+                f"got {actual_size:,} bytes"
+            )
+
+    # SHA256 check (if hash known)
+    if expected_sha256:
+        sha = _hashlib.sha256()
+        with open(model_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                sha.update(chunk)
+        actual_hash = sha.hexdigest()
+        if actual_hash != expected_sha256:
+            return False, (
+                f"SHA256 mismatch: expected {expected_sha256[:16]}..., "
+                f"got {actual_hash[:16]}..."
+            )
+
+    return True, "OK"

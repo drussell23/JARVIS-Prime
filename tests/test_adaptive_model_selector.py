@@ -84,3 +84,43 @@ class TestProposeOptimal:
         )
         assert proposal is not None
         assert len(proposal.reason) > 0
+
+
+from jarvis_prime.core.adaptive_model_selector import verify_model_integrity
+
+
+class TestVerifyModelIntegrity:
+
+    def test_file_not_found(self, tmp_path):
+        ok, reason = verify_model_integrity(tmp_path / "nonexistent.gguf")
+        assert ok is False
+        assert "not found" in reason
+
+    def test_size_mismatch(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"\0" * 1000)
+        ok, reason = verify_model_integrity(f, expected_size_bytes=5000)
+        assert ok is False
+        assert "Size mismatch" in reason
+
+    def test_size_within_tolerance(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"\0" * 1000)
+        ok, _ = verify_model_integrity(f, expected_size_bytes=1005)  # <1% off
+        assert ok is True
+
+    def test_sha256_match(self, tmp_path):
+        import hashlib
+        data = b"hello model data"
+        f = tmp_path / "test.gguf"
+        f.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        ok, _ = verify_model_integrity(f, expected_sha256=expected)
+        assert ok is True
+
+    def test_sha256_mismatch(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"some data")
+        ok, reason = verify_model_integrity(f, expected_sha256="0000" * 16)
+        assert ok is False
+        assert "SHA256 mismatch" in reason
