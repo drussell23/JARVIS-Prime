@@ -1676,6 +1676,30 @@ async def main():
                 getattr(app, "_tok_s_estimate", 0) or 0
             )
 
+            # === Adaptive Quantization Engine fields (additive) ===
+            _aqe_epoch = {}
+            _aqe_pressure_zone = "unknown"
+
+            try:
+                from jarvis_prime.core.model_transition_manager import ModelTransitionManager
+                _tmgr = getattr(_startup_state, "transition_manager", None) if _startup_state else None
+                if _tmgr and isinstance(_tmgr, ModelTransitionManager):
+                    _aqe_status = _tmgr.status()
+                    _aqe_epoch = {
+                        "model_epoch": _aqe_status.get("model_epoch", 0),
+                        "cache_epoch": _aqe_status.get("cache_epoch", 0),
+                    }
+            except (ImportError, Exception):
+                pass
+
+            try:
+                from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor
+                _vmon = getattr(_startup_state, "vram_monitor", None) if _startup_state else None
+                if _vmon and isinstance(_vmon, VRAMPressureMonitor):
+                    _aqe_pressure_zone = _vmon.current_zone.value
+            except (ImportError, Exception):
+                pass
+
             return {
                 "schema_version": "1.0",
                 "contract_version": "1.0.0",
@@ -1691,6 +1715,9 @@ async def main():
                 "gpu_layers": gpu_layers,
                 "tok_s_estimate": tok_s_estimate,
                 "host": _hostname,
+                # === AQE extensions (additive, backwards-compatible) ===
+                "transition_epoch": _aqe_epoch,
+                "vram_pressure_zone": _aqe_pressure_zone,
             }
 
         @app.get("/trinity/status")
