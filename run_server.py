@@ -445,8 +445,10 @@ def _assess_hardware() -> HardwareAssessment:
         logger.warning(f"[v138.0] Hardware detection error: {e}")
 
     # Detect GPU
+    gpu_vram_gb = 0.0
     if is_apple_silicon:
         has_gpu = True
+        gpu_vram_gb = total_ram_gb  # Apple Silicon uses unified memory
         # Detect specific Apple Silicon chip
         try:
             import subprocess
@@ -467,33 +469,55 @@ def _assess_hardware() -> HardwareAssessment:
                 gpu_name = f"Apple Silicon GPU ({chip_info})"
         except Exception:
             gpu_name = "Apple Silicon GPU"
+    else:
+        # v151.0: Detect NVIDIA GPU VRAM via nvidia-smi
+        try:
+            import subprocess
+            nv_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total,name", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if nv_result.returncode == 0 and nv_result.stdout.strip():
+                parts = nv_result.stdout.strip().split("\n")[0].split(",")
+                gpu_vram_gb = float(parts[0].strip()) / 1024
+                gpu_name = parts[1].strip() if len(parts) > 1 else "NVIDIA GPU"
+                has_gpu = True
+                logger.info(f"[v151.0] Detected {gpu_name} with {gpu_vram_gb:.1f}GB VRAM")
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+            pass  # No NVIDIA GPU
+
+    # v151.0: For GPU inference, VRAM is the relevant memory, not system RAM
+    # A g2-standard-4 with 15.6GB RAM + 23GB L4 VRAM should be FULL, not CLOUD_ONLY
+    effective_memory_gb = max(total_ram_gb, gpu_vram_gb) if has_gpu and gpu_vram_gb > 0 else total_ram_gb
+    if effective_memory_gb != total_ram_gb:
+        logger.info(f"[v151.0] Using GPU VRAM ({gpu_vram_gb:.1f}GB) for profile detection instead of system RAM ({total_ram_gb:.1f}GB)")
 
     # Classify hardware profile
-    if total_ram_gb < 16:
+    if effective_memory_gb < 16:
         profile = HardwareProfile.CLOUD_ONLY
         skip_agi_hub = True
         enable_slim_mode = True
         defer_heavy_subsystems = True
-        reason = f"Insufficient RAM ({total_ram_gb:.1f}GB < 16GB) - CLOUD ONLY mode"
-        recommended_gpu_layers = 0  # Don't use GPU for model on low-memory systems
+        reason = f"Insufficient memory ({effective_memory_gb:.1f}GB effective, {total_ram_gb:.1f}GB RAM, {gpu_vram_gb:.1f}GB VRAM) - CLOUD ONLY mode"
+        recommended_gpu_layers = 0
         recommended_context_size = 1024
 
-    elif total_ram_gb < 30:
+    elif effective_memory_gb < 30:
         profile = HardwareProfile.SLIM
         skip_agi_hub = False
         enable_slim_mode = True
         defer_heavy_subsystems = True
-        reason = f"Moderate RAM ({total_ram_gb:.1f}GB) - SLIM MODE with staged initialization"
-        recommended_gpu_layers = -1 if is_apple_silicon else 0
+        reason = f"Moderate memory ({effective_memory_gb:.1f}GB effective) - SLIM MODE with staged initialization"
+        recommended_gpu_layers = -1 if (is_apple_silicon or has_gpu) else 0
         recommended_context_size = 2048
 
-    elif total_ram_gb < 64:
+    elif effective_memory_gb < 64:
         profile = HardwareProfile.FULL
         skip_agi_hub = False
         enable_slim_mode = False
         defer_heavy_subsystems = False
-        reason = f"Adequate RAM ({total_ram_gb:.1f}GB) - FULL MODE with memory gates"
-        recommended_gpu_layers = -1 if is_apple_silicon else 32
+        reason = f"Adequate memory ({effective_memory_gb:.1f}GB effective) - FULL MODE with memory gates"
+        recommended_gpu_layers = -1 if (is_apple_silicon or has_gpu) else 32
         recommended_context_size = 4096
 
     else:
@@ -501,7 +525,7 @@ def _assess_hardware() -> HardwareAssessment:
         skip_agi_hub = False
         enable_slim_mode = False
         defer_heavy_subsystems = False
-        reason = f"Abundant RAM ({total_ram_gb:.1f}GB) - UNLIMITED MODE"
+        reason = f"Abundant memory ({effective_memory_gb:.1f}GB effective) - UNLIMITED MODE"
         recommended_gpu_layers = -1
         recommended_context_size = 8192
 

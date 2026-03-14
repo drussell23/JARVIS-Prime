@@ -106,7 +106,34 @@ class HollowGuardConfig:
                 total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
         except (ImportError, ValueError):
             total_ram_gb = 16.0  # Conservative default
-        
+
+        # v151.0: Detect GPU VRAM — for GPU inference, VRAM matters more than system RAM
+        gpu_vram_gb = 0.0
+        has_dedicated_gpu = False
+        try:
+            gpu_vram_env = os.environ.get("JARVIS_GPU_VRAM_GB", "")
+            if gpu_vram_env:
+                gpu_vram_gb = float(gpu_vram_env)
+                has_dedicated_gpu = gpu_vram_gb > 0
+            else:
+                # Auto-detect NVIDIA GPU VRAM via nvidia-smi
+                import subprocess
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    gpu_vram_mb = float(result.stdout.strip().split("\n")[0])
+                    gpu_vram_gb = gpu_vram_mb / 1024
+                    has_dedicated_gpu = True
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+            pass  # No NVIDIA GPU or nvidia-smi not available
+
+        # v151.0: For profile auto-detection, use the LARGER of system RAM or GPU VRAM
+        # GPU inference loads models into VRAM, not system RAM, so a machine with
+        # 15.6GB RAM but 23GB VRAM (like g2-standard-4 + L4) should be FULL, not CLOUD_ONLY
+        effective_memory_gb = max(total_ram_gb, gpu_vram_gb) if has_dedicated_gpu else total_ram_gb
+
         # Determine profile
         # v150.0: Environment override takes PRIORITY over RAM detection
         # This allows users to force local ML on SLIM hardware (e.g., TinyLlama on 16GB)
@@ -122,12 +149,12 @@ class HollowGuardConfig:
         elif profile_name == "CLOUD_ONLY" or force_hollow:
             # Explicit CLOUD_ONLY or forced - block all ML
             profile = HollowProfile.CLOUD_ONLY
-        # RAM-based auto-detection (only when no explicit profile set)
-        elif total_ram_gb < 16:
+        # v151.0: Auto-detection uses effective_memory_gb (considers GPU VRAM)
+        elif effective_memory_gb < 16:
             profile = HollowProfile.CLOUD_ONLY
-        elif slim_mode or total_ram_gb < 32:
+        elif slim_mode or effective_memory_gb < 32:
             profile = HollowProfile.SLIM
-        elif total_ram_gb < 64:
+        elif effective_memory_gb < 64:
             profile = HollowProfile.FULL
         else:
             profile = HollowProfile.UNLIMITED
