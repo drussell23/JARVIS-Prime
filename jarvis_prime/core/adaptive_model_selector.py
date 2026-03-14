@@ -298,3 +298,60 @@ def verify_model_integrity(
             )
 
     return True, "OK"
+
+
+async def atomic_download_model(
+    url: str,
+    target_path: Path,
+    expected_sha256: Optional[str] = None,
+    expected_size_bytes: Optional[int] = None,
+    timeout_s: float = 1800.0,  # 30 min
+) -> Tuple[bool, str]:
+    """
+    Download model to temp file, verify, then atomic rename.
+
+    Phase 1: basic download + verify + rename.
+    Phase 2: quarantine pipeline, retry policy, progress tracking.
+    """
+    import asyncio
+    import shutil
+
+    # Pre-check disk space
+    if expected_size_bytes:
+        free = shutil.disk_usage(target_path.parent).free
+        required = int(expected_size_bytes * 1.1)  # 10% safety margin
+        if free < required:
+            return False, f"Insufficient disk: {free:,} < {required:,} bytes needed"
+
+    # Download to temp file in same directory (same filesystem for atomic rename)
+    tmp_path = target_path.parent / f".downloading-{target_path.name}.tmp"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "wget", "-q", "-O", str(tmp_path), url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Download timed out after {timeout_s}s"
+
+        if proc.returncode != 0:
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Download failed: {stderr.decode()[:200]}"
+
+        # Verify integrity before atomic rename
+        ok, reason = verify_model_integrity(tmp_path, expected_sha256, expected_size_bytes)
+        if not ok:
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Integrity check failed: {reason}"
+
+        # Atomic rename (same filesystem)
+        tmp_path.rename(target_path)
+        return True, "OK"
+
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        return False, f"Download error: {e}"
