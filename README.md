@@ -8,6 +8,52 @@ JARVIS Prime is the **cognitive layer** of the JARVIS AGI ecosystem. It runs **1
 
 ---
 
+## Session Update (2026-03-18): Unlock-Domain Safeguards and Fast-Path Classification
+
+This session hardened J-Prime against a recurring cross-repo failure mode: biometric unlock utterances being misclassified as workspace/general tasks. Prime now applies explicit unlock-domain safeguards before standard LLM classification.
+
+### 1) Classification Schema Hardening
+
+`jarvis_prime/core/classification_schema.py` now includes explicit unlock semantics:
+
+- Added `voice_unlock` to the domain enum and `DOMAIN_TO_TASK_TYPE`.
+- Added seven example mappings covering common unlock phrasing variants.
+- Added a CRITICAL guardrail note that unlock utterances must not be routed as workspace tasks.
+
+This gives both rule-based and model-driven paths a stable canonical domain for unlock requests.
+
+### 2) J-Prime Spinal Reflex (v284.0)
+
+`run_server.py` now applies a lightweight Python unlock-pattern guard before invoking Phi classification:
+
+- If unlock intent is detected, the request short-circuits directly to `voice_unlock` domain.
+- Bypass path executes in sub-millisecond to low-millisecond range and avoids unnecessary LLM classification.
+- Result: unlock routing remains deterministic even when prompt/classifier behavior drifts.
+
+### 3) Enriched Query Hints from Body
+
+`backend/core/jarvis_prime_client.py` now forwards unlock intent hints into Prime request context:
+
+- `domain_hint`
+- `not_workspace`
+
+These keys are rendered into the enriched query payload so Prime-side classifiers and guards receive explicit anti-misrouting intent signals.
+
+### 4) Why This Matters in Trinity
+
+Unlock correctness now has protection at both sides of the Body↔Mind boundary:
+
+- **Body-side:** reflex + pre-flight guards + score biasing toward unlock.
+- **Prime-side:** schema-level unlock domain + pre-classification spinal reflex.
+
+Combined, this significantly reduces the probability that biometric commands are treated as generic workspace operations.
+
+### 5) Validation
+
+Cross-repo nuance routing tests for unlock phrasing and paraphrases completed with **50/50 pass rate** in this session.
+
+---
+
 ## 🎯 What is JARVIS Prime?
 
 JARVIS Prime is the **Mind** in the three-repo Trinity architecture:
