@@ -1596,7 +1596,46 @@ async def main():
         _classification = None
         _classification_ms = 0
 
-        if _classifier_loaded and _phi_circuit.can_execute():
+        # v284.0: J-Prime-side spinal reflex for voice_unlock — sub-millisecond
+        # bypass of Phi classify() for unlock paraphrases. The Body's pre-flight
+        # guard handles obvious phrases; this catches anything that slips through.
+        _last_msg = (request.messages[-1].content if request.messages else "").lower().strip()
+        # Strip wake-word prefix before pattern matching
+        for _ww in ("hey jarvis ", "jarvis ", "ok jarvis ", "hey j "):
+            if _last_msg.startswith(_ww):
+                _last_msg = _last_msg[len(_ww):]
+                break
+        _UNLOCK_EXACT_JP = frozenset({
+            "unlock my screen", "unlock the screen", "unlock screen",
+            "unlock my mac", "unlock the mac", "unlock mac",
+            "unlock my computer", "unlock my laptop", "open my screen",
+            "wake my screen", "unlock it", "unlock it please", "unlock for me",
+            "please unlock my screen", "can you unlock my screen",
+            "unlock with voice", "unlock with my voice", "voice unlock",
+        })
+        _UNLOCK_SCREEN_WORDS_JP = frozenset({"screen", "mac", "computer", "laptop", "desktop"})
+        _is_unlock_jp = (
+            _last_msg in _UNLOCK_EXACT_JP
+            or any(p in _last_msg for p in _UNLOCK_EXACT_JP)
+            or ("unlock" in _last_msg.split() and bool(_UNLOCK_SCREEN_WORDS_JP & set(_last_msg.split())))
+        )
+        if _is_unlock_jp:
+            _classification = {
+                "schema_version": SCHEMA_VERSION,
+                "intent": "action",
+                "domain": "voice_unlock",
+                "complexity": "trivial",
+                "requires_vision": False,
+                "requires_action": True,
+                "escalate_to_claude": False,
+                "confidence": 0.99,
+                "suggested_actions": ["unlock_screen"],
+            }
+            _v241_task_type = "voice_command"
+            _classification_ms = 0
+            logger.info("[v284] J-Prime spinal reflex: voice_unlock matched '%s'", _last_msg[:80])
+
+        if _classification is None and _classifier_loaded and _phi_circuit.can_execute():
             _classification_metrics["total"] += 1
             _t0 = time.monotonic()
             try:
@@ -1625,8 +1664,9 @@ async def main():
                 )
                 _classification = None
                 _v241_task_type = request.metadata.get("task_type") if request.metadata else None
-        else:
-            # Fallback: use Body's metadata hint (pre-v242 compatibility)
+        elif _classification is None:
+            # Fallback: use Body's metadata hint (pre-v242 compatibility).
+            # Only runs when neither reflex nor Phi set a classification.
             _v241_task_type = request.metadata.get("task_type") if request.metadata else None
             # v242.1: Track circuit breaker trips
             if _classifier_loaded and not _phi_circuit.can_execute():

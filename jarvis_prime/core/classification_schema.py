@@ -29,7 +29,7 @@ CLASSIFICATION_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "enum": [
                 "math", "code", "reasoning", "creative", "general",
-                "system", "vision", "agentic", "translation",
+                "system", "voice_unlock", "vision", "agentic", "translation",
                 "conversation", "surveillance", "workspace",
             ],
         },
@@ -67,6 +67,7 @@ DOMAIN_TO_TASK_TYPE: Dict[str, str] = {
     "conversation": "greeting",
     "surveillance": "voice_command",
     "workspace": "voice_command",
+    "voice_unlock": "voice_command",
 }
 
 # Domains where Phi can both classify AND respond (no specialist needed)
@@ -99,7 +100,8 @@ Output JSON with these fields:
   - "vision_needed": user is asking about something visual (screen content, image analysis)
   - "clarify": query is ambiguous, ask user to clarify
   - "conversation": greeting, small talk, or casual interaction
-- domain: one of [math, code, reasoning, creative, general, system, vision, agentic, translation, conversation, surveillance, workspace]
+- domain: one of [math, code, reasoning, creative, general, system, voice_unlock, vision, agentic, translation, conversation, surveillance, workspace]
+  - CRITICAL: "voice_unlock" is for ANY command to unlock/open/wake the screen, computer, Mac, or laptop via voice. NEVER classify unlock commands as workspace.
 - complexity: one of [trivial, simple, moderate, complex, expert]
 - requires_vision: true if the query needs to see the screen or an image
 - requires_action: true if the query needs the Body to execute a system action
@@ -111,7 +113,13 @@ Output JSON with these fields:
 
 Examples:
 - "what's today" -> intent=answer, domain=general, complexity=trivial, confidence=0.95
-- "lock my screen" -> intent=action, domain=system, complexity=trivial, confidence=0.99
+- "lock my screen" -> intent=action, domain=system, complexity=trivial, confidence=0.99, suggested_actions=["lock_screen"]
+- "unlock my screen" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.99, requires_action=true, suggested_actions=["unlock_screen"]
+- "unlock the mac" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.99, requires_action=true, suggested_actions=["unlock_screen"]
+- "unlock my computer" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.99, requires_action=true, suggested_actions=["unlock_screen"]
+- "unlock my laptop" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.99, requires_action=true, suggested_actions=["unlock_screen"]
+- "wake my screen" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.98, requires_action=true, suggested_actions=["unlock_screen"]
+- "open my screen" -> intent=action, domain=voice_unlock, complexity=trivial, confidence=0.97, requires_action=true, suggested_actions=["unlock_screen"]
 - "what's on my screen" -> intent=vision_needed, domain=vision, requires_vision=true, confidence=0.92
 - "what's the derivative of x squared" -> intent=answer, domain=math, complexity=moderate, confidence=0.93
 - "open Safari and go to GitHub" -> intent=multi_step_action, domain=agentic, escalate_to_claude=true, confidence=0.88
