@@ -79,6 +79,48 @@ try:
 except ImportError:
     AIOHTTP_AVAILABLE = False
 
+# v296.0: Operation lifecycle poller — primary from JARVIS repo, fallback to local copy
+import hashlib as _hashlib
+import os as _os
+import sys as _sys
+
+def _load_gcp_operation_poller():
+    """Import GCPOperationPoller with cross-repo primary + local fallback."""
+    _jarvis_path = _os.environ.get("JARVIS_REPO_PATH", "")
+    if _jarvis_path and _jarvis_path not in _sys.path:
+        _sys.path.insert(0, _jarvis_path)
+    try:
+        from backend.core.gcp_operation_poller import (
+            GCPOperationPoller, OperationLifecycleRegistry,
+            OperationResult, get_operation_registry,
+        )
+        return GCPOperationPoller, OperationLifecycleRegistry, OperationResult, True
+    except ImportError:
+        pass
+    try:
+        from jarvis_prime.core.gcp_operation_poller import (
+            GCPOperationPoller, OperationLifecycleRegistry,
+            OperationResult, get_operation_registry,
+        )
+        # Hash check between primary and local copy (best-effort)
+        _primary_path = _os.path.join(_jarvis_path, "backend", "core", "gcp_operation_poller.py")
+        _local_path = _os.path.join(_os.path.dirname(__file__), "gcp_operation_poller.py")
+        if _os.path.exists(_primary_path) and _os.path.exists(_local_path):
+            def _fphash(p):
+                return _hashlib.sha256(open(p, "rb").read(8192)).hexdigest()
+            if _fphash(_primary_path) != _fphash(_local_path):
+                logger.critical(
+                    "[GCPOperationPoller] Local fallback copy differs from primary — "
+                    "using local; ensure sync. Dedup registry disabled."
+                )
+                GCPOperationPoller._dedup_enabled = False
+        return GCPOperationPoller, OperationLifecycleRegistry, OperationResult, True
+    except ImportError:
+        return None, None, None, False
+
+(GCPOperationPoller, OperationLifecycleRegistry,
+ OperationResult, _OPERATION_POLLER_AVAILABLE) = _load_gcp_operation_poller()
+
 
 # =============================================================================
 # CONFIGURATION
@@ -484,7 +526,10 @@ class GCPClient:
         )
 
         # Wait for operation to complete
-        await self._wait_for_operation(operation, vm_config.zone)
+        await self._wait_for_operation(
+            operation, vm_config.zone,
+            action="create", instance_name=vm_config.name,
+        )
 
         # Get instance details
         return await self.get_instance(vm_config.name, vm_config.zone)
@@ -504,7 +549,10 @@ class GCPClient:
                     instance=name,
                 )
             )
-            await self._wait_for_operation(operation, zone)
+            await self._wait_for_operation(
+                operation, zone,
+                action="delete", instance_name=name,
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to delete instance {name}: {e}")
@@ -604,7 +652,10 @@ class GCPClient:
                     instance=name,
                 )
             )
-            await self._wait_for_operation(operation, zone)
+            await self._wait_for_operation(
+                operation, zone,
+                action="start", instance_name=name,
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to start instance {name}: {e}")
@@ -625,7 +676,10 @@ class GCPClient:
                     instance=name,
                 )
             )
-            await self._wait_for_operation(operation, zone)
+            await self._wait_for_operation(
+                operation, zone,
+                action="stop", instance_name=name,
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to stop instance {name}: {e}")
@@ -651,7 +705,70 @@ class GCPClient:
 
         return False
 
-    async def _wait_for_operation(self, operation, zone: str, timeout: int = 300):
+    async def _wait_for_operation(
+        self,
+        operation,
+        zone: str = "",
+        timeout: int = 300,
+        *,
+        action: str = "unknown",
+        instance_name: str = "",
+        postcondition=None,
+    ):
+        """
+        v296.0: Delegates to GCPOperationPoller.
+
+        The zone param is retained for API compatibility but is ignored —
+        scope is always extracted from the operation object itself.
+        Falls back to legacy behavior if the poller module is unavailable.
+        """
+        if not _OPERATION_POLLER_AVAILABLE or GCPOperationPoller is None:
+            return await self._wait_for_operation_legacy(operation, zone, timeout)
+
+        if not hasattr(self, "_op_registry") or self._op_registry is None:
+            self._op_registry = OperationLifecycleRegistry(
+                supervisor_epoch=int(time.time() * 1000)
+            )
+
+        ops_client = getattr(self, "_zone_ops_client", None)
+        if ops_client is None and GCP_SDK_AVAILABLE:
+            try:
+                ops_client = compute_v1.ZoneOperationsClient()
+                self._zone_ops_client = ops_client
+            except Exception:
+                return await self._wait_for_operation_legacy(operation, zone, timeout)
+
+        if ops_client is None:
+            return await self._wait_for_operation_legacy(operation, zone, timeout)
+
+        import uuid as _uuid
+        poller = GCPOperationPoller(
+            operations_client=ops_client,
+            registry=self._op_registry,
+            project=self._config.project_id,
+            postcondition=postcondition,
+            timeout=float(timeout),
+        )
+        result = await poller.wait(
+            operation,
+            action=action,
+            instance_name=instance_name,
+            correlation_id=str(_uuid.uuid4()),
+        )
+        if not result.success:
+            if result.reason.value in ("op_done_failure", "permission_denied",
+                                        "invalid_request", "scope_contract_error",
+                                        "not_found_postcondition_fail"):
+                raise RuntimeError(
+                    f"GCP operation {operation.name} failed: "
+                    f"{result.reason.value} — {result.error_message}"
+                )
+            logger.warning(
+                "[GCPVMManager/Prime] Operation ended non-fatally: op=%s reason=%s msg=%s",
+                operation.name, result.reason.value, result.error_message,
+            )
+
+    async def _wait_for_operation_legacy(self, operation, zone: str, timeout: int = 300):
         """Wait for a GCP operation to complete."""
         if not GCP_SDK_AVAILABLE:
             return
