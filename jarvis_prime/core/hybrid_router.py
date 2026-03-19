@@ -1877,3 +1877,123 @@ async def shutdown_cognitive_router() -> None:
         if _cognitive_router is not None:
             await _cognitive_router.stop()
             _cognitive_router = None
+
+
+# =============================================================================
+# v295.0: BrainPolicyReader — JARVIS brain_selection_policy.yaml integration
+# =============================================================================
+
+class BrainPolicyReader:
+    """Read JARVIS's brain_selection_policy.yaml for unified complexity tiers.
+
+    J-Prime makes its own routing decisions, but they should be *consistent*
+    with the tiers that JARVIS assigns to interactive task types.  This class
+    reads the shared policy file and exposes:
+
+    - ``get_task_complexity_map()``  — full task_type → complexity dict
+    - ``complexity_for_task(task_type)`` → "trivial" | "light" | "heavy" | "complex"
+    - ``complexity_score(task_type)``  → 0.0 – 1.0  (blendable into routing signals)
+
+    Hot-reloads when the YAML file changes (same mtime-check pattern as
+    InteractiveBrainRouter in JARVIS).  Falls back to empty dict gracefully
+    when the JARVIS repo is not mounted (e.g., in a standalone J-Prime test).
+    """
+
+    # Numeric scores blended into J-Prime's 0.0–1.0 complexity axis
+    _COMPLEXITY_SCORES: Dict[str, float] = {
+        "trivial": 0.05,
+        "light":   0.30,
+        "heavy":   0.65,
+        "complex": 0.90,
+    }
+
+    # Default search locations for the policy file, most-specific first
+    _DEFAULT_PATHS: List[Path] = [
+        # When jarvis-prime and JARVIS repos live side-by-side
+        Path(__file__).parent.parent.parent.parent
+        / "JARVIS-AI-Agent"
+        / "backend" / "core" / "ouroboros" / "governance"
+        / "brain_selection_policy.yaml",
+        # Environment variable override
+        Path(os.getenv("JARVIS_BRAIN_POLICY_PATH", "__missing__")),
+        # Explicit relative path from JARVIS_REPO_PATH env
+        Path(os.getenv("JARVIS_REPO_PATH", "."))
+        / "backend" / "core" / "ouroboros" / "governance"
+        / "brain_selection_policy.yaml",
+    ]
+
+    def __init__(self) -> None:
+        self._policy_path: Optional[Path] = self._find_policy_file()
+        self._mtime: float = 0.0
+        self._task_complexity: Dict[str, str] = {}
+        if self._policy_path:
+            self._reload()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def get_task_complexity_map(self) -> Dict[str, str]:
+        """Return the full task_type → complexity mapping from the policy."""
+        self._maybe_reload()
+        return dict(self._task_complexity)
+
+    def complexity_for_task(self, task_type: str) -> str:
+        """Return the complexity tier for *task_type* (default: 'light')."""
+        self._maybe_reload()
+        return self._task_complexity.get(task_type, "light")
+
+    def complexity_score(self, task_type: str) -> float:
+        """Return a 0.0–1.0 complexity score suitable for blending into routing signals."""
+        return self._COMPLEXITY_SCORES.get(self.complexity_for_task(task_type), 0.30)
+
+    # ── Internal ───────────────────────────────────────────────────────────
+
+    def _find_policy_file(self) -> Optional[Path]:
+        for p in self._DEFAULT_PATHS:
+            if p.exists():
+                return p
+        return None
+
+    def _maybe_reload(self) -> None:
+        if self._policy_path is None:
+            return
+        try:
+            mtime = self._policy_path.stat().st_mtime
+            if mtime > self._mtime:
+                self._reload()
+        except Exception:
+            pass
+
+    def _reload(self) -> None:
+        if self._policy_path is None:
+            return
+        try:
+            import yaml  # optional dep — graceful skip if not installed
+            with open(self._policy_path) as f:
+                policy = yaml.safe_load(f) or {}
+            self._mtime = self._policy_path.stat().st_mtime
+            # Extract task_complexity section written by InteractiveBrainRouter
+            self._task_complexity = dict(
+                policy.get("interactive_task_complexity", {})
+                or policy.get("task_complexity", {})
+            )
+            logger.info(
+                "[BrainPolicyReader] Loaded %d task types from %s",
+                len(self._task_complexity),
+                self._policy_path,
+            )
+        except ImportError:
+            logger.debug("[BrainPolicyReader] PyYAML not available — policy blending disabled")
+        except Exception as exc:
+            logger.debug("[BrainPolicyReader] Policy reload failed: %s", exc)
+
+
+# Module-level singleton — zero cost when J-Prime runs without JARVIS repo
+_brain_policy_reader: Optional[BrainPolicyReader] = None
+
+
+def get_brain_policy_reader() -> BrainPolicyReader:
+    """Return the global BrainPolicyReader singleton (lazy init)."""
+    global _brain_policy_reader
+    if _brain_policy_reader is None:
+        _brain_policy_reader = BrainPolicyReader()
+    return _brain_policy_reader
