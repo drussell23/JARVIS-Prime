@@ -1,7 +1,8 @@
 """
-Mind-Body protocol package — J-Prime reasoning schemas.
+Mind-Body protocol package — J-Prime reasoning schemas and brain selector.
 
-Exports all public protocol models and version constants.
+Exports all public protocol models, version constants, and the
+UnifiedBrainSelector / UnifiedBrainSelection types.
 """
 from jarvis_prime.reasoning.protocol import (
     PROTOCOL_VERSION,
@@ -21,11 +22,17 @@ from jarvis_prime.reasoning.protocol import (
     StepResult,
     SubGoal,
 )
+from jarvis_prime.reasoning.unified_brain_selector import (
+    UnifiedBrainSelection,
+    UnifiedBrainSelector,
+)
 
 __all__ = [
+    # Protocol version constants
     "PROTOCOL_VERSION",
     "MIN_SUPPORTED_VERSION",
     "MAX_SUPPORTED_VERSION",
+    # Protocol models
     "AuthEnvelope",
     "Classification",
     "Constraints",
@@ -39,4 +46,7 @@ __all__ = [
     "RoutingTrace",
     "StepResult",
     "SubGoal",
+    # Brain selector
+    "UnifiedBrainSelection",
+    "UnifiedBrainSelector",
 ]
