@@ -1720,6 +1720,19 @@ async def main():
                 "vram_pressure_zone": _aqe_pressure_zone,
             }
 
+        # v295.0: Reasoning endpoints (Mind-Body protocol)
+        @app.get("/v1/reason/health")
+        async def reason_health():
+            """Mind health + loaded brains + graph readiness."""
+            from jarvis_prime.reasoning.endpoints import get_reason_health
+            return await get_reason_health()
+
+        @app.get("/v1/protocol/version")
+        async def protocol_version():
+            """Protocol version negotiation + feature flags."""
+            from jarvis_prime.reasoning.endpoints import get_protocol_version
+            return await get_protocol_version()
+
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""
