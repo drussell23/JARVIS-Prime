@@ -28,6 +28,10 @@ from jarvis_prime.reasoning.protocol import (
     PROTOCOL_VERSION,
     MIN_SUPPORTED_VERSION,
     MAX_SUPPORTED_VERSION,
+    Classification,
+    ReasonRequest,
+    ReasonResponse,
+    RoutingTrace,
 )
 
 # ---------------------------------------------------------------------------
@@ -157,3 +161,77 @@ async def get_reason_health() -> Dict[str, Any]:
         "brain_policy_hash": policy_hash,
         "reasoning_graph_ready": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Brain selector singleton (lazy-initialised, one instance per process)
+# ---------------------------------------------------------------------------
+
+_brain_selector = None
+
+
+def _get_brain_selector():
+    """Return the process-level UnifiedBrainSelector, creating it on first call."""
+    global _brain_selector
+    if _brain_selector is None:
+        from jarvis_prime.reasoning.unified_brain_selector import UnifiedBrainSelector  # lazy
+        _brain_selector = UnifiedBrainSelector()
+    return _brain_selector
+
+
+# ---------------------------------------------------------------------------
+# handle_brain_select — backs POST /v1/reason/select
+# ---------------------------------------------------------------------------
+
+
+async def handle_brain_select(req: ReasonRequest) -> dict:
+    """
+    Handler for POST /v1/reason/select.
+
+    Runs the UnifiedBrainSelector 4-layer gate against the incoming
+    ReasonRequest and returns a ReasonResponse serialised to a plain dict.
+
+    Response fields
+    ---------------
+    status          "plan_ready"
+    served_mode     "LEVEL_0_PRIMARY"
+    classification  brain_used, complexity, confidence, graph_depth, intent
+    routing_trace   analysis_brain, cost_gate_passed, resource_gate_passed
+    """
+    selector = _get_brain_selector()
+
+    # Extract task_type from request context; fall back to "classification"
+    task_type: str = str(req.context.get("task_type", "classification"))
+
+    selection = selector.select(task_type=task_type, command=req.command)
+
+    # Confidence: 1.0 when cost gate passes, 0.5 when it fails (degraded mode)
+    confidence: float = 1.0 if selection.cost_gate_passed else 0.5
+
+    classification = Classification(
+        intent=task_type,
+        complexity=selection.complexity,
+        confidence=confidence,
+        brain_used=selection.brain_id,
+        graph_depth=selection.graph_depth,
+    )
+
+    routing_trace = RoutingTrace(
+        analysis_brain=selection.brain_id,
+        planning_brain=selection.brain_id,
+        cost_gate_passed=selection.cost_gate_passed,
+        resource_gate_passed=selection.resource_gate_passed,
+    )
+
+    resp = ReasonResponse(
+        protocol_version=PROTOCOL_VERSION,
+        request_id=req.request_id,
+        session_id=req.session_id,
+        trace_id=req.trace_id,
+        status="plan_ready",
+        served_mode="LEVEL_0_PRIMARY",
+        classification=classification,
+        routing_trace=routing_trace,
+    )
+
+    return resp.model_dump(mode="json")

@@ -154,7 +154,7 @@ class TestClassification:
         assert isinstance(cl.complexity, str)
         assert isinstance(cl.confidence, float)
         assert isinstance(cl.brain_used, str)
-        assert isinstance(cl.graph_depth, int)
+        assert isinstance(cl.graph_depth, str)
 
     def test_roundtrip(self):
         cl = Classification(
@@ -162,12 +162,12 @@ class TestClassification:
             complexity="medium",
             confidence=0.95,
             brain_used="prime-7b",
-            graph_depth=3,
+            graph_depth="full",
         )
         restored = Classification.model_validate(cl.model_dump())
         assert restored.intent == "code_generation"
         assert restored.confidence == pytest.approx(0.95)
-        assert restored.graph_depth == 3
+        assert restored.graph_depth == "full"
 
     def test_json_serializable(self):
         cl = Classification(intent="chat")

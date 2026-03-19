@@ -76,7 +76,7 @@ class Classification(BaseModel):
     complexity: str = ""
     confidence: float = 0.0
     brain_used: str = ""
-    graph_depth: int = 0
+    graph_depth: str = ""
 
 
 class SubGoal(BaseModel):

@@ -66,3 +66,43 @@ async def test_protocol_version_features_is_list_of_strings():
     assert isinstance(features, list)
     for f in features:
         assert isinstance(f, str)
+
+
+# ---------------------------------------------------------------------------
+# Tests for handle_brain_select (POST /v1/reason/select)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reason_brain_select():
+    """Test the brain selection handler."""
+    from jarvis_prime.reasoning.endpoints import handle_brain_select
+    from jarvis_prime.reasoning.protocol import ReasonRequest
+
+    req = ReasonRequest(
+        request_id="req-test-001",
+        session_id="sess-test",
+        trace_id="trace-test",
+        command="open Safari",
+        context={"speaker": "Derek"},
+    )
+    resp = await handle_brain_select(req)
+    assert resp["status"] == "plan_ready"
+    assert resp["served_mode"] == "LEVEL_0_PRIMARY"
+    assert resp["classification"]["brain_used"] != ""
+    assert resp["classification"]["complexity"] in ("trivial", "light", "heavy", "complex")
+
+
+@pytest.mark.asyncio
+async def test_reason_brain_select_complex():
+    from jarvis_prime.reasoning.endpoints import handle_brain_select
+    from jarvis_prime.reasoning.protocol import ReasonRequest
+
+    req = ReasonRequest(
+        request_id="req-test-002",
+        session_id="sess-test",
+        trace_id="trace-test",
+        command="analyze the root cause of our competitor's pricing strategy",
+    )
+    resp = await handle_brain_select(req)
+    assert resp["classification"]["complexity"] == "complex"
+    assert resp["classification"]["graph_depth"] == "full"

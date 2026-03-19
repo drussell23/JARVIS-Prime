@@ -1733,6 +1733,15 @@ async def main():
             from jarvis_prime.reasoning.endpoints import get_protocol_version
             return await get_protocol_version()
 
+        @app.post("/v1/reason/select")
+        async def reason_select(request: Request):
+            """Brain selection via unified selector."""
+            from jarvis_prime.reasoning.endpoints import handle_brain_select
+            from jarvis_prime.reasoning.protocol import ReasonRequest
+            body = await request.json()
+            req = ReasonRequest.model_validate(body)
+            return await handle_brain_select(req)
+
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""
