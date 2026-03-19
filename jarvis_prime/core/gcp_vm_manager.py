@@ -92,7 +92,7 @@ def _load_gcp_operation_poller():
     try:
         from backend.core.gcp_operation_poller import (
             GCPOperationPoller, OperationLifecycleRegistry,
-            OperationResult, get_operation_registry,
+            OperationResult,
         )
         return GCPOperationPoller, OperationLifecycleRegistry, OperationResult, True
     except ImportError:
@@ -100,14 +100,15 @@ def _load_gcp_operation_poller():
     try:
         from jarvis_prime.core.gcp_operation_poller import (
             GCPOperationPoller, OperationLifecycleRegistry,
-            OperationResult, get_operation_registry,
+            OperationResult,
         )
         # Hash check between primary and local copy (best-effort)
         _primary_path = _os.path.join(_jarvis_path, "backend", "core", "gcp_operation_poller.py")
         _local_path = _os.path.join(_os.path.dirname(__file__), "gcp_operation_poller.py")
         if _os.path.exists(_primary_path) and _os.path.exists(_local_path):
             def _fphash(p):
-                return _hashlib.sha256(open(p, "rb").read(8192)).hexdigest()
+                with open(p, "rb") as f:
+                    return _hashlib.sha256(f.read(8192)).hexdigest()
             if _fphash(_primary_path) != _fphash(_local_path):
                 logger.critical(
                     "[GCPOperationPoller] Local fallback copy differs from primary — "
