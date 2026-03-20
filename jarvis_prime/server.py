@@ -1751,6 +1751,14 @@ async def main():
             req = ReasonRequest.model_validate(body)
             return await handle_reason(req)
 
+        @app.post("/v1/vision/analyze")
+        async def vision_analyze(request: Request):
+            """Vision element detection -- find UI elements in a frame."""
+            from jarvis_prime.reasoning.vision_assist import handle_vision_analyze, VisionAnalyzeRequest
+            body = await request.json()
+            req = VisionAnalyzeRequest.model_validate(body)
+            return await handle_vision_analyze(req)
+
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""
