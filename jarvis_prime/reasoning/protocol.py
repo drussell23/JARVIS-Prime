@@ -22,6 +22,7 @@ Key design decisions
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -230,3 +231,95 @@ class ProtocolVersionInfo(BaseModel):
     max_supported_version: str = MAX_SUPPORTED_VERSION
     features: List[str] = Field(default_factory=list)
     brain_policy_hash: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Internal LangGraph state model (not on the wire)
+# ---------------------------------------------------------------------------
+
+
+class ReasoningGraphState(BaseModel):
+    """Internal state flowing between LangGraph nodes. Not on the wire."""
+
+    # Identity
+    request_id: str
+    session_id: str
+    trace_id: str
+    command: str
+    context: Dict[str, Any] = Field(default_factory=dict)
+    # Phase
+    phase: str = "initializing"
+    served_mode: str = "LEVEL_0_PRIMARY"
+    degraded_reason_code: Optional[str] = None
+    # Analysis output
+    intent: str = ""
+    complexity: str = "light"
+    confidence: float = 0.0
+    inferred_goals: List[str] = Field(default_factory=list)
+    analysis_brain_used: str = ""
+    # Planning output
+    sub_goals: List[Dict[str, Any]] = Field(default_factory=list)
+    action_graph: Dict[str, List[str]] = Field(default_factory=dict)
+    execution_strategy: str = "sequential"
+    planning_brain_used: str = ""
+    # Validation output
+    approval_required: bool = False
+    approval_reason_codes: List[str] = Field(default_factory=list)
+    risk_level: str = "low"
+    cost_gate_passed: bool = True
+    resource_gate_passed: bool = True
+    # Control
+    graph_depth: str = "fast"
+    error_count: int = 0
+    # Trace
+    reasoning_trace: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Canonical plan hashing
+# ---------------------------------------------------------------------------
+
+
+def _normalize_value(v: Any) -> Any:
+    """Recursively normalize a value for stable JSON serialization."""
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return str(v)
+        return f"{v:.6f}".rstrip("0").rstrip(".")
+    if isinstance(v, dict):
+        return {k: _normalize_value(val) for k, val in sorted(v.items())}
+    if isinstance(v, (list, tuple)):
+        return [_normalize_value(item) for item in v]
+    return v
+
+
+def compute_plan_hash(plan: "Plan") -> str:
+    """Return the full SHA-256 hex digest of a canonical plan representation.
+
+    ``plan_id`` and ``plan_hash`` are intentionally excluded so that the hash
+    describes *what* the plan does, not *which instance* it is.  This prevents
+    circular dependency where the hash must be stored inside the plan itself.
+    """
+    import hashlib
+    import json
+
+    hashable = _normalize_value(
+        {
+            "sub_goals": [
+                {
+                    "step_id": sg.step_id,
+                    "action_id": sg.action_id,
+                    "goal": sg.goal,
+                    "task_type": sg.task_type,
+                    "brain_assigned": sg.brain_assigned,
+                    "tool_required": sg.tool_required,
+                    "depends_on": sorted(sg.depends_on),
+                }
+                for sg in plan.sub_goals
+            ],
+            "execution_strategy": plan.execution_strategy,
+            "approval_required": plan.approval_required,
+        }
+    )
+    canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

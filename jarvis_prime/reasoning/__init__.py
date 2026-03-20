@@ -21,6 +21,8 @@ from jarvis_prime.reasoning.protocol import (
     RoutingTrace,
     StepResult,
     SubGoal,
+    ReasoningGraphState,
+    compute_plan_hash,
 )
 from jarvis_prime.reasoning.unified_brain_selector import (
     UnifiedBrainSelection,
@@ -58,4 +60,7 @@ __all__ = [
     "ModelProvider",
     "MockModelProvider",
     "LlamaCppModelProvider",
+    # Internal graph state + plan hashing
+    "ReasoningGraphState",
+    "compute_plan_hash",
 ]

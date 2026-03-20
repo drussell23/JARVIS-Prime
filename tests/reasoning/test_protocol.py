@@ -26,6 +26,8 @@ from jarvis_prime.reasoning.protocol import (
     RoutingTrace,
     StepResult,
     SubGoal,
+    ReasoningGraphState,
+    compute_plan_hash,
 )
 
 
@@ -585,3 +587,75 @@ class TestProtocolVersionInfo:
         raw = pvi.model_dump_json()
         parsed = json.loads(raw)
         assert parsed["features"] == ["f1", "f2"]
+
+
+# ---------------------------------------------------------------------------
+# ReasoningGraphState
+# ---------------------------------------------------------------------------
+
+class TestReasoningGraphState:
+    def test_default_state(self):
+        state = ReasoningGraphState(
+            request_id="r1", session_id="s1", trace_id="t1", command="test"
+        )
+        assert state.phase == "initializing"
+        assert state.served_mode == "LEVEL_0_PRIMARY"
+        assert state.complexity == "light"
+        assert state.confidence == 0.0
+        assert state.approval_required is False
+        assert state.graph_depth == "fast"
+        assert state.error_count == 0
+
+    def test_roundtrip(self):
+        state = ReasoningGraphState(
+            request_id="r1", session_id="s1", trace_id="t1",
+            command="analyze", complexity="complex", confidence=0.87,
+        )
+        data = state.model_dump()
+        restored = ReasoningGraphState.model_validate(data)
+        assert restored.complexity == "complex"
+        assert restored.confidence == 0.87
+
+
+# ---------------------------------------------------------------------------
+# compute_plan_hash
+# ---------------------------------------------------------------------------
+
+class TestPlanHash:
+    def test_deterministic(self):
+        plan = Plan(
+            plan_id="p1", plan_hash="",
+            sub_goals=[SubGoal(step_id="s1", action_id="a1", goal="open Safari",
+                              task_type="system_command", brain_assigned="phi3_lightweight",
+                              tool_required="app_control")],
+            execution_strategy="sequential", approval_required=False,
+        )
+        h1 = compute_plan_hash(plan)
+        h2 = compute_plan_hash(plan)
+        assert h1 == h2
+        assert len(h1) == 64  # full SHA-256
+
+    def test_different_plans_different_hash(self):
+        plan_a = Plan(plan_id="p1", plan_hash="",
+                      sub_goals=[SubGoal(step_id="s1", action_id="a1", goal="open Safari",
+                                        task_type="system_command", brain_assigned="phi3",
+                                        tool_required="app_control")])
+        plan_b = Plan(plan_id="p2", plan_hash="",
+                      sub_goals=[SubGoal(step_id="s1", action_id="a1", goal="open Chrome",
+                                        task_type="system_command", brain_assigned="phi3",
+                                        tool_required="app_control")])
+        assert compute_plan_hash(plan_a) != compute_plan_hash(plan_b)
+
+    def test_plan_id_excluded_from_hash(self):
+        plan_a = Plan(plan_id="aaa", plan_hash="", sub_goals=[
+            SubGoal(step_id="s1", action_id="a1", goal="test",
+                    task_type="t", brain_assigned="b", tool_required="x")])
+        plan_b = Plan(plan_id="bbb", plan_hash="", sub_goals=[
+            SubGoal(step_id="s1", action_id="a1", goal="test",
+                    task_type="t", brain_assigned="b", tool_required="x")])
+        assert compute_plan_hash(plan_a) == compute_plan_hash(plan_b)
+
+    def test_empty_plan_hash(self):
+        plan = Plan(plan_id="p1", plan_hash="", sub_goals=[])
+        h = compute_plan_hash(plan)
+        assert isinstance(h, str) and len(h) == 64
