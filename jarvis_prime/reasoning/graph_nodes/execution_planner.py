@@ -108,9 +108,10 @@ class ExecutionPlanner:
             raw_sub_goals = self._auto_generate_sub_goal(state)
 
         # Step 2 + 3: fill missing brain/tool and convert to SubGoal objects
+        capability_index: Optional[Dict[str, Any]] = state.context.get("capability_index")
         sub_goal_objects: List[SubGoal] = []
         for sg_dict in raw_sub_goals:
-            enriched = self._enrich(sg_dict)
+            enriched = self._enrich(sg_dict, capability_index=capability_index)
             sub_goal_objects.append(SubGoal(**enriched))
 
         # Step 4: build Plan
@@ -179,15 +180,24 @@ class ExecutionPlanner:
             }
         ]
 
-    def _enrich(self, sg: Dict[str, Any]) -> Dict[str, Any]:
+    def _enrich(
+        self,
+        sg: Dict[str, Any],
+        capability_index: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Return a copy of *sg* with brain_assigned and tool_required filled.
 
         If either field is already non-empty it is left unchanged so that
         upstream assignments from PlanningNode are preserved.
+
+        When *capability_index* (from JARVIS AgentCapabilityIndex) is present,
+        it is used to resolve tool_required from the live agent registry instead
+        of the static _TOOL_MAP.  The static map remains as a fallback.
         """
         task_type = str(sg.get("task_type", _DEFAULT_TASK_TYPE)).strip() or _DEFAULT_TASK_TYPE
         goal_text = str(sg.get("goal", "")).strip()
+        target_app = str(sg.get("target_app", "")).strip() or None
 
         brain_assigned = str(sg.get("brain_assigned", "")).strip()
         tool_required = str(sg.get("tool_required", "")).strip()
@@ -197,7 +207,14 @@ class ExecutionPlanner:
             brain_assigned = selection.brain_id
 
         if not tool_required:
-            tool_required = _TOOL_MAP.get(task_type, _DEFAULT_TOOL)
+            # 1. Try live capability_index (injected from JARVIS at planning time)
+            if capability_index:
+                tool_required = self._resolve_tool_from_index(
+                    capability_index, task_type, goal_text, target_app
+                )
+            # 2. Fall back to static _TOOL_MAP
+            if not tool_required:
+                tool_required = _TOOL_MAP.get(task_type, _DEFAULT_TOOL)
 
         return {
             "step_id": str(sg.get("step_id", "")).strip() or "s1",
@@ -209,3 +226,53 @@ class ExecutionPlanner:
             "depends_on": list(sg.get("depends_on", [])),
             "estimated_ms": int(sg.get("estimated_ms", 0)),
         }
+
+    @staticmethod
+    def _resolve_tool_from_index(
+        capability_index: Dict[str, Any],
+        task_type: str,
+        goal_text: str,
+        target_app: Optional[str],
+    ) -> str:
+        """
+        Resolve a tool name from the live AgentCapabilityIndex payload.
+
+        Searches agents in the index for:
+        1. task_type match in supported_task_types
+        2. target_app match in supported_apps
+        3. URL pattern match for web goals
+        Returns the first matching capability token, or empty string if none found.
+        """
+        agents: List[Dict[str, Any]] = capability_index.get("agents", [])
+        goal_lower = goal_text.lower()
+
+        # 1. task_type match
+        tt_lower = task_type.lower()
+        for agent in agents:
+            stts = [s.lower() for s in agent.get("supported_task_types", [])]
+            if tt_lower in stts:
+                caps = agent.get("capabilities", [])
+                if caps:
+                    return caps[0]
+
+        # 2. target_app match
+        if target_app:
+            app_lower = target_app.lower()
+            for agent in agents:
+                if any(
+                    app_lower == sa.lower() or app_lower in sa.lower() or sa.lower() in app_lower
+                    for sa in agent.get("supported_apps", [])
+                ):
+                    caps = agent.get("capabilities", [])
+                    if caps:
+                        return caps[0]
+
+        # 3. URL/web signal → browser agent
+        if any(pat in goal_lower for pat in ("http://", "https://", "www.", ".com", ".org")):
+            for agent in agents:
+                if agent.get("supported_url_patterns"):
+                    caps = agent.get("capabilities", [])
+                    if caps:
+                        return caps[0]
+
+        return ""
