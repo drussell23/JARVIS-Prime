@@ -2047,6 +2047,19 @@ async def main():
                     # v223.0: Transition to initializing stage
                     _startup_state.set_stage("initializing", "Model loaded, warming up...")
 
+                # v295.0: Wire real ModelProvider for reasoning pipeline
+                # Now that the model is loaded, inject PrimeManagerModelProvider
+                # so graph nodes use the real GPU instead of MockModelProvider.
+                try:
+                    from jarvis_prime.reasoning.model_provider import PrimeManagerModelProvider
+                    from jarvis_prime.reasoning.endpoints import set_model_provider
+                    set_model_provider(PrimeManagerModelProvider(
+                        get_manager_fn=lambda: _startup_state.manager
+                    ))
+                    logger.info("[v295.0] Reasoning pipeline wired to PrimeModelManager")
+                except Exception as e:
+                    logger.warning("[v295.0] Could not wire reasoning ModelProvider: %s", e)
+
                 # Initialize Trinity
                 # Note: global _trinity_integration is declared at function start (v192.0)
                 _trinity_integration = TrinityIntegration()

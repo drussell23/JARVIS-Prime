@@ -156,3 +156,81 @@ class LlamaCppModelProvider:
         if model is None:
             return "unknown"
         return getattr(model, "model_path", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# PrimeManagerModelProvider — wraps PrimeModelManager.complete()
+# ---------------------------------------------------------------------------
+
+
+class PrimeManagerModelProvider:
+    """Production ModelProvider that uses PrimeModelManager for inference.
+
+    This is the preferred production provider. It uses the full model manager
+    pipeline (routing, hot-swap, reasoning engine, telemetry) rather than
+    calling the raw llama-cpp model directly.
+
+    Parameters
+    ----------
+    get_manager_fn:
+        Zero-argument callable returning the PrimeModelManager instance,
+        or None if not yet initialized.
+    """
+
+    def __init__(self, get_manager_fn: Callable[[], Optional[Any]]) -> None:
+        self._get_manager = get_manager_fn
+
+    async def infer(
+        self,
+        messages: List[Dict],
+        max_tokens: int = 1024,
+        temperature: float = 0.2,
+        timeout_s: float = 10.0,
+    ) -> Dict:
+        manager = self._get_manager()
+        if manager is None:
+            raise RuntimeError("PrimeModelManager not initialized")
+
+        # Convert dicts to ChatMessage dataclasses
+        from jarvis_prime.core.model_manager import ChatMessage, CompletionRequest
+
+        chat_messages = [
+            ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
+            for m in messages
+        ]
+        request = CompletionRequest(
+            messages=chat_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            force_tier="tier_0",  # always use local GPU for reasoning nodes
+        )
+
+        response = await asyncio.wait_for(
+            manager.complete(request),
+            timeout=timeout_s,
+        )
+
+        # Extract content from CompletionResponse
+        content = ""
+        if response.choices:
+            content = response.choices[0].message.content
+        return {"content": content}
+
+    def is_model_loaded(self) -> bool:
+        manager = self._get_manager()
+        if manager is None:
+            return False
+        try:
+            return manager.get_health_status() == "ready"
+        except Exception:
+            return False
+
+    def loaded_model_name(self) -> str:
+        manager = self._get_manager()
+        if manager is None:
+            return ""
+        try:
+            status = manager.get_health_status()
+            return status if isinstance(status, str) else "unknown"
+        except Exception:
+            return "unknown"
