@@ -1742,6 +1742,15 @@ async def main():
             req = ReasonRequest.model_validate(body)
             return await handle_brain_select(req)
 
+        @app.post("/v1/reason")
+        async def reason(request: Request):
+            """Full reasoning pipeline -- the Mind thinks."""
+            from jarvis_prime.reasoning.endpoints import handle_reason
+            from jarvis_prime.reasoning.protocol import ReasonRequest
+            body = await request.json()
+            req = ReasonRequest.model_validate(body)
+            return await handle_reason(req)
+
         @app.get("/trinity/status")
         async def trinity_status():
             """Get Trinity integration status."""

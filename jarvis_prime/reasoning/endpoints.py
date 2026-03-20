@@ -1,10 +1,12 @@
 """
 Mind-Body protocol v1.0.0 — endpoint handler functions.
 
-Two pure async functions that back the FastAPI routes registered in server.py:
+Pure async functions that back the FastAPI routes registered in server.py:
 
-  GET /v1/reason/health     → get_reason_health()
-  GET /v1/protocol/version  → get_protocol_version()
+  GET  /v1/reason/health     -> get_reason_health()
+  GET  /v1/protocol/version  -> get_protocol_version()
+  POST /v1/reason/select     -> handle_brain_select()
+  POST /v1/reason            -> handle_reason()         # canonical Mind API
 
 Design constraints
 ------------------
@@ -15,11 +17,13 @@ Design constraints
   contents, or "unavailable" when the file cannot be located/read.
 - brains_loaded: populated from BrainPolicyReader task-complexity keys;
   falls back to [] when hybrid_router is not accessible.
-- reasoning_graph_ready is always False in v295.0 (graph not wired yet).
+- reasoning_graph_ready: True once the ReasoningGraph is wired.
 """
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -159,7 +163,7 @@ async def get_reason_health() -> Dict[str, Any]:
         "protocol_version": PROTOCOL_VERSION,
         "brains_loaded": brains,
         "brain_policy_hash": policy_hash,
-        "reasoning_graph_ready": False,
+        "reasoning_graph_ready": True,
     }
 
 
@@ -235,3 +239,149 @@ async def handle_brain_select(req: ReasonRequest) -> dict:
     )
 
     return resp.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# Model provider factory (injectable for production vs test)
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+_model_provider = None
+
+
+def _get_model_provider():
+    """Return the process-level ModelProvider, creating a MockModelProvider on first call.
+
+    Production: overridden by set_model_provider() called from server.py
+    with a LlamaCppModelProvider wired to the real GPU model.
+    """
+    global _model_provider
+    if _model_provider is None:
+        from jarvis_prime.reasoning.model_provider import MockModelProvider
+        _model_provider = MockModelProvider()
+    return _model_provider
+
+
+def set_model_provider(provider) -> None:
+    """Called by server.py to inject the real LlamaCppModelProvider."""
+    global _model_provider
+    _model_provider = provider
+
+
+# ---------------------------------------------------------------------------
+# Idempotency store singleton
+# ---------------------------------------------------------------------------
+
+_idempotency_store = None
+
+
+def _get_idempotency_store():
+    """Return the process-level IdempotencyStore, creating it on first call."""
+    global _idempotency_store
+    if _idempotency_store is None:
+        from jarvis_prime.reasoning.idempotency_store import IdempotencyStore
+        _idempotency_store = IdempotencyStore()
+    return _idempotency_store
+
+
+# ---------------------------------------------------------------------------
+# Protocol version compatibility
+# ---------------------------------------------------------------------------
+
+
+def _is_version_compatible(version: str) -> bool:
+    """Check if version is within [MIN_SUPPORTED_VERSION, MAX_SUPPORTED_VERSION] range."""
+    try:
+        parts = [int(x) for x in version.split(".")]
+        min_parts = [int(x) for x in MIN_SUPPORTED_VERSION.split(".")]
+        max_parts = [int(x) for x in MAX_SUPPORTED_VERSION.split(".")]
+        return min_parts <= parts <= max_parts
+    except (ValueError, AttributeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# handle_reason — backs POST /v1/reason (the canonical Mind API)
+# ---------------------------------------------------------------------------
+
+
+async def handle_reason(req: ReasonRequest) -> Dict[str, Any]:
+    """
+    Handler for POST /v1/reason.
+
+    The full reasoning pipeline: protocol gate -> idempotency check ->
+    ReasoningGraph execution -> cache result -> return.
+
+    Response fields
+    ---------------
+    protocol_version  current Mind-Body protocol semver
+    request_id        echo of the incoming request_id
+    status            "plan_ready" | "needs_approval" | "error"
+    served_mode       "LEVEL_0_PRIMARY" (or degraded variant)
+    classification    intent, complexity, confidence, brain_used, graph_depth
+    plan              plan_id, plan_hash, sub_goals[], execution_strategy, ...
+    routing_trace     analysis_brain, planning_brain, cost/resource gate outcomes
+    error             only present when status == "error"
+    """
+    # 1. Protocol gate — reject before any work
+    if not _is_version_compatible(req.protocol_version):
+        logger.warning(
+            "Protocol mismatch: request=%s supported=[%s, %s]",
+            req.protocol_version, MIN_SUPPORTED_VERSION, MAX_SUPPORTED_VERSION,
+        )
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": req.request_id,
+            "session_id": req.session_id,
+            "trace_id": req.trace_id,
+            "status": "error",
+            "served_mode": "",
+            "classification": None,
+            "plan": None,
+            "routing_trace": None,
+            "error": {
+                "code": "PROTOCOL_MISMATCH",
+                "class": "permanent",
+                "message": (
+                    f"Protocol version {req.protocol_version} is not supported. "
+                    f"Supported range: [{MIN_SUPPORTED_VERSION}, {MAX_SUPPORTED_VERSION}]."
+                ),
+                "retry_after_ms": None,
+                "recovery_strategy": "BLOCK",
+            },
+        }
+
+    # 2. Idempotency check — return cached result if available
+    store = _get_idempotency_store()
+    cached = store.get(req.request_id)
+    if cached is not None:
+        logger.debug("Idempotency hit for request_id=%s", req.request_id)
+        return json.loads(cached)
+
+    # 3. Create ReasoningGraph and run the pipeline
+    from jarvis_prime.reasoning.reasoning_graph import ReasoningGraph
+
+    provider = _get_model_provider()
+    graph = ReasoningGraph(model_provider=provider)
+
+    result = await graph.run(
+        request_id=req.request_id,
+        session_id=req.session_id,
+        trace_id=req.trace_id,
+        command=req.command,
+        context=req.context if req.context else None,
+    )
+
+    # 4. Cache result for idempotency
+    store.store(req.request_id, req.session_id, json.dumps(result))
+
+    logger.info(
+        "handle_reason complete: request_id=%s status=%s plan_id=%s",
+        req.request_id,
+        result.get("status", ""),
+        result.get("plan", {}).get("plan_id", ""),
+    )
+
+    # 5. Return wire-format response
+    return result
