@@ -3970,6 +3970,19 @@ async def main():
             _startup_state.complete_phase("marking_ready")
             _startup_state.details = {}  # Clear step details
 
+            # v296.0: Wire real LlamaCppModelProvider into the reasoning pipeline
+            # now that the executor and model are fully loaded.  Graph nodes
+            # (handle_reason, handle_brain_select) use this for GPU inference.
+            try:
+                from jarvis_prime.reasoning.model_provider import LlamaCppModelProvider
+                from jarvis_prime.reasoning.endpoints import set_model_provider
+                set_model_provider(LlamaCppModelProvider(
+                    get_model_fn=lambda: getattr(_executor, "_model", None),
+                ))
+                logger.info("[v296.0] Reasoning pipeline wired to LlamaCppExecutor")
+            except Exception as _mp_err:
+                logger.warning("[v296.0] Could not wire reasoning ModelProvider (non-fatal): %s", _mp_err)
+
             # v93.7: Calculate detailed timing breakdown
             total_time = _startup_state.init_elapsed
             model_load_time = _startup_state.model_load_elapsed or 0
@@ -4059,6 +4072,68 @@ async def main():
             traceback.print_exc()
             _startup_state.phase = "error"
             _startup_state.error = str(e)
+
+    # =========================================================================
+    # v296.0: MIND-BODY REASONING PROTOCOL ENDPOINTS
+    # These are the canonical /v1/reason/* routes consumed by JARVIS-AI-Agent.
+    # They live here (the authoritative entrypoint) so every startup path
+    # — GCP golden image, local reactor-core, APARS launcher — exposes them.
+    # Routes return 503 while the model is loading, real responses after ready.
+    # =========================================================================
+
+    def _reasoning_ready_or_503():
+        """Raise 503 if model not yet loaded, so callers get a retryable error."""
+        from fastapi import HTTPException as _HTTPEx
+        if not _startup_state or _startup_state.phase not in ("ready",):
+            raise _HTTPEx(
+                status_code=503,
+                detail={
+                    "error": "model_loading",
+                    "message": "J-Prime model is still initializing — retry shortly",
+                    "phase": getattr(_startup_state, "phase", "unknown"),
+                },
+            )
+
+    @app.get("/v1/reason/health")
+    async def v1_reason_health():
+        """Mind health + loaded brains + reasoning graph readiness."""
+        from jarvis_prime.reasoning.endpoints import get_reason_health
+        return await get_reason_health()
+
+    @app.get("/v1/protocol/version")
+    async def v1_protocol_version():
+        """Protocol version negotiation + feature flags."""
+        from jarvis_prime.reasoning.endpoints import get_protocol_version
+        return await get_protocol_version()
+
+    @app.post("/v1/reason/select")
+    async def v1_reason_select(request: Request):
+        """Brain selection via unified selector — pick the right model for the task."""
+        _reasoning_ready_or_503()
+        from jarvis_prime.reasoning.endpoints import handle_brain_select
+        from jarvis_prime.reasoning.protocol import ReasonRequest
+        body = await request.json()
+        req = ReasonRequest.model_validate(body)
+        return await handle_brain_select(req)
+
+    @app.post("/v1/reason")
+    async def v1_reason(request: Request):
+        """Full reasoning pipeline — the Mind thinks."""
+        _reasoning_ready_or_503()
+        from jarvis_prime.reasoning.endpoints import handle_reason
+        from jarvis_prime.reasoning.protocol import ReasonRequest
+        body = await request.json()
+        req = ReasonRequest.model_validate(body)
+        return await handle_reason(req)
+
+    @app.post("/v1/vision/analyze")
+    async def v1_vision_analyze(request: Request):
+        """Vision element detection — find UI elements in a frame."""
+        _reasoning_ready_or_503()
+        from jarvis_prime.reasoning.vision_assist import handle_vision_analyze, VisionAnalyzeRequest
+        body = await request.json()
+        req = VisionAnalyzeRequest.model_validate(body)
+        return await handle_vision_analyze(req)
 
     # =========================================================================
     # STARTUP EVENT - Triggers background initialization AFTER server starts
