@@ -26,6 +26,11 @@ from jarvis_prime.reasoning.unified_brain_selector import (
     UnifiedBrainSelection,
     UnifiedBrainSelector,
 )
+from jarvis_prime.reasoning.model_provider import (
+    LlamaCppModelProvider,
+    MockModelProvider,
+    ModelProvider,
+)
 
 __all__ = [
     # Protocol version constants
@@ -49,4 +54,8 @@ __all__ = [
     # Brain selector
     "UnifiedBrainSelection",
     "UnifiedBrainSelector",
+    # Model provider (DI interface for GPU inference)
+    "ModelProvider",
+    "MockModelProvider",
+    "LlamaCppModelProvider",
 ]
