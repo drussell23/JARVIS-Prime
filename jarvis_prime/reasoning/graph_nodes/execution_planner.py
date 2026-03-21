@@ -208,15 +208,27 @@ class ExecutionPlanner:
 
         if not tool_required:
             # 1. Try live capability_index (injected from JARVIS at planning time)
+            _gap_hint: Optional[Dict[str, Any]] = None
             if capability_index:
-                tool_required = self._resolve_tool_from_index(
+                _from_index = self._resolve_tool_from_index(
                     capability_index, task_type, goal_text, target_app
                 )
+                if _from_index:
+                    tool_required = _from_index
+                else:
+                    # Index was consulted but found no match — emit advisory hint
+                    _gap_hint = {
+                        "task_type": task_type,
+                        "target_app": target_app,
+                        "reason": "no_index_match",
+                    }
             # 2. Fall back to static _TOOL_MAP
             if not tool_required:
                 tool_required = _TOOL_MAP.get(task_type, _DEFAULT_TOOL)
+        else:
+            _gap_hint = None
 
-        return {
+        result: Dict[str, Any] = {
             "step_id": str(sg.get("step_id", "")).strip() or "s1",
             "action_id": str(sg.get("action_id", "")).strip() or str(uuid.uuid4()),
             "goal": goal_text,
@@ -226,6 +238,9 @@ class ExecutionPlanner:
             "depends_on": list(sg.get("depends_on", [])),
             "estimated_ms": int(sg.get("estimated_ms", 0)),
         }
+        if _gap_hint is not None:
+            result["capability_gap_hint"] = _gap_hint
+        return result
 
     @staticmethod
     def _resolve_tool_from_index(
