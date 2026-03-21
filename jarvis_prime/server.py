@@ -1733,6 +1733,39 @@ async def main():
             from jarvis_prime.reasoning.endpoints import get_protocol_version
             return await get_protocol_version()
 
+        @app.get("/v1/metrics")
+        async def metrics():
+            """Queue depth + processing telemetry for JARVIS LittlesLawVerifier.
+
+            Returns current request queue depth, average processing latency,
+            and request count so JARVIS can compute Little's Law (L = lambda * W)
+            to determine if Prime is idle enough for proactive exploration.
+            """
+            import psutil as _ps
+            _cpu = _ps.cpu_percent(interval=None)
+            _mem = _ps.virtual_memory()
+
+            # Queue metrics from the completion handler
+            _pending = 0
+            _total_requests = 0
+            _avg_latency_ms = 0.0
+            if _startup_state:
+                _status = _startup_state.get_status()
+                _pending = _status.get("pending_requests", 0)
+                _total_requests = _status.get("total_requests", 0)
+                _avg_latency_ms = _status.get("avg_latency_ms", 0.0)
+
+            return {
+                "queue_depth": _pending,
+                "total_requests": _total_requests,
+                "avg_processing_latency_ms": _avg_latency_ms,
+                "cpu_percent": _cpu,
+                "ram_used_mb": (_mem.total - _mem.available) // (1024 * 1024),
+                "ram_total_mb": _mem.total // (1024 * 1024),
+                "status": "ready" if (_startup_state and _startup_state.get_status().get("status") == "ready") else "loading",
+                "timestamp": time.time(),
+            }
+
         @app.post("/v1/reason/select")
         async def reason_select(request: Request):
             """Brain selection via unified selector."""
