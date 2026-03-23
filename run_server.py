@@ -33,21 +33,38 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 # =============================================================================
 # v149.0: HOLLOW CLIENT GUARD - MUST BE BEFORE ANY ML IMPORTS
-# v150.0: Import is_hollow_client_active for model loading skip check
+# v302.0: HollowGuard — DISABLED when NVIDIA GPU is present.
+# The guard protects low-RAM machines from loading heavy ML libs.
+# A machine with an NVIDIA L4 (22.5GB VRAM) is NOT low-RAM.
+# Checking nvidia-smi BEFORE any ML imports ensures the guard
+# never blocks llama_cpp on GPU-equipped machines.
 # =============================================================================
 _hollow_installed = False
 _hollow_reason = "Not installed"
 _is_hollow_client_active = lambda: False  # Default: not active
 
+import subprocess as _sp
+_has_nvidia_gpu = False
 try:
-    from jarvis_prime.core.hollow_client_guard import (
-        install_hollow_guard,
-        is_hollow_client_active as _is_hollow_check,
-    )
-    _hollow_installed, _hollow_reason = install_hollow_guard()
-    _is_hollow_client_active = _is_hollow_check
-except (ImportError, Exception) as e:
-    pass  # Guard not available
+    _nv = _sp.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                   capture_output=True, text=True, timeout=5)
+    _has_nvidia_gpu = _nv.returncode == 0 and _nv.stdout.strip() != ""
+except Exception:
+    pass
+
+if _has_nvidia_gpu:
+    # GPU present — NEVER install HollowGuard (it would block llama_cpp)
+    _hollow_reason = f"Skipped: NVIDIA GPU detected ({_nv.stdout.strip()})"
+else:
+    try:
+        from jarvis_prime.core.hollow_client_guard import (
+            install_hollow_guard,
+            is_hollow_client_active as _is_hollow_check,
+        )
+        _hollow_installed, _hollow_reason = install_hollow_guard()
+        _is_hollow_client_active = _is_hollow_check
+    except (ImportError, Exception) as e:
+        pass  # Guard not available
 
 import warnings
 import sys
@@ -371,46 +388,12 @@ def _assess_hardware() -> HardwareAssessment:
     # hardware and passed the profile via environment variables. This ensures
     # consistent profile decisions across all repos in the JARVIS ecosystem.
     # =========================================================================
+    # v302.0: NEVER skip local GPU detection. The supervisor profile provides
+    # hints but CANNOT detect the GPU — it runs on the Mac, not on this VM.
+    # Always fall through to local detection which runs nvidia-smi.
     supervisor_profile = os.environ.get("JARVIS_HARDWARE_PROFILE")
     if supervisor_profile:
-        logger.info(f"[v138.0] 📡 Hardware profile received from supervisor: {supervisor_profile}")
-        try:
-            # Parse profile from environment
-            profile = HardwareProfile[supervisor_profile]
-
-            # Read other environment variables from supervisor
-            total_ram_gb = float(os.environ.get("JARVIS_TOTAL_RAM_GB", "16.0"))
-            available_ram_gb = float(os.environ.get("JARVIS_AVAILABLE_RAM_GB", "8.0"))
-            cpu_count = int(os.environ.get("JARVIS_CPU_COUNT", "4"))
-            is_apple_silicon = os.environ.get("JARVIS_IS_APPLE_SILICON", "false").lower() == "true"
-            skip_agi_hub = os.environ.get("JARVIS_SKIP_AGI_HUB", "false").lower() == "true"
-            enable_slim_mode = os.environ.get("JARVIS_ENABLE_SLIM_MODE", "false").lower() == "true"
-            defer_heavy_subsystems = os.environ.get("JARVIS_DEFER_HEAVY_SUBSYSTEMS", "false").lower() == "true"
-            has_gpu = os.environ.get("JARVIS_HAS_GPU", "false").lower() == "true"
-            gpu_name = os.environ.get("JARVIS_GPU_NAME", "Unknown")
-            recommended_gpu_layers = int(os.environ.get("JARVIS_GPU_LAYERS", "0"))
-            recommended_context_size = int(os.environ.get("JARVIS_CONTEXT_SIZE", "2048"))
-
-            reason = f"Profile received from supervisor: {supervisor_profile} ({total_ram_gb:.1f}GB RAM)"
-
-            logger.info(f"[v138.0] ✅ Using supervisor-provided hardware profile: {profile.name}")
-            return HardwareAssessment(
-                profile=profile,
-                total_ram_gb=total_ram_gb,
-                available_ram_gb=available_ram_gb,
-                cpu_count=cpu_count,
-                is_apple_silicon=is_apple_silicon,
-                has_gpu=has_gpu,
-                gpu_name=gpu_name,
-                recommended_gpu_layers=recommended_gpu_layers,
-                recommended_context_size=recommended_context_size,
-                skip_agi_hub=skip_agi_hub,
-                enable_slim_mode=enable_slim_mode,
-                defer_heavy_subsystems=defer_heavy_subsystems,
-                reason=reason,
-            )
-        except (KeyError, ValueError) as e:
-            logger.warning(f"[v138.0] ⚠️ Invalid supervisor profile '{supervisor_profile}': {e}. Falling back to local detection.")
+        logger.info(f"[v138.0] 📡 Hardware profile hint from supervisor: {supervisor_profile} (will verify locally)")
 
     # =========================================================================
     # v138.0: LOCAL HARDWARE DETECTION (Fallback)
@@ -719,7 +702,7 @@ class StartupState:
             # TrinityIntegrator._discover_running_component() checks this field
             # to verify it's talking to the correct service during startup
             "service": "jarvis_prime",
-            "status": "error" if self.error else ("healthy" if self.phase == "ready" else "starting"),
+            "status": "fatal" if self.phase == "fatal" else ("error" if self.error else ("healthy" if self.phase == "ready" else "starting")),
             "phase": self.phase,
             "startup_elapsed_seconds": round(elapsed, 1),
             "pid": os.getpid(),
@@ -3722,12 +3705,18 @@ async def main():
                     _startup_state.error = f"Model load failed: {type(e).__name__}: {e}"
                     _startup_state.model_load_elapsed = load_time
                     progress_task.cancel()
-                    # v108.2: Don't exit! Continue running in health-check-only mode
-                    # This allows the supervisor to see the error via health endpoint
-                    logger.warning(
-                        "[Background] Server will continue in health-check-only mode. "
-                        "Model loading failed but service remains available for diagnostics."
+                    # v302.0: CRASH LOUD. A headless Mind is a dead Mind.
+                    # "health-check-only mode" is an anti-pattern that violates
+                    # Pillar 7 (Observability). The organism must know its Mind is dead.
+                    logger.critical(
+                        "[FATAL] MODEL LOAD FAILED — Mind is OFFLINE. "
+                        "Error: %s. The server will NOT pretend to be healthy. "
+                        "Fix the GPU binding or model path and restart.",
+                        _startup_state.error,
                     )
+                    _startup_state.phase = "fatal"
+                    _startup_state.status = "fatal"
+                    # Do NOT return silently — continue to mark as fatal
                     return
 
                 finally:
@@ -3748,9 +3737,16 @@ async def main():
                     except Exception as e:
                         logger.warning(f"[Background] Failed to notify bridge: {e}")
             else:
-                logger.warning(f"[Background] Model not found: {_args.model}")
-                logger.warning("[Background] Server will run in health-check-only mode")
+                logger.critical(
+                    "[FATAL] Model file not found: %s. "
+                    "The Mind cannot think without a model. "
+                    "Available models in /opt/jarvis-prime/models/: %s",
+                    model_path,
+                    list(Path("/opt/jarvis-prime/models").glob("*.gguf")) if Path("/opt/jarvis-prime/models").exists() else "DIR NOT FOUND",
+                )
                 _startup_state.model_path = None
+                _startup_state.phase = "fatal"
+                _startup_state.error = f"Model not found: {model_path}"
                 _startup_state.complete_phase("loading_model")
 
                 if _bridge:
