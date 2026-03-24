@@ -80,28 +80,53 @@ _TASK_COMPLEXITY: Dict[str, str] = {
     "complex_reasoning": "complex",
 }
 
-# Brain IDs per complexity tier
-_DEFAULT_BRAIN: Dict[str, str] = {
+# ==========================================================================
+# ROUTING PRIORITY (v307.0):
+#   Tier 0 (PRIMARY)   — Doubleword API (397B reasoning, 235B vision, 120B general)
+#   Tier 1 (SECONDARY) — Claude API (fallback when Doubleword unavailable)
+#   Tier 2 (LAST RESORT) — Local GCP J-Prime models (when VM is running)
+# ==========================================================================
+
+# --- Tier 0: Doubleword (PRIMARY) --- per-task model routing
+_DOUBLEWORD_MODELS: Dict[str, str] = {
+    "reasoning": os.environ.get("DOUBLEWORD_REASONING_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"),
+    "vision": os.environ.get("DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"),
+    "general": os.environ.get("DOUBLEWORD_GENERAL_MODEL", "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
+    "fast": os.environ.get("DOUBLEWORD_FAST_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"),
+}
+
+# Doubleword model selection per complexity tier
+_DOUBLEWORD_BY_COMPLEXITY: Dict[str, str] = {
+    "trivial": _DOUBLEWORD_MODELS["fast"],       # 35B for quick tasks
+    "light": _DOUBLEWORD_MODELS["fast"],          # 35B for light reasoning
+    "heavy": _DOUBLEWORD_MODELS["general"],       # 120B Nemotron for heavy tasks
+    "complex": _DOUBLEWORD_MODELS["reasoning"],   # 397B for deep reasoning + coding
+}
+
+# Doubleword vision model (for all vision tasks)
+_DOUBLEWORD_VISION = _DOUBLEWORD_MODELS["vision"]  # 235B VL
+
+# --- Tier 1: Claude (SECONDARY fallback) ---
+_CLAUDE_FALLBACK: Dict[str, str] = {
+    "trivial": "claude-haiku-4-5-20251001",
+    "light": "claude-sonnet-4-20250514",
+    "heavy": "claude-sonnet-4-20250514",
+    "complex": "claude-sonnet-4-20250514",
+}
+
+# --- Tier 2: Local GCP J-Prime (LAST RESORT — only when VM is running) ---
+_LOCAL_BRAIN: Dict[str, str] = {
     "trivial": "phi3_lightweight",
     "light": "qwen_coder",
     "heavy": "qwen_coder",
     "complex": "qwen_coder_32b",
 }
 
-# Model name strings per complexity tier
-_DEFAULT_MODEL: Dict[str, str] = {
+_LOCAL_MODEL: Dict[str, str] = {
     "trivial": "llama-3.2-1b",
     "light": "qwen-2.5-coder-7b",
     "heavy": "qwen-2.5-coder-7b",
     "complex": "qwen-2.5-coder-32b",
-}
-
-# Claude fallback model per complexity tier
-_CLAUDE_FALLBACK: Dict[str, str] = {
-    "trivial": "claude-haiku-4-5-20251001",
-    "light": "claude-sonnet-4-20250514",
-    "heavy": "claude-sonnet-4-20250514",
-    "complex": "claude-sonnet-4-20250514",
 }
 
 # LangGraph pipeline depth per complexity tier
@@ -112,13 +137,17 @@ _GRAPH_DEPTH: Dict[str, str] = {
     "complex": "full",
 }
 
-# Ordered fallback chains per primary brain_id
+# Ordered fallback chains: Doubleword → Claude → Local
 _FALLBACK_CHAINS: Dict[str, List[str]] = {
-    "phi3_lightweight": ["qwen_coder", "mistral_7b_fallback"],
-    "qwen_coder": ["qwen_coder_14b", "mistral_7b_fallback"],
-    "qwen_coder_14b": ["qwen_coder_32b", "mistral_7b_fallback"],
-    "qwen_coder_32b": ["mistral_7b_fallback"],
-    "mistral_7b_fallback": [],
+    "doubleword_397b": ["claude_sonnet", "qwen_coder_32b"],
+    "doubleword_120b": ["claude_sonnet", "qwen_coder"],
+    "doubleword_35b": ["claude_haiku", "phi3_lightweight"],
+    "doubleword_vl_235b": ["claude_vision", "llava_v1.5"],
+    "claude_sonnet": ["qwen_coder_32b"],
+    "claude_haiku": ["phi3_lightweight"],
+    "phi3_lightweight": ["qwen_coder"],
+    "qwen_coder": ["qwen_coder_32b"],
+    "qwen_coder_32b": [],
 }
 
 # Task types that require a vision model
@@ -127,22 +156,6 @@ _VISION_TASKS: Set[str] = {
     "vision_verification",
     "screen_observation",
     "proactive_narration",
-}
-
-# Task types eligible for Doubleword Tier 0 (batch, latency-insensitive)
-# These tasks benefit from 397B-class reasoning and don't need real-time response
-_DOUBLEWORD_ELIGIBLE: Set[str] = {
-    "complex_reasoning",
-    "multi_step_planning",
-    "email_summarization",
-}
-
-# Doubleword model per complexity tier (None = not eligible)
-_DOUBLEWORD_MODEL: Dict[str, Optional[str]] = {
-    "trivial": None,
-    "light": None,
-    "heavy": None,
-    "complex": os.environ.get("DOUBLEWORD_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"),
 }
 
 # ---------------------------------------------------------------------------
@@ -282,26 +295,44 @@ class UnifiedBrainSelector:
             f"claude_spend=${self.daily_spend_claude:.4f}/{self._budget_claude})"
         )
 
-        # --- Resolve brain + model ---
-        brain_id = _DEFAULT_BRAIN[complexity]
-        model_name = _DEFAULT_MODEL[complexity]
-        claude_fallback = _CLAUDE_FALLBACK[complexity]
+        # --- Resolve brain + model (3-tier cascade) ---
         graph_depth = _GRAPH_DEPTH[complexity]
+        claude_fallback = _CLAUDE_FALLBACK[complexity]
+
+        # Tier 0: Doubleword (PRIMARY when available)
+        doubleword_model: Optional[str] = None
+        if self._doubleword_available:
+            if task_type in _VISION_TASKS:
+                doubleword_model = _DOUBLEWORD_VISION
+                brain_id = "doubleword_vl_235b"
+                model_name = _DOUBLEWORD_VISION
+                reason_parts.append(
+                    f"PRIMARY: Doubleword VL-235B (vision)"
+                )
+            else:
+                doubleword_model = _DOUBLEWORD_BY_COMPLEXITY[complexity]
+                brain_id = f"doubleword_{complexity}"
+                model_name = doubleword_model
+                reason_parts.append(
+                    f"PRIMARY: Doubleword {doubleword_model}"
+                )
+        else:
+            # Tier 1: Claude (SECONDARY — Doubleword unavailable)
+            brain_id = f"claude_{complexity}"
+            model_name = claude_fallback
+            reason_parts.append(
+                f"SECONDARY: Claude {claude_fallback} (Doubleword unavailable)"
+            )
+
         fallback_chain = list(_FALLBACK_CHAINS.get(brain_id, []))
 
-        # Vision model (only for vision task types)
-        vision_model: Optional[str] = (
-            self._vision_model if task_type in _VISION_TASKS else None
-        )
-
-        # Doubleword Tier 0 (batch 397B for complex/coding tasks)
-        doubleword_model: Optional[str] = None
-        if (task_type in _DOUBLEWORD_ELIGIBLE or complexity == "complex") and self._doubleword_available:
-            doubleword_model = _DOUBLEWORD_MODEL.get(complexity)
-            if doubleword_model:
-                reason_parts.append(
-                    f"doubleword_tier0={doubleword_model} (batch, 29x cheaper)"
-                )
+        # Vision model — Doubleword VL-235B primary, Claude Vision secondary
+        vision_model: Optional[str] = None
+        if task_type in _VISION_TASKS:
+            if self._doubleword_available:
+                vision_model = _DOUBLEWORD_VISION
+            else:
+                vision_model = self._vision_model  # Claude or local LLaVA
 
         routing_reason = "; ".join(reason_parts)
 
