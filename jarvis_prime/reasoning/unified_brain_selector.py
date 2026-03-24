@@ -48,6 +48,7 @@ class UnifiedBrainSelection:
     cost_gate_passed: bool
     resource_gate_passed: bool
     vision_model: Optional[str] = None
+    doubleword_model: Optional[str] = None  # Tier 0 batch model for complex/coding tasks
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,22 @@ _VISION_TASKS: Set[str] = {
     "proactive_narration",
 }
 
+# Task types eligible for Doubleword Tier 0 (batch, latency-insensitive)
+# These tasks benefit from 397B-class reasoning and don't need real-time response
+_DOUBLEWORD_ELIGIBLE: Set[str] = {
+    "complex_reasoning",
+    "multi_step_planning",
+    "email_summarization",
+}
+
+# Doubleword model per complexity tier (None = not eligible)
+_DOUBLEWORD_MODEL: Dict[str, Optional[str]] = {
+    "trivial": None,
+    "light": None,
+    "heavy": None,
+    "complex": os.environ.get("DOUBLEWORD_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"),
+}
+
 # ---------------------------------------------------------------------------
 # Keyword regex patterns for Layer 2 escalation / de-escalation
 # Compiled once at module load — zero per-call overhead.
@@ -191,15 +208,20 @@ class UnifiedBrainSelector:
         # Daily spend accumulators (public so tests can inspect / mutate them)
         self.daily_spend_gcp: float = 0.0
         self.daily_spend_claude: float = 0.0
+        self.daily_spend_doubleword: float = 0.0
 
         # Budget ceilings from environment (float, with safe fallback)
         self._budget_gcp: float = _parse_float_env("JARVIS_DAILY_BUDGET_GCP", 5.0)
         self._budget_claude: float = _parse_float_env("JARVIS_DAILY_BUDGET_CLAUDE", 2.0)
+        self._budget_doubleword: float = _parse_float_env("JARVIS_DAILY_BUDGET_DOUBLEWORD", 1.0)
 
         # Vision model name from environment
         self._vision_model: str = os.environ.get(
             "JARVIS_VISION_MODEL_NAME", "llava-v1.5-7b"
         )
+
+        # Doubleword availability (requires API key)
+        self._doubleword_available: bool = bool(os.environ.get("DOUBLEWORD_API_KEY", ""))
 
         # Day tracking for automatic midnight reset (POSIX day number)
         self._current_day: int = _today_day_number()
@@ -272,6 +294,15 @@ class UnifiedBrainSelector:
             self._vision_model if task_type in _VISION_TASKS else None
         )
 
+        # Doubleword Tier 0 (batch 397B for complex/coding tasks)
+        doubleword_model: Optional[str] = None
+        if (task_type in _DOUBLEWORD_ELIGIBLE or complexity == "complex") and self._doubleword_available:
+            doubleword_model = _DOUBLEWORD_MODEL.get(complexity)
+            if doubleword_model:
+                reason_parts.append(
+                    f"doubleword_tier0={doubleword_model} (batch, 29x cheaper)"
+                )
+
         routing_reason = "; ".join(reason_parts)
 
         return UnifiedBrainSelection(
@@ -285,6 +316,7 @@ class UnifiedBrainSelector:
             cost_gate_passed=cost_gate_passed,
             resource_gate_passed=resource_gate_passed,
             vision_model=vision_model,
+            doubleword_model=doubleword_model,
         )
 
     def record_cost(self, provider: str, usd: float) -> None:
@@ -303,6 +335,8 @@ class UnifiedBrainSelector:
             self.daily_spend_gcp += usd
         elif provider == "claude":
             self.daily_spend_claude += usd
+        elif provider == "doubleword":
+            self.daily_spend_doubleword += usd
         # Unknown providers: no-op (graceful degradation)
 
     # ------------------------------------------------------------------
@@ -310,10 +344,11 @@ class UnifiedBrainSelector:
     # ------------------------------------------------------------------
 
     def _check_cost_gate(self) -> bool:
-        """Return True if both GCP and Claude spend are within budget."""
+        """Return True if all providers are within budget."""
         return (
             self.daily_spend_gcp < self._budget_gcp
             and self.daily_spend_claude < self._budget_claude
+            and self.daily_spend_doubleword < self._budget_doubleword
         )
 
     def _maybe_reset_daily(self) -> None:
@@ -322,6 +357,7 @@ class UnifiedBrainSelector:
         if today != self._current_day:
             self.daily_spend_gcp = 0.0
             self.daily_spend_claude = 0.0
+            self.daily_spend_doubleword = 0.0
             self._current_day = today
 
 
