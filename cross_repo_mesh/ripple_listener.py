@@ -113,4 +113,11 @@ def handle_inbound_ripple(
         # Silent drop — no intent emitted, nothing executed.
         return verdict, None
     intent_record = _emit_local_intent(payload, now_unix=now_unix)
+    # Slice 98 Phase 3 — stamp handshake freshness so partition_posture()
+    # recovers automatically (pure function of now vs last-verified). Best-effort.
+    try:
+        from .partition_degradation import record_verified
+        record_verified(now_unix)
+    except Exception:  # noqa: BLE001 — never let recovery bookkeeping break verify
+        pass
     return VerifyVerdict.VERIFIED, intent_record
