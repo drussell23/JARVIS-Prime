@@ -128,8 +128,14 @@ build {
     inline = [
       "set -euxo pipefail",
       "for i in $(seq 1 60); do sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && sleep 5 || break; done",
-      "sudo apt-get update -y",
-      "sudo apt-get install -y zstd jq curl",
+      # The DLVM (debian-11/bullseye) ships a `bullseye-backports` apt source that
+      # has been RETIRED from deb.debian.org -> `apt-get update` errors out. Strip
+      # every backports source (zstd lives in main, not backports).
+      "sudo sed -i '/backports/d' /etc/apt/sources.list 2>/dev/null || true",
+      "sudo rm -f /etc/apt/sources.list.d/*backports*.list 2>/dev/null || true",
+      # -o DPkg::Lock::Timeout: wait out the DLVM's first-boot apt instead of failing.
+      "sudo apt-get -o DPkg::Lock::Timeout=300 update -y",
+      "sudo apt-get -o DPkg::Lock::Timeout=300 install -y zstd jq curl",
       "curl -fsSL https://ollama.com/install.sh | sudo sh",
       "sudo systemctl enable ollama",
     ]
