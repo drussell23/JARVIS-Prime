@@ -106,7 +106,7 @@ source "googlecompute" "jprime_gpu" {
   project_id              = var.project_id
   zone                    = var.zone
   source_image_family     = var.source_image_family
-  source_image_project_id = var.source_image_project
+  source_image_project_id = [var.source_image_project] # plugin expects a list
   image_name              = "${var.image_family}-{{timestamp}}"
   image_family            = var.image_family
   image_description       = "JARVIS J-Prime QUALITY tier: ${var.model_label} on ${var.accelerator_type}, DLVM base (driver+CUDA) + pre-pulled Ollama 32B."
