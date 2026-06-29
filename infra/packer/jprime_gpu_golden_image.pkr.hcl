@@ -142,9 +142,12 @@ build {
       "set -euxo pipefail",
       "sudo systemctl start ollama",
       "for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/tags && break || sleep 2; done",
-      "sudo -u ollama OLLAMA_HOST=127.0.0.1:11434 ollama pull ${var.model_label}",
-      # Verify the weights are present in the image (NOT a GPU generation — CPU node).
-      "sudo -u ollama OLLAMA_HOST=127.0.0.1:11434 ollama list | grep -q \"$(echo ${var.model_label} | cut -d: -f1)\"",
+      # Pull via the RUNNING systemd daemon (which has HOME set + owns the model
+      # store) -- NOT `sudo -u ollama` (HOME unset -> Ollama/Go panics; the known
+      # bake lesson). The daemon downloads + stores; the CLI just tells it to.
+      "OLLAMA_HOST=127.0.0.1:11434 ollama pull ${var.model_label}",
+      # Verify the weights landed in the image's model store.
+      "OLLAMA_HOST=127.0.0.1:11434 ollama list | grep -q \"$(echo ${var.model_label} | cut -d: -f1)\"",
       "sudo systemctl stop ollama",
     ]
   }
