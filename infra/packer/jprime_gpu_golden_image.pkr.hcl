@@ -6,10 +6,14 @@
 #
 # WHY PRE-BAKED (not cloud-init): the failover node is a TEMPORARY survival tier.
 # Installing NVIDIA drivers + CUDA + pulling a 32B model at boot costs 5-10 min of
-# cold-boot — unacceptable. This image bakes the driver, CUDA, Ollama, AND the
-# pre-pulled 32B weights so the quality node boots READY. The runtime cloud-init
-# only forces the Ollama bind (failover_deadman.build_inference_bind_block) and
-# the TTFT armor (prime_client) absorbs the model-load latency.
+# cold-boot — unacceptable.
+#
+# BASE = Google Deep Learning VM (DLVM): the NVIDIA driver + CUDA toolkit are
+# PRE-INSTALLED, kernel-matched, and officially maintained — this image only adds
+# Ollama + the pre-pulled 32B weights on top, so the quality node boots READY. No
+# DKMS compile (that failure class is eliminated). The runtime cloud-init only
+# forces the Ollama bind (failover_deadman.build_inference_bind_block) and the
+# TTFT armor (prime_client) absorbs the model-load latency.
 #
 # The companion survival image (`jarvis-prime-coder`, 7B/CPU) is a separate, much
 # simpler bake (no driver/CUDA) and is NOT in scope here.
@@ -57,8 +61,14 @@ variable "image_family" {
 
 variable "source_image_family" {
   type        = string
-  default     = "ubuntu-2204-lts"
-  description = "Base OS family (GPU-driver compatible)."
+  default     = "common-cu121-debian-11"
+  description = "Google Deep Learning VM (DLVM) family — NVIDIA driver + CUDA toolkit PRE-INSTALLED, kernel-matched, and officially maintained by Google. Eliminates the DKMS kernel-header compile failure class entirely."
+}
+
+variable "source_image_project" {
+  type        = string
+  default     = "deeplearning-platform-release"
+  description = "Project hosting the DLVM source-image family."
 }
 
 variable "build_machine_type" {
@@ -84,15 +94,9 @@ variable "model_label" {
   description = "Ollama model to PRE-PULL into the image. Must equal JARVIS_FAILOVER_QUALITY_MODEL."
 }
 
-variable "cuda_keyring_deb" {
-  type        = string
-  default     = "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
-  description = "NVIDIA CUDA keyring (pin/override as needed)."
-}
-
 variable "disk_size_gb" {
   type        = number
-  default     = 80 # 32B Q4 weights ~20GB + CUDA toolkit headroom
+  default     = 150 # DLVM base (~50GB: driver+CUDA+conda) + 32B Q4 weights ~20GB + headroom
 }
 
 # ----------------------------------------------------------------------------
@@ -102,13 +106,19 @@ source "googlecompute" "jprime_gpu" {
   project_id              = var.project_id
   zone                    = var.zone
   source_image_family     = var.source_image_family
+  source_image_project_id = var.source_image_project
   image_name              = "${var.image_family}-{{timestamp}}"
   image_family            = var.image_family
-  image_description       = "JARVIS J-Prime QUALITY tier: ${var.model_label} on ${var.accelerator_type}, pre-baked driver+CUDA+Ollama."
+  image_description       = "JARVIS J-Prime QUALITY tier: ${var.model_label} on ${var.accelerator_type}, DLVM base (driver+CUDA) + pre-pulled Ollama 32B."
   machine_type            = var.build_machine_type
   disk_size               = var.disk_size_gb
   ssh_username            = "packer"
   on_host_maintenance     = "TERMINATE" # GPUs cannot live-migrate — mirrors gcp_compute_rest._build_insert_payload
+
+  # DLVM convention: ensure the pre-installed NVIDIA driver is active on boot.
+  metadata = {
+    "install-nvidia-driver" = "True"
+  }
 
   accelerator_type  = "projects/${var.project_id}/zones/${var.zone}/acceleratorTypes/${var.accelerator_type}"
   accelerator_count = var.accelerator_count
@@ -121,23 +131,19 @@ source "googlecompute" "jprime_gpu" {
 }
 
 # ----------------------------------------------------------------------------
-# Build — driver → CUDA → Ollama → pre-pull model → systemd → verify.
+# Build — DLVM base (driver+CUDA pre-installed) → Ollama → pre-pull model → verify.
 # ----------------------------------------------------------------------------
 build {
   sources = ["source.googlecompute.jprime_gpu"]
 
-  # 1) NVIDIA driver + CUDA toolkit (pre-baked — never installed at boot).
+  # 1) The DLVM base SHIPS the NVIDIA driver + CUDA (kernel-matched). No compile.
+  #    Just wait for the first-boot driver to finalize + ensure jq for the smoke.
   provisioner "shell" {
     inline = [
       "set -euxo pipefail",
-      "sudo apt-get update -y",
-      "sudo apt-get install -y build-essential dkms curl jq linux-headers-$(uname -r)",
-      "curl -fsSL ${var.cuda_keyring_deb} -o /tmp/cuda-keyring.deb",
-      "sudo dpkg -i /tmp/cuda-keyring.deb",
-      "sudo apt-get update -y",
-      # cuda-drivers pulls the matched kernel driver + libs; headless server build.
-      "sudo apt-get install -y cuda-drivers cuda-toolkit",
-      "echo 'export PATH=/usr/local/cuda/bin:$PATH' | sudo tee /etc/profile.d/cuda.sh",
+      "for i in $(seq 1 60); do nvidia-smi >/dev/null 2>&1 && break || (echo 'waiting for DLVM NVIDIA driver...' && sleep 5); done",
+      "nvidia-smi",
+      "command -v jq >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y jq)",
     ]
   }
 
