@@ -49,8 +49,8 @@ variable "project_id" {
 
 variable "zone" {
   type        = string
-  default     = "us-central1-b" # an L4-available zone
-  description = "Build zone — MUST have the chosen accelerator available."
+  default     = "us-central1-b"
+  description = "Build zone (CPU instance — no accelerator constraint; any zone works)."
 }
 
 variable "image_family" {
@@ -73,19 +73,8 @@ variable "source_image_project" {
 
 variable "build_machine_type" {
   type        = string
-  default     = "g2-standard-8"
-  description = "Build VM — a GPU box so `ollama pull` warms on-device."
-}
-
-variable "accelerator_type" {
-  type        = string
-  default     = "nvidia-l4"
-  description = "GPU for the BUILD instance (match the runtime quality tier)."
-}
-
-variable "accelerator_count" {
-  type    = number
-  default = 1
+  default     = "e2-standard-4"
+  description = "Build VM — a cheap CPU box. BAKING needs NO GPU (only Ollama install + 32B pull, both CPU work). The GPU is a RUNTIME concern; on-device hardware validation moved to the runtime cloud-init nvidia-smi gate. CPU nodes never stock out -> deterministic bake."
 }
 
 variable "model_label" {
@@ -100,7 +89,9 @@ variable "disk_size_gb" {
 }
 
 # ----------------------------------------------------------------------------
-# Source — the GPU build instance.
+# Source — a cheap CPU build instance (NO accelerator). Baking only downloads the
+# model + installs Ollama; the GPU is a runtime concern (validated by the cloud-
+# init nvidia-smi gate). CPU nodes never stock out -> deterministic bake.
 # ----------------------------------------------------------------------------
 source "googlecompute" "jprime_gpu" {
   project_id              = var.project_id
@@ -109,45 +100,27 @@ source "googlecompute" "jprime_gpu" {
   source_image_project_id = [var.source_image_project] # plugin expects a list
   image_name              = "${var.image_family}-{{timestamp}}"
   image_family            = var.image_family
-  image_description       = "JARVIS J-Prime QUALITY tier: ${var.model_label} on ${var.accelerator_type}, DLVM base (driver+CUDA) + pre-pulled Ollama 32B."
+  image_description       = "JARVIS J-Prime QUALITY tier: ${var.model_label}, DLVM base (driver+CUDA) + pre-pulled Ollama 32B. Baked on CPU; GPU validated at runtime."
   machine_type            = var.build_machine_type
   disk_size               = var.disk_size_gb
   ssh_username            = "packer"
-  on_host_maintenance     = "TERMINATE" # GPUs cannot live-migrate — mirrors gcp_compute_rest._build_insert_payload
-
-  # DLVM convention: ensure the pre-installed NVIDIA driver is active on boot.
-  metadata = {
-    "install-nvidia-driver" = "True"
-  }
-
-  accelerator_type  = "projects/${var.project_id}/zones/${var.zone}/acceleratorTypes/${var.accelerator_type}"
-  accelerator_count = var.accelerator_count
 
   image_labels = {
     role  = "jprime-failover-quality"
     model = replace(replace(var.model_label, ":", "_"), ".", "-")
-    tier  = "gpu-32b"
+    tier  = "gpu-32b" # runtime tier (the image runs on an L4 at runtime)
   }
 }
 
 # ----------------------------------------------------------------------------
-# Build — DLVM base (driver+CUDA pre-installed) → Ollama → pre-pull model → verify.
+# Build (CPU node) — Ollama install → pre-pull the 32B weights. NO GPU smoke test
+# here (the build node has no GPU); the NVIDIA driver + CUDA are already in the
+# DLVM base and are validated at RUNTIME by the cloud-init nvidia-smi gate.
 # ----------------------------------------------------------------------------
 build {
   sources = ["source.googlecompute.jprime_gpu"]
 
-  # 1) The DLVM base SHIPS the NVIDIA driver + CUDA (kernel-matched). No compile.
-  #    Just wait for the first-boot driver to finalize + ensure jq for the smoke.
-  provisioner "shell" {
-    inline = [
-      "set -euxo pipefail",
-      "for i in $(seq 1 60); do nvidia-smi >/dev/null 2>&1 && break || (echo 'waiting for DLVM NVIDIA driver...' && sleep 5); done",
-      "nvidia-smi",
-      "command -v jq >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y jq)",
-    ]
-  }
-
-  # 2) Ollama (GPU-aware runtime).
+  # 1) Ollama (the DLVM base already carries the NVIDIA driver + CUDA for runtime).
   provisioner "shell" {
     inline = [
       "set -euxo pipefail",
@@ -156,17 +129,16 @@ build {
     ]
   }
 
-  # 3) PRE-PULL the 32B weights INTO the image (the whole point — no boot download).
-  #    Start the daemon transiently, pull, verify it loads on the GPU, stop.
+  # 2) PRE-PULL the 32B weights INTO the image (the whole point — no boot download).
+  #    On the CPU build node the pull is a plain download; no GPU load is attempted.
   provisioner "shell" {
     inline = [
       "set -euxo pipefail",
       "sudo systemctl start ollama",
       "for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/tags && break || sleep 2; done",
       "sudo -u ollama OLLAMA_HOST=127.0.0.1:11434 ollama pull ${var.model_label}",
-      # On-device smoke: a 1-token generation proves driver+CUDA+model coherence.
-      "curl -sf http://127.0.0.1:11434/api/generate -d '{\"model\":\"${var.model_label}\",\"prompt\":\"ok\",\"stream\":false,\"options\":{\"num_predict\":1}}' | jq -e '.response' >/dev/null",
-      "nvidia-smi || (echo 'DRIVER VERIFY FAILED' && exit 1)",
+      # Verify the weights are present in the image (NOT a GPU generation — CPU node).
+      "sudo -u ollama OLLAMA_HOST=127.0.0.1:11434 ollama list | grep -q \"$(echo ${var.model_label} | cut -d: -f1)\"",
       "sudo systemctl stop ollama",
     ]
   }
