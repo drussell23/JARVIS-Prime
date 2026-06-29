@@ -59,16 +59,16 @@ variable "image_family" {
   description = "Published family — must equal JARVIS_FAILOVER_QUALITY_IMAGE."
 }
 
-variable "source_image_family" {
+variable "source_image" {
   type        = string
-  default     = "common-cu121-debian-11"
-  description = "Google Deep Learning VM (DLVM) family — NVIDIA driver + CUDA toolkit PRE-INSTALLED, kernel-matched, and officially maintained by Google. Eliminates the DKMS kernel-header compile failure class entirely."
+  default     = "common-cu124-v20250325-debian-11"
+  description = "Google Deep Learning VM (DLVM) image — NVIDIA driver + CUDA PRE-INSTALLED, kernel-matched, Google-maintained (eliminates the DKMS compile failure class). Pinned by EXACT NAME (not family): DLVM marks every image `DEPRECATED` the moment a newer one ships, which 404s the family pointer — but a DEPRECATED image is still launchable by name. Bump this when a newer common-cu* image ships."
 }
 
 variable "source_image_project" {
   type        = string
   default     = "deeplearning-platform-release"
-  description = "Project hosting the DLVM source-image family."
+  description = "Project hosting the DLVM source image."
 }
 
 variable "build_machine_type" {
@@ -105,7 +105,7 @@ variable "disk_size_gb" {
 source "googlecompute" "jprime_gpu" {
   project_id              = var.project_id
   zone                    = var.zone
-  source_image_family     = var.source_image_family
+  source_image            = var.source_image # pinned by name (DLVM family pointers 404)
   source_image_project_id = [var.source_image_project] # plugin expects a list
   image_name              = "${var.image_family}-{{timestamp}}"
   image_family            = var.image_family
