@@ -121,9 +121,15 @@ build {
   sources = ["source.googlecompute.jprime_gpu"]
 
   # 1) Ollama (the DLVM base already carries the NVIDIA driver + CUDA for runtime).
+  #    The DLVM base lacks `zstd`, which the Ollama installer REQUIRES to extract
+  #    its binary -- install it first (also `jq`/`curl` for robustness). Wait for
+  #    the DLVM first-boot apt/dpkg lock to release before apt.
   provisioner "shell" {
     inline = [
       "set -euxo pipefail",
+      "for i in $(seq 1 60); do sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && sleep 5 || break; done",
+      "sudo apt-get update -y",
+      "sudo apt-get install -y zstd jq curl",
       "curl -fsSL https://ollama.com/install.sh | sudo sh",
       "sudo systemctl enable ollama",
     ]
