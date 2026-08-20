@@ -1,0 +1,56 @@
+# Line endings — normalise in the repository, check out LF everywhere.
+#
+# This repo is authored on macOS/Linux but cloned onto Windows hosts, where
+# Git-for-Windows ships `core.autocrlf=true` at *system* scope. Without this
+# file that setting rewrites every file with CRLF on checkout, which breaks
+# shebangs (`#!/bin/bash\r` is not an interpreter), Docker entrypoints, and any
+# byte-exact comparison. The failure is silent at checkout and loud at runtime.
+#
+# This file is authoritative and travels with the repo, so correctness no
+# longer depends on any individual machine's git configuration.
+#
+# `text=auto` (not bare `text`) is deliberate: it preserves the LF guarantee for
+# text files while letting git's binary detection protect any binary that is not
+# yet enumerated below — which matters in a repo that will accumulate model
+# weights and checkpoints.
+* text=auto eol=lf
+
+# Binary — never normalised, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.whl binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.a binary
+*.o binary
+*.pyc binary
+*.wav binary
+*.mp3 binary
+*.mp4 binary
+*.mov binary
+
+# Model weights and serialized tensors — large, binary, never text.
+*.gguf binary
+*.onnx binary
+*.npz binary
+*.npy binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.safetensors binary
+*.ckpt binary
+*.h5 binary
+
+# Windows-native scripts require CRLF — cmd.exe and PowerShell will not parse LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
