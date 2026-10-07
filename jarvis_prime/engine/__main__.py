@@ -24,9 +24,14 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=int(os.environ.get("JPRIME_ENGINE_PORT", "8000")))
     ap.add_argument("--preload", default=None, help="model to load at startup (resident until evicted)")
     ap.add_argument("--default-model", default=None)
+    ap.add_argument("--ctx", type=int, default=None, help="context for a model loaded with no num_ctx")
     ap.add_argument("--log-level", default=os.environ.get("JPRIME_ENGINE_LOG_LEVEL", "info"))
+    ap.add_argument("--log-file", default=os.environ.get("JPRIME_ENGINE_LOG_FILE", ""),
+                    help="write logs here instead of stderr (a detached engine has no console)")
     args = ap.parse_args()
 
+    if args.ctx:
+        os.environ["JPRIME_ENGINE_DEFAULT_CTX"] = str(args.ctx)
     if args.preload:
         os.environ["JPRIME_ENGINE_PRELOAD"] = args.preload
     if args.default_model:
@@ -35,7 +40,8 @@ def main() -> None:
         os.environ["JPRIME_ENGINE_DEFAULT_MODEL"] = args.preload
 
     logging.basicConfig(level=args.log_level.upper(),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        **({"filename": args.log_file} if args.log_file else {}))
     # httpx logs every upstream request at INFO -- including the 0.5 s health
     # polls during a load. The engine's own lines carry what matters.
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -43,8 +49,10 @@ def main() -> None:
 
     from .app import create_app
 
+    # log_config=None: uvicorn keeps the root handler configured above instead
+    # of installing its own stderr handlers (which a detached engine lacks).
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level=args.log_level.lower(),
-                access_log=False)
+                access_log=False, log_config=None)
 
 
 if __name__ == "__main__":

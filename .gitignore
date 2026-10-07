@@ -59,3 +59,4 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+.venv-engine/
