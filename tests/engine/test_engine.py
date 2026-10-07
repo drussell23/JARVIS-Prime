@@ -506,3 +506,32 @@ def test_rejecting_the_only_fine_tune_falls_back_to_origin_and_origin_is_never_d
     assert all(p.exists() for p in origin.adapter_paths)
     with pytest.raises(AdapterRejected, match="never deleted"):
         reg.reject("qwen3-coder-ov:30b", "origin", "x")
+
+
+# ------------------------------------------------------------ evaluation scope
+def test_evaluation_scope_disables_prompt_cache_only_while_open(pool_factory, monkeypatch):
+    import httpx
+    from fastapi.testclient import TestClient
+    from jarvis_prime.engine.app import create_app
+
+    pool, _, _ = pool_factory()
+    sent = []
+
+    async def fake_post(self, url, json=None, **kw):
+        sent.append(dict(json or {}))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    body = {"model": "qwen3-coder-ov:30b", "messages": [{"role": "user", "content": "x"}]}
+    with TestClient(create_app(pool)) as c:
+        c.post("/v1/chat/completions", json=body)
+        assert c.post("/v1/models/qwen3-coder-ov:30b/evaluation", json={"on": True, "ttl_s": 60}).json()["evaluation"]
+        c.post("/v1/chat/completions", json=body)
+        assert c.get("/health").json()["evaluation_scopes"] == ["qwen3-coder-ov:30b"]
+        c.post("/v1/models/qwen3-coder-ov:30b/evaluation", json={"on": False})
+        c.post("/v1/chat/completions", json=body)
+        c.post("/v1/models/qwen3-coder-ov:30b/evaluation", json={"on": True, "ttl_s": 1})
+        import time as _t
+        _t.sleep(1.1)                                         # an abandoned scope closes itself
+        c.post("/v1/chat/completions", json=body)
+    assert ["cache_prompt" in s for s in sent] == [False, True, False, False]
+    assert sent[1]["cache_prompt"] is False

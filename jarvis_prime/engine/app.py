@@ -75,6 +75,24 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         return None
     pool.admission_gate = _gate
     default_model = os.environ.get("JPRIME_ENGINE_DEFAULT_MODEL", "").strip()
+
+    #: model -> monotonic deadline of its evaluation scope. While open, every
+    #: request to that model disables prompt-cache reuse: llama.cpp reuses the
+    #: previous request's KV prefix, which changes the batch split, flips
+    #: near-ties and makes greedy decoding drift between identical runs
+    #: (measured: cold vs warm cache gave different outputs for the same
+    #: prompt and weights; cache off gave 3/3 byte-identical). A verification
+    #: that cannot reproduce its own baseline cannot judge an adapter.
+    evaluation: Dict[str, float] = {}
+
+    def _evaluation_scope(body: Dict[str, Any], name: str) -> None:
+        deadline = evaluation.get(name)
+        if deadline is None:
+            return
+        if time.monotonic() > deadline:
+            evaluation.pop(name, None)       # an abandoned scope closes itself
+            return
+        body["cache_prompt"] = False
     preload = os.environ.get("JPRIME_ENGINE_PRELOAD", "").strip()
     state: Dict[str, Any] = {}
 
@@ -216,6 +234,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
             "engine": "llama.cpp", "engine_binary": str(binary) if binary else None,
             "default_model": default_model or None,
             "lease": lease.status(),
+            "evaluation_scopes": sorted(n for n, d in evaluation.items() if d > time.monotonic()),
             "resident": [{"name": e.spec.name, "ctx": e.ctx, "size_vram": e.size_vram_bytes,
                           "inflight": e.inflight} for e in pool.resident()],
             "gpu": {"name": mem.name, "total_mib": mem.total_mib, "free_mib": mem.free_mib} if mem else None,
@@ -268,6 +287,20 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
                 "model_info": meta, "capabilities": caps, "modified_at": spec.modified_at,
                 "adapters": adapters}
 
+    @app.post("/v1/models/{name:path}/evaluation")
+    async def evaluation_scope(name: str, request: Request) -> Dict[str, Any]:
+        """Open (``{"on": true, "ttl_s": N}``) or close a reproducible-
+        evaluation scope for one model. Time-bounded: a holder that dies
+        cannot leave caching off."""
+        b = await request.json()
+        spec = _spec_or_404(name)
+        if b.get("on", True):
+            ttl = float(b.get("ttl_s") or os.environ.get("JPRIME_EVALUATION_TTL_S", "") or 3600.0)
+            evaluation[spec.name] = time.monotonic() + max(1.0, ttl)
+        else:
+            evaluation.pop(spec.name, None)
+        return {"model": spec.name, "evaluation": spec.name in evaluation}
+
     @app.post("/v1/models/{name:path}/unload")
     async def unload(name: str) -> Dict[str, Any]:
         return {"model": canonical_name(name), "unloaded": await pool.unload(name)}
@@ -315,6 +348,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         spec = _spec_or_404(_model_of(raw))
         body, num_ctx, keep_alive = protocol.prepare_openai_chat(raw, spec.defaults)
         body["model"] = spec.name
+        _evaluation_scope(body, spec.name)
         await pool.ensure(spec.name, num_ctx)  # surface 404/503/500 before streaming starts
         if body.get("stream"):
             return StreamingResponse(
@@ -328,6 +362,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         spec = _spec_or_404(_model_of(raw))
         body, num_ctx, keep_alive = protocol.prepare_openai_chat(raw, spec.defaults)
         body["model"] = spec.name
+        _evaluation_scope(body, spec.name)
         await pool.ensure(spec.name, num_ctx)
         if body.get("stream"):
             return StreamingResponse(
@@ -341,6 +376,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         spec = _spec_or_404(_model_of(raw))
         body, num_ctx, keep_alive, stream = protocol.prepare_ollama_chat(raw, spec.defaults)
         body["model"] = spec.name
+        _evaluation_scope(body, spec.name)
         if not body["messages"]:  # Ollama: an empty chat just loads the model
             async with pool.acquire(spec.name, num_ctx, keep_alive):
                 pass
@@ -378,6 +414,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         spec = _spec_or_404(name)
         body, num_ctx, keep_alive, stream = protocol.prepare_ollama_generate(raw, spec.defaults)
         body["model"] = spec.name
+        _evaluation_scope(body, spec.name)
         await pool.ensure(spec.name, num_ctx)
         if stream:
             body["stream_options"] = {"include_usage": True}
