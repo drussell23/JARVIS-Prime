@@ -93,7 +93,12 @@ class TrainingLease:
         self._clock = clock
         self.state = LeaseState.SERVING
         self.lease: Optional[Lease] = None
+        # The latest failure of the CURRENT lease cycle, and when. Cleared when
+        # a new lease is acquired: an error from an earlier cycle (a restore
+        # that failed hours ago and was since recovered) is history, and
+        # reporting it beside a live lease would describe the wrong cycle.
         self.last_error = ""
+        self.last_error_at: Optional[float] = None
         self._lock = asyncio.Lock()
         self._watch: Optional[asyncio.Task] = None
 
@@ -110,7 +115,10 @@ class TrainingLease:
 
     def status(self) -> Dict[str, Any]:
         return {"state": self.state.value, "lease": self.lease.public() if self.lease else None,
-                "last_error": self.last_error}
+                "last_error": self.last_error, "last_error_at": self.last_error_at}
+
+    def _fail(self, message: str) -> None:
+        self.last_error, self.last_error_at = message, self._clock()
 
     # ------------------------------------------------------------- acquire
     async def acquire(self, *, holder: str, purpose: str, ttl_s: float,
@@ -122,6 +130,7 @@ class TrainingLease:
         async with self._lock:
             if self.state != LeaseState.SERVING:
                 raise LeaseConflict(f"lease busy: state={self.state.value}")
+            self.last_error, self.last_error_at = "", None     # a new cycle
             drain_timeout = drain_timeout_s if drain_timeout_s is not None else _env_float(
                 "JPRIME_LEASE_DRAIN_TIMEOUT_S", 600.0)
             release_timeout = release_timeout_s if release_timeout_s is not None else _env_float(
@@ -141,7 +150,7 @@ class TrainingLease:
                 await self.pool.unload(name)
             freed = await self._verify_released(before, held_mib, release_timeout)
         except Exception as exc:
-            self.last_error = f"acquire failed: {exc}"
+            self._fail(f"acquire failed: {exc}")
             logger.error("[Lease] %s -- restoring service", self.last_error)
             await self._restore()
             raise
@@ -226,7 +235,7 @@ class TrainingLease:
             self.state = LeaseState.SERVING
             self.lease = None
         if failed:
-            self.last_error = f"restore: {failed}"
+            self._fail(f"restore: {failed}")
         logger.warning("[Lease] SERVING again; reloaded=%s failed=%s", loaded, failed or "none")
         return {"state": self.state.value, "reloaded": loaded, "failed": failed}
 
@@ -252,8 +261,8 @@ class TrainingLease:
                         for s in filter(None, (self.pool.store.resolve(n) for n in lease.restore_models))),
                        default=0)
             if mem is not None and mem.free_mib < need + self.pool.config.vram_headroom_mib:
-                self.last_error = (f"lease of {lease.holder} expired but the card is still occupied "
-                                   f"({mem.free_mib} MiB free, need ~{need}) -- waiting")
+                self._fail(f"lease of {lease.holder} expired but the card is still occupied "
+                           f"({mem.free_mib} MiB free, need ~{need}) -- waiting")
                 logger.error("[Lease] %s", self.last_error)
                 continue
             logger.error("[Lease] lease of %s expired; restoring service", lease.holder)

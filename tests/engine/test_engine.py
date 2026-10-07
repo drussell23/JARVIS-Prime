@@ -383,6 +383,31 @@ def test_unverifiable_release_aborts_and_restores_service(pool_factory):
     asyncio.run(go())
 
 
+def test_a_lease_error_belongs_to_its_own_cycle(pool_factory):
+    # 2026-10-07: a restore that failed in an EARLIER cycle (and was since
+    # recovered) was still reported beside the next live lease, so the boot
+    # alert described a failure that was not happening.
+    pool, lease, _, _ = _leased(pool_factory)
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        eng = pool.engines["qwen3-coder-ov:30b"]
+        eng.proc.terminate = lambda: None
+        eng.proc.kill = lambda: None
+        with pytest.raises(TimeoutError):
+            await lease.acquire(holder="h", purpose="p", ttl_s=60, release_timeout_s=1.5)
+        failed = lease.status()
+        assert failed["last_error"].startswith("acquire failed") and failed["last_error_at"] is not None
+        for name in list(pool.engines):                         # the operator clears the wedge
+            pool.engines.pop(name)
+        got = await lease.acquire(holder="next", purpose="grpo", ttl_s=60)
+        st = lease.status()
+        assert st["last_error"] == "" and st["last_error_at"] is None   # a new cycle starts clean
+        await lease.release(got["token"])
+    asyncio.run(go())
+
+
 def test_concurrent_allocator_delta_is_not_attributed(pool_factory, monkeypatch):
     pool, launched, gpu_state = pool_factory(model_mib=20000)
     import jarvis_prime.engine.engine_pool as ep
