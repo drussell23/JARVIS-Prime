@@ -44,6 +44,13 @@ def _err(status: int, msg: str) -> JSONResponse:
     return JSONResponse({"error": msg}, status_code=status)
 
 
+def _mtime(path: Any) -> Optional[float]:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
 def _details(spec: ModelSpec) -> Dict[str, Any]:
     meta = gguf_meta.read_metadata(spec.model_path)
     arch = meta.get("general.architecture", "")
@@ -179,6 +186,12 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
     async def adapter_rollback(name: str) -> Dict[str, Any]:
         return await asyncio.to_thread(registry.rollback, name)
 
+    @app.post("/v1/adapters/{name:path}/reject")
+    async def adapter_reject(name: str, request: Request) -> Dict[str, Any]:
+        b = await request.json()
+        return await asyncio.to_thread(registry.reject, name, str(b.get("version") or ""),
+                                       str(b.get("reason") or "rejected"))
+
     @app.post("/v1/adapters/{name:path}/activate")
     async def adapter_activate(name: str, request: Request) -> Dict[str, Any]:
         b = await request.json()
@@ -241,8 +254,19 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         meta = gguf_meta.read_metadata(spec.model_path)
         caps = ["completion", "tools"] + (["vision"] if spec.has_vision else [])
         params = "\n".join(f"{k} {v}" for k, v in spec.defaults.items() if not isinstance(v, list))
+        # Each adapter's own provenance, from ITS header: which base it was
+        # trained on. A trainer continuing this model must start from that
+        # base, so the fact is served rather than restated by every caller.
+        adapters = []
+        for p in spec.adapter_paths:
+            am = gguf_meta.read_metadata(p)
+            adapters.append({k: am.get(k) for k in (
+                "general.architecture", "adapter.type", "general.name", "general.version",
+                "general.base_model.0.name", "general.base_model.0.organization",
+                "general.base_model.0.repo_url")} | {"path": str(p), "mtime": _mtime(p)})
         return {"modelfile": "", "parameters": params, "template": "", "details": _details(spec),
-                "model_info": meta, "capabilities": caps, "modified_at": spec.modified_at}
+                "model_info": meta, "capabilities": caps, "modified_at": spec.modified_at,
+                "adapters": adapters}
 
     @app.post("/v1/models/{name:path}/unload")
     async def unload(name: str) -> Dict[str, Any]:

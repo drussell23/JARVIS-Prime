@@ -470,3 +470,39 @@ def test_changed_definition_reloads_resident_engine(pool_factory, registry, tmp_
             pass
     asyncio.run(go())
     assert len(launched) == 2 and "adapters" in launched[1][launched[1].index("--lora") + 1]
+
+
+def test_reject_deletes_the_bad_weights_and_restores_the_last_good(registry, tmp_path):
+    import hashlib as _h
+    reg, store = registry
+    origin = store.resolve("qwen3-coder-ov:30b")
+    good = _adapter_bytes(tmp_path)
+    reg.publish("qwen3-coder-ov:30b", good, sha256=_h.sha256(good).hexdigest())
+    good_version = reg.versions("qwen3-coder-ov:30b")["active"]
+    bad = good + b"\0" * 64                                   # distinct bytes, same valid header
+    out = reg.publish("qwen3-coder-ov:30b", bad, sha256=_h.sha256(bad).hexdigest())
+    bad_version = out["active"]
+    bad_file = Path(reg.versions("qwen3-coder-ov:30b")["versions"][-1]["adapters"][0])
+    assert bad_file.is_file()
+
+    rej = reg.reject("qwen3-coder-ov:30b", bad_version, "smoke failed: 0/3 parsed")
+    assert rej["active"] == good_version and not bad_file.exists()
+    state = reg.versions("qwen3-coder-ov:30b")
+    entry = next(v for v in state["versions"] if v["version"] == bad_version)
+    assert entry["status"] == "rejected" and "smoke failed" in entry["reason"]
+    assert store.resolve("qwen3-coder-ov:30b").adapter_paths != origin.adapter_paths   # the GOOD fine-tune
+    with pytest.raises(AdapterRejected, match="rejected"):
+        reg.activate("qwen3-coder-ov:30b", bad_version)
+
+
+def test_rejecting_the_only_fine_tune_falls_back_to_origin_and_origin_is_never_deleted(registry, tmp_path):
+    import hashlib as _h
+    reg, store = registry
+    origin = store.resolve("qwen3-coder-ov:30b")
+    data = _adapter_bytes(tmp_path)
+    v = reg.publish("qwen3-coder-ov:30b", data, sha256=_h.sha256(data).hexdigest())["active"]
+    reg.reject("qwen3-coder-ov:30b", v, "corrupt")
+    assert store.resolve("qwen3-coder-ov:30b").adapter_paths == origin.adapter_paths
+    assert all(p.exists() for p in origin.adapter_paths)
+    with pytest.raises(AdapterRejected, match="never deleted"):
+        reg.reject("qwen3-coder-ov:30b", "origin", "x")

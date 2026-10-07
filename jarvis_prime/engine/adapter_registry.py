@@ -162,6 +162,8 @@ class AdapterRegistry:
         entry = next((v for v in state["versions"] if v["version"] == version), None)
         if entry is None:
             raise AdapterRejected(f"{name}: no version {version!r}")
+        if entry.get("status") == "rejected":
+            raise AdapterRejected(f"{name}: version {version} was rejected ({entry.get('reason', '')[:120]})")
         previous = state.get("active")
         self._write_declared({"name": name, "model": state["base_model"], "adapters": entry["adapters"],
                               "projector": None, "defaults": state.get("defaults") or {}})
@@ -178,3 +180,36 @@ class AdapterRegistry:
         if not prev:
             raise AdapterRejected(f"{name}: nothing to roll back to")
         return self.activate(name, prev)
+
+    def reject(self, name: str, version: str, reason: str) -> Dict[str, Any]:
+        """A version proved bad: DELETE its weights, record why, and if it was
+        active put the newest remaining good version back (never another
+        rejected one). The record stays -- an audit of what was refused --
+        but the file cannot be activated again by anyone."""
+        name = canonical_name(name)
+        state = self.versions(name)
+        entry = next((v for v in state["versions"] if v["version"] == version), None)
+        if entry is None:
+            raise AdapterRejected(f"{name}: no version {version!r}")
+        if version == "origin":
+            raise AdapterRejected("the origin version is the fallback of last resort; it is never deleted")
+        for p in entry.get("adapters") or []:
+            # Only files this registry owns; origin's blobs belong to their store.
+            if Path(p).resolve().is_relative_to(adapters_dir().resolve()):
+                Path(p).unlink(missing_ok=True)
+        entry.update({"status": "rejected", "rejected_at": time.time(), "reason": reason[:500],
+                      "adapters": []})
+        restored = None
+        if state.get("active") == version:
+            good = [v for v in state["versions"] if v.get("status") != "rejected" and v["version"] != version]
+            prev = state.get("previous")
+            target = prev if any(v["version"] == prev for v in good) else (good[-1]["version"] if good else None)
+            if target is None:
+                raise AdapterRejected(f"{name}: no good version left to serve")
+            self._save_versions(name, state)
+            restored = self.activate(name, target)
+            state = self.versions(name)
+        state["previous"] = None if state.get("previous") == version else state.get("previous")
+        self._save_versions(name, state)
+        logger.error("[Adapters] %s: REJECTED %s (%s); serving %s", name, version, reason[:200], state["active"])
+        return {"model": name, "rejected": version, "active": state["active"], "restored": restored}
