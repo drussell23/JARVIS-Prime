@@ -560,3 +560,99 @@ def test_evaluation_scope_disables_prompt_cache_only_while_open(pool_factory, mo
         c.post("/v1/chat/completions", json=body)
     assert ["cache_prompt" in s for s in sent] == [False, True, False, False]
     assert sent[1]["cache_prompt"] is False
+
+
+# ---------------------------------------------------------------- pinning
+# The preloaded model is the operator's declaration of the primary: a
+# best-effort model (a vision read) must never evict it, or every screenshot
+# between two generations costs the generation lane a cold reload.
+
+def test_a_pinned_primary_is_never_evicted_for_an_unpinned_model(pool_factory):
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass                                            # idle now, but pinned
+        with pytest.raises(InsufficientVram, match="pinned"):
+            async with pool.acquire("qwen3-coder:30b", 8192):
+                pass
+    asyncio.run(go())
+    assert list(pool.engines) == ["qwen3-coder-ov:30b"]
+
+
+def test_a_pinned_requester_may_evict_an_idle_unpinned_model(pool_factory):
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder:30b", 8192):
+            pass
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+    asyncio.run(go())
+    assert list(pool.engines) == ["qwen3-coder-ov:30b"]
+
+
+def test_the_preload_is_pinned_by_declaration(monkeypatch):
+    monkeypatch.setenv("JPRIME_ENGINE_PRELOAD", "qwen3-coder-ov:30b")
+    monkeypatch.setenv("JPRIME_ENGINE_PINNED", "other:7b, ")
+    assert EngineConfig(binary=Path("x")).pinned == frozenset({"qwen3-coder-ov:30b", "other:7b"})
+
+
+# ---------------------------------------------------------------- declaring a model
+
+VL_KV = {"general.architecture": "qwen3vl", "qwen3vl.context_length": 262144, "qwen3vl.block_count": 36,
+         "qwen3vl.attention.head_count_kv": 8, "qwen3vl.attention.key_length": 128,
+         "qwen3vl.attention.value_length": 128}
+CLIP_KV = {"general.architecture": "clip"}
+
+
+@pytest.fixture
+def declared_env(tmp_path, monkeypatch):
+    path = tmp_path / "models.yaml"
+    monkeypatch.setenv("JPRIME_ENGINE_MODELS", str(path))
+    path.write_text("models:\n- name: qwen3-coder-ov:30b\n  model: /x.gguf\n", encoding="utf-8")
+    return tmp_path
+
+
+def _registry(tmp_path):
+    from jarvis_prime.engine.adapter_registry import AdapterRegistry
+    store = ModelStore(DeclaredModels(tmp_path / "models.yaml"), OllamaManifestStore(_ollama_store(tmp_path / "o")))
+    return AdapterRegistry(store), store
+
+
+def test_a_vision_model_is_declared_verified_and_served_by_name(declared_env):
+    import hashlib
+    from jarvis_prime.engine.adapter_registry import AdapterRejected
+    reg, store = _registry(declared_env)
+    model = _gguf(declared_env / "vl.gguf", VL_KV)
+    proj = _gguf(declared_env / "mmproj.gguf", CLIP_KV)
+    sha = {str(model): hashlib.sha256(model.read_bytes()).hexdigest()}
+    reg.declare(name="jarvis-vision:8b", model=model, projector=proj, defaults={"temperature": 0.1}, sha256=sha)
+    spec = store.resolve("jarvis-vision:8b")
+    assert spec.projector_path == proj and spec.defaults["temperature"] == 0.1
+    assert store.resolve("qwen3-coder-ov:30b") is not None or "qwen3-coder-ov:30b" in store.declared.names()
+    with pytest.raises(AdapterRejected, match="projector"):
+        reg.declare(name="v", model=model, projector=model)            # a language model is not a projector
+    with pytest.raises(AdapterRejected, match="must not be"):
+        reg.declare(name="v", model=proj)                              # a projector is not a model
+    with pytest.raises(AdapterRejected, match="sha256"):
+        reg.declare(name="v", model=model, sha256={str(model): "0" * 64})
+    with pytest.raises(AdapterRejected, match="readable GGUF"):
+        (declared_env / "junk.gguf").write_bytes(b"not a gguf")
+        reg.declare(name="v", model=declared_env / "junk.gguf")
+
+
+def test_the_cli_inherits_the_names_existing_defaults(declared_env, monkeypatch, capsys):
+    from jarvis_prime.engine import declare as dc
+    root = _ollama_store(declared_env / "o2")
+    monkeypatch.setattr(dc, "ModelStore", lambda: ModelStore(DeclaredModels(declared_env / "models.yaml"),
+                                                             OllamaManifestStore(root)))
+    model = _gguf(declared_env / "vl.gguf", VL_KV)
+    proj = _gguf(declared_env / "mmproj.gguf", CLIP_KV)
+    # qwen3-coder:30b already resolves (from the Ollama manifest) with params.
+    rc = dc.main(["--name", "qwen3-coder:30b", "--model", str(model), "--projector", str(proj),
+                  "--inherit-defaults", "--default", "num_ctx=8192"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0 and out["defaults"]["temperature"] == 0.7 and out["defaults"]["num_ctx"] == 8192

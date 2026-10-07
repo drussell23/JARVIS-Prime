@@ -136,6 +136,11 @@ class EngineConfig:
     default_keep_alive_s: Optional[float] = field(
         default_factory=lambda: parse_keep_alive(os.environ.get("JPRIME_ENGINE_KEEP_ALIVE", "5m"), 300.0))
     vram_headroom_mib: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_VRAM_HEADROOM_MIB", 1024))
+    #: Models never evicted to admit an UNPINNED one: the preloaded model
+    #: (the operator's declaration of the primary) plus JPRIME_ENGINE_PINNED.
+    pinned: frozenset = field(default_factory=lambda: frozenset(
+        canonical_name(n) for n in (os.environ.get("JPRIME_ENGINE_PINNED", "").split(",")
+                                    + [os.environ.get("JPRIME_ENGINE_PRELOAD", "")]) if n.strip()))
     #: A load's VRAM delta is attributed to it only if it covers at least this
     #: fraction of the files it mapped (weights are fully offloaded).
     min_attributable_fraction: float = field(default_factory=lambda: float(
@@ -368,11 +373,19 @@ class EnginePool:
             mem = await asyncio.to_thread(self._gpu)
             if mem is None or mem.free_mib >= need_mib + self.config.vram_headroom_mib:
                 return
-            idle = [e for n, e in self.engines.items() if n != keep and e.inflight == 0]
+            # A best-effort model never evicts the primary: a screenshot read
+            # must not cost the generation lane a cold reload. A pinned
+            # requester may evict anything idle.
+            protected = set() if keep in self.config.pinned else set(self.config.pinned)
+            idle = [e for n, e in self.engines.items()
+                    if n != keep and e.inflight == 0 and n not in protected]
             if not idle:
-                if any(n != keep for n in self.engines):
-                    raise InsufficientVram(
-                        f"need ~{need_mib} MiB, {mem.free_mib} MiB free, and every resident model is busy")
+                others = [n for n in self.engines if n != keep]
+                if others:
+                    held = [n for n in others if n in protected]
+                    why = (f"resident pinned model(s) {held} are never evicted for {keep}" if held
+                           else "every resident model is busy")
+                    raise InsufficientVram(f"need ~{need_mib} MiB, {mem.free_mib} MiB free, and {why}")
                 return  # nothing of ours to evict; let the engine try (another process owns the VRAM)
             victim = min(idle, key=lambda e: e.last_used)
             logger.info("[Engine] evicting %s to admit ~%d MiB (free %d MiB)",

@@ -63,6 +63,14 @@ def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", canonical_name(name))
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -106,6 +114,43 @@ class AdapterRegistry:
         # is THIS file for the life of the process.
         os.environ.setdefault("JPRIME_ENGINE_MODELS", str(declared_models_path()))
         self.store.declared = DeclaredModels(declared_models_path())
+
+    # ---------------------------------------------------------------- declare
+    def declare(self, *, name: str, model: Path, projector: Optional[Path] = None,
+                defaults: Optional[Dict[str, Any]] = None,
+                sha256: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Declare a model the store serves by name, VERIFIED before it is.
+
+        The declared file is the store's first answer for ``name``, so a
+        wrong file here is served confidently. Each file must be a GGUF; the
+        model must be a language model and the projector a vision encoder
+        (llama.cpp's ``clip`` architecture). An Ollama-format combined file,
+        which embeds its vision tower where llama.cpp cannot load it, has no
+        separate projector and is refused for vision here, not at load time.
+        ``sha256`` (path -> digest) pins the bytes when the publisher states
+        them. Raises :class:`AdapterRejected`.
+        """
+        model = Path(model)
+        files = [("model", model)] + ([("projector", Path(projector))] if projector else [])
+        for role, path in files:
+            if not path.is_file():
+                raise AdapterRejected(f"{role} file missing: {path}")
+            arch = str(gguf_meta.read_metadata(path).get("general.architecture") or "")
+            if not arch:
+                raise AdapterRejected(f"{role} is not a readable GGUF: {path}")
+            if (role == "projector") != (arch == "clip"):
+                need = "a projector must be" if role == "projector" else "a model must not be"
+                raise AdapterRejected(f"{role} {path.name} has architecture {arch!r}; {need} 'clip'")
+        for path_str, want in (sha256 or {}).items():
+            got = _sha256(Path(path_str))
+            if got != want.lower():
+                raise AdapterRejected(f"sha256 mismatch for {path_str}: {got} != {want}")
+        entry = {"name": canonical_name(name), "model": str(model), "adapters": [],
+                 "projector": str(projector) if projector else None, "defaults": dict(defaults or {})}
+        self._write_declared(entry)
+        logger.warning("[Registry] declared %s -> %s%s", entry["name"], model.name,
+                       f" + {Path(projector).name}" if projector else "")
+        return entry
 
     # ---------------------------------------------------------------- publish
     def _validate(self, base_model: Path, adapter: Path) -> Dict[str, Any]:
