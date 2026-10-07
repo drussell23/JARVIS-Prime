@@ -319,3 +319,154 @@ def test_keep_alive_zero_unloads_when_idle_and_unknown_model_404(pool_factory):
             await pool.ensure("ghost:7b")
     asyncio.run(go())
     assert pool.engines == {} and gpu_state["used"] == 4000
+
+
+# ------------------------------------------------------------ training lease
+from jarvis_prime.engine.engine_pool import AdmissionClosed  # noqa: E402
+from jarvis_prime.engine.lease import LeaseConflict, LeaseState, LeaseTokenMismatch, TrainingLease  # noqa: E402
+
+
+def _leased(pool_factory, **kw):
+    pool, launched, gpu_state = pool_factory(**kw)
+    lease = TrainingLease(pool, gpu_probe=pool._gpu)
+    pool.admission_gate = lambda: (("leased", 5) if lease.state in (LeaseState.DRAINING, LeaseState.RELEASED)
+                                   else None)
+    return pool, lease, launched, gpu_state
+
+
+def test_lease_unloads_verifies_release_refuses_loads_and_restores(pool_factory):
+    pool, lease, launched, gpu_state = _leased(pool_factory)
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        got = await lease.acquire(holder="handoff", purpose="grpo", ttl_s=60)
+        assert got["freed_mib"] == 20000 and pool.engines == {}
+        assert gpu_state["used"] == 4000                       # the card is measurably free
+        with pytest.raises(AdmissionClosed):                    # nobody reloads during training
+            await pool.ensure("qwen3-coder-ov:30b")
+        with pytest.raises(LeaseConflict):
+            await lease.acquire(holder="other", purpose="x", ttl_s=60)
+        with pytest.raises(LeaseTokenMismatch):
+            await lease.release("wrong-token")
+        out = await lease.release(got["token"])
+        assert out["reloaded"] == ["qwen3-coder-ov:30b"] and lease.state == LeaseState.SERVING
+    asyncio.run(go())
+    assert len(launched) == 2                                   # loaded, then restored
+
+
+def test_lease_waits_for_inflight_generation_to_finish(pool_factory):
+    pool, lease, _, _ = _leased(pool_factory)
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            task = asyncio.ensure_future(lease.acquire(holder="h", purpose="p", ttl_s=60))
+            await asyncio.sleep(0.2)
+            assert lease.state == LeaseState.DRAINING and not task.done()
+        got = await task
+        assert got["freed_mib"] == 20000
+    asyncio.run(go())
+
+
+def test_unverifiable_release_aborts_and_restores_service(pool_factory):
+    pool, lease, _, gpu_state = _leased(pool_factory)
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        eng = pool.engines["qwen3-coder-ov:30b"]
+        eng.proc.terminate = lambda: None                       # a process that will not die
+        eng.proc.kill = lambda: None
+        with pytest.raises(TimeoutError):
+            await lease.acquire(holder="h", purpose="p", ttl_s=60, release_timeout_s=1.5)
+        assert lease.state == LeaseState.SERVING and lease.lease is None
+    asyncio.run(go())
+
+
+def test_concurrent_allocator_delta_is_not_attributed(pool_factory, monkeypatch):
+    pool, launched, gpu_state = pool_factory(model_mib=20000)
+    import jarvis_prime.engine.engine_pool as ep
+    from jarvis_prime.engine.model_store import ModelSpec
+    # The real 30B's mapped files; the fixture GGUFs are bytes, not gigabytes.
+    monkeypatch.setattr(ModelSpec, "size_bytes", property(lambda self: 18_583_454_368))
+
+    real = pool._launch
+    def freeing_launcher(argv, log):                            # another process frees 19.9 GB mid-load
+        p = real(argv, log)
+        gpu_state["used"] -= 19900
+        return p
+    pool._launch = freeing_launcher
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+    asyncio.run(go())
+    eng = pool.engines["qwen3-coder-ov:30b"]
+    assert eng.size_vram_bytes == pool.estimate_mib(eng.spec, 8192) * ep._MIB
+    assert ("qwen3-coder-ov:30b", 8192) not in pool._measured
+
+
+# ------------------------------------------------------------ adapter registry
+from jarvis_prime.engine.adapter_registry import AdapterRegistry, AdapterRejected  # noqa: E402
+
+
+def _adapter_bytes(tmp_path, arch="qwen3moe", gtype="adapter"):
+    p = _gguf(tmp_path / "lora.gguf", {"general.architecture": arch, "general.type": gtype,
+                                         "adapter.type": "lora"})
+    return p.read_bytes()
+
+
+@pytest.fixture
+def registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("JPRIME_ENGINE_ADAPTER_DIR", str(tmp_path / "adapters"))
+    monkeypatch.setenv("JPRIME_ENGINE_MODELS", str(tmp_path / "models.yaml"))
+    store = ModelStore(DeclaredModels(tmp_path / "models.yaml"), OllamaManifestStore(_ollama_store(tmp_path / "om")))
+    return AdapterRegistry(store), store
+
+
+def test_publish_activates_new_adapter_and_rollback_restores_origin(registry, tmp_path):
+    import hashlib as _h
+    reg, store = registry
+    origin = store.resolve("qwen3-coder-ov:30b")
+    data = _adapter_bytes(tmp_path)
+    out = reg.publish("qwen3-coder-ov:30b", data, sha256=_h.sha256(data).hexdigest(), source={"run": "r1"})
+    now = store.resolve("qwen3-coder-ov:30b")
+    assert now.source == "declared" and now.model_path == origin.model_path
+    assert now.adapter_paths != origin.adapter_paths and now.defaults == origin.defaults
+    assert out["previous"] == "origin"
+    reg.rollback("qwen3-coder-ov:30b")
+    assert store.resolve("qwen3-coder-ov:30b").adapter_paths == origin.adapter_paths
+
+
+@pytest.mark.parametrize("kw,why", [({"arch": "llama"}, "architecture"), ({"gtype": "model"}, "LoRA")])
+def test_wrong_adapters_are_refused_and_leave_nothing_behind(registry, tmp_path, kw, why):
+    import hashlib as _h
+    reg, store = registry
+    data = _adapter_bytes(tmp_path, **kw)
+    with pytest.raises(AdapterRejected, match=why):
+        reg.publish("qwen3-coder-ov:30b", data, sha256=_h.sha256(data).hexdigest())
+    assert store.resolve("qwen3-coder-ov:30b").source == "ollama-store"
+    assert not list((tmp_path / "adapters").rglob("*.gguf"))
+
+
+def test_sha_mismatch_is_refused(registry, tmp_path):
+    reg, _ = registry
+    with pytest.raises(AdapterRejected, match="sha256"):
+        reg.publish("qwen3-coder-ov:30b", _adapter_bytes(tmp_path), sha256="0" * 64)
+
+
+def test_changed_definition_reloads_resident_engine(pool_factory, registry, tmp_path):
+    import hashlib as _h
+    reg, store = registry
+    pool, launched, _ = pool_factory()
+    pool.store = store
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        data = _adapter_bytes(tmp_path)
+        reg.publish("qwen3-coder-ov:30b", data, sha256=_h.sha256(data).hexdigest())
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+    asyncio.run(go())
+    assert len(launched) == 2 and "adapters" in launched[1][launched[1].index("--lora") + 1]

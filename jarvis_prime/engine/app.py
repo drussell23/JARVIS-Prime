@@ -16,6 +16,7 @@ disconnect closes the upstream request (llama-server then stops decoding).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -28,8 +29,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from . import __version__, gguf_meta, gpu, protocol
-from .engine_pool import (EnginePool, EngineStartError, InsufficientVram, ModelNotFound,
-                          find_engine_binary)
+from .adapter_registry import AdapterRegistry, AdapterRejected
+from .engine_pool import (AdmissionClosed, EnginePool, EngineStartError, InsufficientVram,
+                          ModelNotFound, find_engine_binary)
+from .lease import LeaseConflict, LeaseState, LeaseTokenMismatch, TrainingLease
 from .model_store import ModelSpec, canonical_name
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,18 @@ def _details(spec: ModelSpec) -> Dict[str, Any]:
 
 def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
     pool = pool or EnginePool()
+    lease = TrainingLease(pool)
+    registry = AdapterRegistry(pool.store)
+
+    def _gate():
+        # Generations and loads are refused while a trainer holds (or is
+        # being handed) the card; RESTORING is the lease reloading models.
+        if lease.state in (LeaseState.DRAINING, LeaseState.RELEASED):
+            who = lease.lease.holder if lease.lease else "?"
+            return (f"J-Prime is {lease.state.value}: training lease held by {who}",
+                    lease.retry_after_s())
+        return None
+    pool.admission_gate = _gate
     default_model = os.environ.get("JPRIME_ENGINE_DEFAULT_MODEL", "").strip()
     preload = os.environ.get("JPRIME_ENGINE_PRELOAD", "").strip()
     state: Dict[str, Any] = {}
@@ -101,6 +116,74 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
     async def _es(_r: Request, exc: EngineStartError) -> JSONResponse:
         return _err(500, str(exc))
 
+    @app.exception_handler(AdmissionClosed)
+    async def _ac(_r: Request, exc: AdmissionClosed) -> JSONResponse:
+        return JSONResponse({"error": str(exc), "lease": lease.status()}, status_code=503,
+                            headers={"Retry-After": str(exc.retry_after_s)})
+
+    @app.exception_handler(LeaseConflict)
+    async def _lc(_r: Request, exc: LeaseConflict) -> JSONResponse:
+        return JSONResponse({"error": str(exc), "lease": lease.status()}, status_code=409)
+
+    @app.exception_handler(LeaseTokenMismatch)
+    async def _lt(_r: Request, exc: LeaseTokenMismatch) -> JSONResponse:
+        return _err(409, str(exc))
+
+    @app.exception_handler(AdapterRejected)
+    async def _ar(_r: Request, exc: AdapterRejected) -> JSONResponse:
+        return _err(422, str(exc))
+
+    # ------------------------------------------------------------ training lease
+    @app.get("/v1/lease")
+    async def lease_status() -> Dict[str, Any]:
+        return lease.status()
+
+    @app.post("/v1/lease/acquire")
+    async def lease_acquire(request: Request) -> Dict[str, Any]:
+        b = await request.json()
+        return await lease.acquire(holder=str(b.get("holder") or "unknown"),
+                                   purpose=str(b.get("purpose") or ""),
+                                   ttl_s=float(b.get("ttl_s") or 300.0),
+                                   drain_timeout_s=b.get("drain_timeout_s"),
+                                   release_timeout_s=b.get("release_timeout_s"))
+
+    @app.post("/v1/lease/renew")
+    async def lease_renew(request: Request) -> Dict[str, Any]:
+        b = await request.json()
+        return await lease.renew(str(b.get("token") or ""), b.get("ttl_s"))
+
+    @app.post("/v1/lease/release")
+    async def lease_release(request: Request) -> Dict[str, Any]:
+        b = await request.json()
+        return await lease.release(str(b.get("token") or ""),
+                                   restore_models=b.get("restore_models"))
+
+    # ------------------------------------------------------------ adapters
+    @app.get("/v1/adapters/{name:path}")
+    async def adapters(name: str) -> Dict[str, Any]:
+        return registry.versions(name)
+
+    @app.post("/v1/adapters/{name:path}/publish")
+    async def adapter_publish(name: str, request: Request) -> Dict[str, Any]:
+        data = await request.body()
+        source = request.headers.get("x-adapter-source", "")
+        try:
+            meta = json.loads(source) if source else {}
+        except ValueError:
+            meta = {"raw": source[:500]}
+        return await asyncio.to_thread(
+            registry.publish, name, data, sha256=request.headers.get("x-adapter-sha256", ""),
+            source=meta, activate=request.query_params.get("activate", "true") != "false")
+
+    @app.post("/v1/adapters/{name:path}/rollback")
+    async def adapter_rollback(name: str) -> Dict[str, Any]:
+        return await asyncio.to_thread(registry.rollback, name)
+
+    @app.post("/v1/adapters/{name:path}/activate")
+    async def adapter_activate(name: str, request: Request) -> Dict[str, Any]:
+        b = await request.json()
+        return await asyncio.to_thread(registry.activate, name, str(b.get("version") or ""))
+
     # ------------------------------------------------------------ discovery
     @app.get("/")
     async def root() -> PlainTextResponse:
@@ -119,6 +202,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
             "status": "healthy" if binary else "degraded",
             "engine": "llama.cpp", "engine_binary": str(binary) if binary else None,
             "default_model": default_model or None,
+            "lease": lease.status(),
             "resident": [{"name": e.spec.name, "ctx": e.ctx, "size_vram": e.size_vram_bytes,
                           "inflight": e.inflight} for e in pool.resident()],
             "gpu": {"name": mem.name, "total_mib": mem.total_mib, "free_mib": mem.free_mib} if mem else None,
@@ -180,7 +264,7 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
                     if translator is None:
                         yield f"data: {{\"error\": {detail!r}}}\n\n".encode()
                     else:
-                        yield (protocol.json.dumps({"error": detail}) + "\n").encode()
+                        yield (json.dumps({"error": detail}) + "\n").encode()
                     return
                 if translator is None:
                     async for chunk in r.aiter_raw():

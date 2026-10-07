@@ -40,7 +40,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -63,6 +63,15 @@ class InsufficientVram(RuntimeError):
 
 class EngineStartError(RuntimeError):
     pass
+
+
+class AdmissionClosed(RuntimeError):
+    """The pool is not loading models right now (e.g. a training lease holds
+    the card). Carries the seconds after which a retry is sensible."""
+
+    def __init__(self, reason: str, retry_after_s: int) -> None:
+        super().__init__(reason)
+        self.retry_after_s = retry_after_s
 
 
 def _env_int(name: str, default: int) -> int:
@@ -127,6 +136,10 @@ class EngineConfig:
     default_keep_alive_s: Optional[float] = field(
         default_factory=lambda: parse_keep_alive(os.environ.get("JPRIME_ENGINE_KEEP_ALIVE", "5m"), 300.0))
     vram_headroom_mib: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_VRAM_HEADROOM_MIB", 1024))
+    #: A load's VRAM delta is attributed to it only if it covers at least this
+    #: fraction of the files it mapped (weights are fully offloaded).
+    min_attributable_fraction: float = field(default_factory=lambda: float(
+        os.environ.get("JPRIME_ENGINE_MIN_ATTRIBUTABLE_FRACTION", "") or 0.9))
     extra_args: List[str] = field(
         default_factory=lambda: shlex.split(os.environ.get("JPRIME_ENGINE_EXTRA_ARGS", ""), posix=not _IS_WINDOWS))
     state_dir: Path = field(default_factory=lambda: Path(
@@ -269,6 +282,9 @@ class EnginePool:
         self._measured: Dict[Any, int] = {}   # (name, ctx) -> MiB a load actually took
         self._load_lock = asyncio.Lock()
         self._reaper: Optional[asyncio.Task] = None
+        #: Set by the owner of exclusivity (the training lease). Returns None
+        #: when generations may proceed, else (reason, retry_after_s).
+        self.admission_gate: Optional[Callable[[], Optional[Tuple[str, int]]]] = None
 
     # ------------------------------------------------------------------ state
     @property
@@ -413,16 +429,29 @@ class EnginePool:
                 raise EngineStartError(f"{spec.name} not ready after {self.config.load_timeout_s:.0f}s; see {log_path}")
             await asyncio.sleep(0.5)
         after = await asyncio.to_thread(self._gpu)
-        if before and after and after.used_mib > before.used_mib:
-            eng.size_vram_bytes = (after.used_mib - before.used_mib) * _MIB
-            self._measured[(spec.name, ctx)] = after.used_mib - before.used_mib
+        delta = (after.used_mib - before.used_mib) if (before and after) else 0
+        # A fully offloaded model cannot occupy less VRAM than its own weights.
+        # A smaller delta means another process freed memory during the load
+        # (measured 2026-10-07: 2226 MiB "for" an 18.6 GB model while a trainer
+        # was releasing the card), so the reading is NOT attributable and is
+        # neither reported nor learned.
+        if delta * _MIB >= spec.size_bytes * self.config.min_attributable_fraction:
+            eng.size_vram_bytes = delta * _MIB
+            self._measured[(spec.name, ctx)] = delta
         else:
+            if delta:
+                logger.warning("[Engine] %s VRAM delta %d MiB is below its %d MiB of weights -- a "
+                               "concurrent allocator moved; using the estimate", spec.name, delta,
+                               spec.size_bytes // _MIB)
             eng.size_vram_bytes = self.estimate_mib(spec, ctx) * _MIB
         logger.info("[Engine] %s ready in %.1fs, vram=%d MiB", spec.name,
                     time.time() - eng.started_at, eng.size_vram_bytes // _MIB)
         return eng
 
     async def ensure(self, name: str, num_ctx: Optional[int] = None) -> Engine:
+        closed = self.admission_gate() if self.admission_gate else None
+        if closed:
+            raise AdmissionClosed(*closed)
         spec = self.store.resolve(name)
         if spec is None:
             raise ModelNotFound(f"model '{name}' not found")
@@ -431,10 +460,16 @@ class EnginePool:
             want = self._wanted_ctx(spec, num_ctx)
             eng = self.engines.get(key)
             if eng is not None and eng.alive():
-                if eng.ctx >= want or eng.inflight > 0:
+                if eng.spec != spec and eng.inflight == 0:
+                    # The model's files changed under its name (a new adapter
+                    # was published): serve the new one, never the stale one.
+                    logger.info("[Engine] %s definition changed -- reloading", key)
+                    await self._unload_locked(key)
+                elif eng.ctx >= want or eng.inflight > 0:
                     return eng
-                logger.info("[Engine] %s ctx %d < requested %d -- reloading larger", key, eng.ctx, want)
-                await self._unload_locked(key)
+                else:
+                    logger.info("[Engine] %s ctx %d < requested %d -- reloading larger", key, eng.ctx, want)
+                    await self._unload_locked(key)
             elif eng is not None:
                 self.engines.pop(key, None)
             eng = await self._load(spec, want)

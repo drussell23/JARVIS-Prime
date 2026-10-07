@@ -193,8 +193,12 @@ class DeclaredModels:
     """
 
     def __init__(self, path: Optional[Path] = None) -> None:
-        env = os.environ.get("JPRIME_ENGINE_MODELS", "").strip()
-        self.path = Path(path) if path else (Path(env) if env else None)
+        if path is None:
+            # The env override, else J-Prime's own file -- the one the adapter
+            # registry writes, so a published fine-tune survives a restart.
+            from .adapter_registry import declared_models_path
+            path = declared_models_path()
+        self.path = Path(path)
 
     def _entries(self) -> Iterable[Dict[str, Any]]:
         if self.path is None or not self.path.is_file():
