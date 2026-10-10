@@ -231,7 +231,10 @@ def pool_factory(tmp_path):
             return True
 
         cfg = EngineConfig(binary=Path("llama-server"), state_dir=tmp_path / "state",
-                           default_keep_alive_s=300.0, vram_headroom_mib=512)
+                           default_keep_alive_s=300.0, vram_headroom_mib=512,
+                           # One slot: these pins are about ctx/admission; the
+                           # slot tests set their own count (unset is auto).
+                           parallel=1)
         pool = EnginePool(ModelStore(DeclaredModels(tmp_path / "none.yaml"), OllamaManifestStore(root)), cfg,
                           gpu_probe=lambda: GpuMemory("RTX 5090", total_mib, gpu_state["used"]),
                           launcher=launcher, health_check=healthy)
@@ -738,3 +741,11 @@ def test_ps_reports_the_slot_count(pool_factory, monkeypatch):
     client = TestClient(create_app(pool))
     models = client.get("/api/ps").json()["models"]
     assert models and models[0]["parallel"] == 2
+
+
+def test_unset_slots_are_auto_and_a_count_or_auto_is_honoured(monkeypatch):
+    monkeypatch.delenv("JPRIME_ENGINE_PARALLEL", raising=False)
+    assert ep._parallel_setting() == 0, "unset: the card decides"
+    for raw, want in (("auto", 0), ("AUTO", 0), ("3", 3), ("0", 1), ("junk", 1)):
+        monkeypatch.setenv("JPRIME_ENGINE_PARALLEL", raw)
+        assert ep._parallel_setting() == want, raw

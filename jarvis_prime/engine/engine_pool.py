@@ -84,9 +84,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _parallel_setting() -> int:
-    """``JPRIME_ENGINE_PARALLEL``: a slot count, or ``auto`` (returned as 0)."""
+    """``JPRIME_ENGINE_PARALLEL``: a slot count, or ``auto`` (returned as 0).
+
+    Unset is ``auto``: the card decides, and an unreadable card or an unknown
+    KV geometry already resolves to one slot in :meth:`EnginePool.slots_for`."""
     raw = os.environ.get("JPRIME_ENGINE_PARALLEL", "").strip().lower()
-    if raw == "auto":
+    if raw in ("", "auto"):
         return 0
     return max(1, _env_int("JPRIME_ENGINE_PARALLEL", 1))
 

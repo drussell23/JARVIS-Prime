@@ -10,6 +10,7 @@ Environment (all optional):
   JPRIME_ENGINE_MODELS                        YAML of declared models (else the Ollama store)
   JPRIME_ENGINE_DEFAULT_CTX / _MAX_CTX        context when a request names none / ceiling
   JPRIME_ENGINE_KEEP_ALIVE                    default residency after last request (5m)
+  JPRIME_ENGINE_PARALLEL / _PARALLEL_MAX      generation slots: a count, or auto (default, from the card)
 """
 from __future__ import annotations
 
@@ -25,6 +26,8 @@ def main() -> None:
     ap.add_argument("--preload", default=None, help="model to load at startup (resident until evicted)")
     ap.add_argument("--default-model", default=None)
     ap.add_argument("--ctx", type=int, default=None, help="context for a model loaded with no num_ctx")
+    ap.add_argument("--parallel", default=None,
+                    help="generation slots per engine: a count, or 'auto' to size them from free VRAM")
     ap.add_argument("--log-level", default=os.environ.get("JPRIME_ENGINE_LOG_LEVEL", "info"))
     ap.add_argument("--log-file", default=os.environ.get("JPRIME_ENGINE_LOG_FILE", ""),
                     help="write logs here instead of stderr (a detached engine has no console)")
@@ -32,6 +35,8 @@ def main() -> None:
 
     if args.ctx:
         os.environ["JPRIME_ENGINE_DEFAULT_CTX"] = str(args.ctx)
+    if args.parallel:
+        os.environ["JPRIME_ENGINE_PARALLEL"] = args.parallel
     if args.preload:
         os.environ["JPRIME_ENGINE_PRELOAD"] = args.preload
     if args.default_model:
