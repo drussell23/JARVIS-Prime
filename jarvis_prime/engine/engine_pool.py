@@ -50,6 +50,8 @@ from .model_store import ModelSpec, ModelStore, canonical_name
 logger = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
+#: llama.cpp compute buffers beside weights and KV (a floor, not a measurement).
+_COMPUTE_BYTES = 512 * _MIB
 _IS_WINDOWS = sys.platform == "win32"
 
 
@@ -79,6 +81,14 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip() or default)
     except ValueError:
         return default
+
+
+def _parallel_setting() -> int:
+    """``JPRIME_ENGINE_PARALLEL``: a slot count, or ``auto`` (returned as 0)."""
+    raw = os.environ.get("JPRIME_ENGINE_PARALLEL", "").strip().lower()
+    if raw == "auto":
+        return 0
+    return max(1, _env_int("JPRIME_ENGINE_PARALLEL", 1))
 
 
 def default_engine_home() -> Path:
@@ -130,7 +140,12 @@ class EngineConfig:
     gpu_layers: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_GPU_LAYERS", 999))
     default_ctx: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_DEFAULT_CTX", 8192))
     max_ctx: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_MAX_CTX", 131072))
-    parallel: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_PARALLEL", 1))
+    #: Generation slots per engine (llama-server ``--parallel``). ``auto`` (0)
+    #: derives it at load from MEASURED free VRAM and the model's own KV
+    #: geometry: every slot carries a full ``ctx`` of KV, so the card, not a
+    #: guess, decides how many concurrent generations it can serve.
+    parallel: int = field(default_factory=lambda: _parallel_setting())
+    parallel_max: int = field(default_factory=lambda: max(1, _env_int("JPRIME_ENGINE_PARALLEL_MAX", 4)))
     flash_attn: str = field(default_factory=lambda: os.environ.get("JPRIME_ENGINE_FLASH_ATTN", "on"))
     load_timeout_s: float = field(default_factory=lambda: float(_env_int("JPRIME_ENGINE_LOAD_TIMEOUT_S", 300)))
     default_keep_alive_s: Optional[float] = field(
@@ -241,6 +256,8 @@ class Engine:
     port: int
     proc: subprocess.Popen
     log_path: Path
+    #: Generation slots this engine was launched with (each holds ``ctx``).
+    parallel: int = 1
     started_at: float = field(default_factory=time.time)
     size_vram_bytes: int = 0
     inflight: int = 0
@@ -358,15 +375,41 @@ class EnginePool:
                     await self.unload(name)
 
     # ------------------------------------------------------------- admission
-    def estimate_mib(self, spec: ModelSpec, ctx: int) -> int:
+    def estimate_mib(self, spec: ModelSpec, ctx: int, slots: int = 1) -> int:
         """VRAM a load will need: what it measurably took last time at this
-        context if we have seen it, else file size + KV from its geometry."""
-        measured = self._measured.get((spec.name, ctx))
+        context and slot count if we have seen it, else file size + KV from
+        its geometry. The engine is launched with ``-c ctx*slots``, so the KV
+        is per SLOT: counting one slot under-admitted every parallel load."""
+        slots = max(1, int(slots))
+        measured = self._measured.get((spec.name, ctx, slots))
         if measured:
             return measured
-        kv = gguf_meta.kv_bytes_per_token(gguf_meta.read_metadata(spec.model_path)) * ctx
-        compute = 512 * _MIB
-        return int((spec.size_bytes + kv + compute) / _MIB)
+        kv = gguf_meta.kv_bytes_per_token(gguf_meta.read_metadata(spec.model_path)) * ctx * slots
+        return int((spec.size_bytes + kv + _COMPUTE_BYTES) / _MIB)
+
+    def slots_for(self, spec: ModelSpec, ctx: int, *, budget_mib: Optional[int]) -> int:
+        """How many generation slots to launch *spec* with at *ctx*.
+
+        A fixed ``JPRIME_ENGINE_PARALLEL`` is honoured as given. ``auto``
+        derives it: (budget - headroom - weights - compute) / KV-per-slot,
+        clamped to ``[1, JPRIME_ENGINE_PARALLEL_MAX]``. An unreadable card or
+        an undeclared KV geometry is ONE slot: over-subscription is the
+        failure being prevented (every stream returned tokens=0 at four on
+        2026-09-08), so an unknown must not be assumed roomy."""
+        c = self.config
+        if c.parallel >= 1:
+            return c.parallel
+        kv_slot = gguf_meta.kv_bytes_per_token(gguf_meta.read_metadata(spec.model_path)) * ctx
+        if not budget_mib or kv_slot <= 0:
+            return 1
+        spare = budget_mib * _MIB - c.vram_headroom_mib * _MIB - spec.size_bytes - _COMPUTE_BYTES
+        return max(1, min(c.parallel_max, int(spare // kv_slot)))
+
+    def _evictable_mib(self, keep: str) -> int:
+        """VRAM ``_make_room`` could free for *keep*: idle engines it may evict."""
+        protected = set() if keep in self.config.pinned else set(self.config.pinned)
+        return sum(e.size_vram_bytes // _MIB for n, e in self.engines.items()
+                   if n != keep and e.inflight == 0 and n not in protected)
 
     async def _make_room(self, need_mib: int, keep: str) -> None:
         while True:
@@ -393,16 +436,17 @@ class EnginePool:
             await self._unload_locked(victim.spec.name)  # caller holds _load_lock
 
     # ---------------------------------------------------------------- loading
-    def _argv(self, spec: ModelSpec, ctx: int, port: int) -> List[str]:
+    def _argv(self, spec: ModelSpec, ctx: int, port: int, slots: int = 1) -> List[str]:
         c = self.config
+        slots = max(1, int(slots))
         argv = [str(c.resolve_binary()), "--model", str(spec.model_path)]
         for a in spec.adapter_paths:
             argv += ["--lora", str(a)]
         if spec.projector_path:
             argv += ["--mmproj", str(spec.projector_path)]
         argv += ["--alias", spec.name, "--host", "127.0.0.1", "--port", str(port),
-                 "-ngl", str(c.gpu_layers), "-c", str(ctx * max(c.parallel, 1)),
-                 "--parallel", str(max(c.parallel, 1)), "--jinja", "-fa", c.flash_attn, "--metrics"]
+                 "-ngl", str(c.gpu_layers), "-c", str(ctx * slots),
+                 "--parallel", str(slots), "--jinja", "-fa", c.flash_attn, "--metrics"]
         return argv + list(c.extra_args)
 
     def _wanted_ctx(self, spec: ModelSpec, num_ctx: Optional[int]) -> int:
@@ -421,16 +465,19 @@ class EnginePool:
             return False
 
     async def _load(self, spec: ModelSpec, ctx: int) -> Engine:
-        await self._make_room(self.estimate_mib(spec, ctx), keep=spec.name)
+        mem = await asyncio.to_thread(self._gpu)
+        budget = (mem.free_mib + self._evictable_mib(spec.name)) if mem is not None else None
+        slots = self.slots_for(spec, ctx, budget_mib=budget)
+        await self._make_room(self.estimate_mib(spec, ctx, slots), keep=spec.name)
         before = await asyncio.to_thread(self._gpu)
         port = _free_port()
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", spec.name)
         log_path = self.config.state_dir / "logs" / f"{safe}.log"
-        argv = self._argv(spec, ctx, port)
-        logger.info("[Engine] loading %s ctx=%d port=%d adapters=%d", spec.name, ctx, port,
-                    len(spec.adapter_paths))
+        argv = self._argv(spec, ctx, port, slots)
+        logger.info("[Engine] loading %s ctx=%d slots=%d port=%d adapters=%d", spec.name, ctx,
+                    slots, port, len(spec.adapter_paths))
         proc = await asyncio.to_thread(self._launch, argv, log_path)
-        eng = Engine(spec=spec, ctx=ctx, port=port, proc=proc, log_path=log_path)
+        eng = Engine(spec=spec, ctx=ctx, port=port, proc=proc, log_path=log_path, parallel=slots)
         deadline = time.monotonic() + self.config.load_timeout_s
         while True:
             if not eng.alive():
@@ -450,13 +497,13 @@ class EnginePool:
         # neither reported nor learned.
         if delta * _MIB >= spec.size_bytes * self.config.min_attributable_fraction:
             eng.size_vram_bytes = delta * _MIB
-            self._measured[(spec.name, ctx)] = delta
+            self._measured[(spec.name, ctx, slots)] = delta
         else:
             if delta:
                 logger.warning("[Engine] %s VRAM delta %d MiB is below its %d MiB of weights -- a "
                                "concurrent allocator moved; using the estimate", spec.name, delta,
                                spec.size_bytes // _MIB)
-            eng.size_vram_bytes = self.estimate_mib(spec, ctx) * _MIB
+            eng.size_vram_bytes = self.estimate_mib(spec, ctx, slots) * _MIB
         logger.info("[Engine] %s ready in %.1fs, vram=%d MiB", spec.name,
                     time.time() - eng.started_at, eng.size_vram_bytes // _MIB)
         return eng

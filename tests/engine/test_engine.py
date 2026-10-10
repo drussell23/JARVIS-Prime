@@ -428,7 +428,7 @@ def test_concurrent_allocator_delta_is_not_attributed(pool_factory, monkeypatch)
     asyncio.run(go())
     eng = pool.engines["qwen3-coder-ov:30b"]
     assert eng.size_vram_bytes == pool.estimate_mib(eng.spec, 8192) * ep._MIB
-    assert ("qwen3-coder-ov:30b", 8192) not in pool._measured
+    assert ("qwen3-coder-ov:30b", 8192, 1) not in pool._measured
 
 
 # ------------------------------------------------------------ adapter registry
@@ -656,3 +656,85 @@ def test_the_cli_inherits_the_names_existing_defaults(declared_env, monkeypatch,
                   "--inherit-defaults", "--default", "num_ctx=8192"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0 and out["defaults"]["temperature"] == 0.7 and out["defaults"]["num_ctx"] == 8192
+
+
+# ---------------------------------------------------------------- generation slots
+
+import jarvis_prime.engine.engine_pool as ep  # noqa: E402
+
+_KV_PER_TOKEN = 96 * 1024          # the 30B's f16 KV geometry, ~96 KiB/token
+
+
+def _slots_pool(pool_factory, monkeypatch, parallel, *, total_mib=32000, model_mib=18000):
+    monkeypatch.setattr(gguf_meta, "kv_bytes_per_token", lambda _meta: _KV_PER_TOKEN)
+    pool, launched, gpu_state = pool_factory(total_mib=total_mib, model_mib=model_mib)
+    pool.config.parallel = parallel
+    return pool, launched, gpu_state
+
+
+def _argv_value(argv, flag):
+    return int(argv[argv.index(flag) + 1])
+
+
+def test_a_fixed_slot_count_is_honoured_and_reported(pool_factory, monkeypatch):
+    pool, launched, _ = _slots_pool(pool_factory, monkeypatch, 2)
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192) as eng:
+            return eng
+    eng = asyncio.run(go())
+    assert eng.parallel == 2
+    assert _argv_value(launched[-1], "--parallel") == 2
+    assert _argv_value(launched[-1], "-c") == 8192 * 2, "each slot carries a full ctx"
+
+
+def test_auto_slots_follow_the_measured_card(pool_factory, monkeypatch):
+    """(free - headroom - weights - compute) / KV-per-slot, from the probe."""
+    pool, launched, gpu_state = _slots_pool(pool_factory, monkeypatch, 0)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    free = 32000 - gpu_state["used"]
+    kv_slot = _KV_PER_TOKEN * 32768
+    spare = free * ep._MIB - 512 * ep._MIB - spec.size_bytes - ep._COMPUTE_BYTES
+    expected = max(1, min(pool.config.parallel_max, int(spare // kv_slot)))
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 32768) as eng:
+            return eng
+    eng = asyncio.run(go())
+    assert eng.parallel == expected == _argv_value(launched[-1], "--parallel")
+
+
+def test_auto_slots_never_exceed_the_ceiling(pool_factory, monkeypatch):
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0, total_mib=200000)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    assert pool.slots_for(spec, 4096, budget_mib=200000) == pool.config.parallel_max
+
+
+def test_an_unknown_card_or_geometry_is_one_slot(pool_factory, monkeypatch):
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    assert pool.slots_for(spec, 32768, budget_mib=None) == 1
+    monkeypatch.setattr(gguf_meta, "kv_bytes_per_token", lambda _meta: 0)
+    assert pool.slots_for(spec, 32768, budget_mib=32000) == 1
+
+
+def test_the_estimate_counts_kv_per_slot(pool_factory, monkeypatch):
+    """Launched with -c ctx*slots: one slot's KV under-admitted every parallel load."""
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 1)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    one, three = pool.estimate_mib(spec, 32768, 1), pool.estimate_mib(spec, 32768, 3)
+    assert three - one == (2 * _KV_PER_TOKEN * 32768) // ep._MIB
+
+
+def test_ps_reports_the_slot_count(pool_factory, monkeypatch):
+    from fastapi.testclient import TestClient
+    from jarvis_prime.engine.app import create_app
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 2)
+
+    async def warm():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+    asyncio.run(warm())
+    client = TestClient(create_app(pool))
+    models = client.get("/api/ps").json()["models"]
+    assert models and models[0]["parallel"] == 2

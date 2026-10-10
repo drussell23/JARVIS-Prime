@@ -263,7 +263,10 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
                    if e.expires_wall else _FOREVER)
             out.append({"name": e.spec.name, "model": e.spec.name, "size": e.spec.size_bytes,
                         "size_vram": e.size_vram_bytes, "digest": e.spec.digest,
-                        "details": _details(e.spec), "expires_at": exp, "context_length": e.ctx})
+                        "details": _details(e.spec), "expires_at": exp, "context_length": e.ctx,
+                        # Generation slots: how many requests run at once, each
+                        # with context_length. O+V sizes its concurrency from this.
+                        "parallel": e.parallel})
         return {"models": out}
 
     @app.post("/api/show")
