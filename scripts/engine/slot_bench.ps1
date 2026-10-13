@@ -37,7 +37,14 @@ $log = Join-Path $stateDir 'slot_bench.log'
 $stopMarker = Join-Path $stateDir "slot_bench-$Run.stop"
 $wsl = Join-Path $env:WINDIR 'System32\wsl.exe'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
-function Say($m) { "$(Get-Date -Format s) [$Run] $m" | Add-Content -Path $log }
+# A log line must never end the driver: under ErrorActionPreference=Stop a
+# locked file (another writer, an editor, the installer) threw and killed it.
+function Say($m) {
+  $line = "$(Get-Date -Format s) [$Run] $m"
+  for ($i = 0; $i -lt 5; $i++) {
+    try { Add-Content -Path $log -Value $line -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 200 }
+  }
+}
 function Bench([string[]]$a) { & $wsl -d Ubuntu -u jarvis_svc -- $Python $Bench @a }
 
 if ($Stop) {
@@ -50,14 +57,22 @@ if ($Stop) {
 
 if ($Install) {
   Remove-Item -Force -ErrorAction SilentlyContinue $stopMarker
-  $args_ = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Run $Run"
-  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args_
+  # conhost --headless, as start_detached_wsl.ps1 does for every soak that has
+  # survived for hours. The first run of this driver used a plain hidden
+  # powershell.exe, and at 02:43 on 2026-10-13 it died with 0xC000013A
+  # (STATUS_CONTROL_C_EXIT): a console attached to the interactive session can be
+  # sent a close or Ctrl+C. Its wsl.exe went with it and SIGHUPed the arm.
+  $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $args_ = "--headless `"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Run $Run"
+  $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR 'System32\conhost.exe') -Argument $args_
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
   # No time limit: the bench ends itself; a limit would kill the VM's client.
   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+    -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Settings $settings -Force | Out-Null
+    -Settings $settings -Principal $principal -Force | Out-Null
   Start-ScheduledTask -TaskName $TaskName
   Say "installed $TaskName (runs now, resumes at logon)"
   return
