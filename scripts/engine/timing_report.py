@@ -1,18 +1,22 @@
 """Summarise llama-server timing lines into the figures BENCHMARKS.md publishes.
 
-    python scripts/engine/timing_report.py %LOCALAPPDATA%\\JARVIS\\jprime\\state\\logs\\qwen3-coder-ov_30b.log
+    python scripts/engine/timing_report.py --head-lines 3505 %LOCALAPPDATA%\\JARVIS\\jprime\\state\\logs\\qwen3-coder-ov_30b.log
 
 Every request llama-server finishes logs a ``prompt eval time`` line (prefill:
 only the tokens NOT served from the prompt cache) and an ``eval time`` line
 (decode). This reads both, so a published number can always be regenerated
 from the log it came from rather than transcribed by hand. Stdlib only.
+
+The engine log is append-only and carries no wall-clock timestamps, so a
+published snapshot is pinned by line count: ``--head-lines N`` reads only the
+first N lines, the traffic that existed when the figures were taken.
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sys
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 _PREFILL = re.compile(r"prompt eval time =\s+([\d.]+) ms /\s+(\d+) tokens.*?([\d.]+) tokens per second")
 _DECODE = re.compile(r"\|\s+eval time =\s+([\d.]+) ms /\s+(\d+) tokens.*?([\d.]+) tokens per second")
@@ -29,11 +33,13 @@ def _quantile(values: Sequence[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
-def parse(path: str) -> Tuple[List[Timing], List[Timing]]:
+def parse(path: str, head_lines: Optional[int] = None) -> Tuple[List[Timing], List[Timing]]:
     prefill: List[Timing] = []
     decode: List[Timing] = []
     with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
+            if head_lines is not None and lineno > head_lines:
+                break
             m = _PREFILL.search(line)
             if m:
                 prefill.append((float(m[1]), int(m[2]), float(m[3])))
@@ -44,9 +50,10 @@ def parse(path: str) -> Tuple[List[Timing], List[Timing]]:
     return prefill, decode
 
 
-def report(path: str) -> str:
-    prefill, decode = parse(path)
-    out = [f"{path}: {len(decode)} generations"]
+def report(path: str, head_lines: Optional[int] = None) -> str:
+    prefill, decode = parse(path, head_lines)
+    scope = f" (first {head_lines} lines)" if head_lines is not None else ""
+    out = [f"{path}{scope}: {len(decode)} generations"]
     rates = [tps for _, n, tps in decode if n >= _MIN_DECODE_TOKENS]
     if rates:
         out.append(
@@ -66,9 +73,13 @@ def report(path: str) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+", help="llama-server log files")
+    ap.add_argument("--head-lines", type=int, default=None, metavar="N",
+                    help="read only the first N lines of each log (pins a published snapshot)")
     args = ap.parse_args(argv)
+    if args.head_lines is not None and args.head_lines < 1:
+        ap.error("--head-lines must be >= 1")
     for path in args.logs:
-        print(report(path))
+        print(report(path, args.head_lines))
     return 0
 
 
