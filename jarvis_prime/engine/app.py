@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from . import __version__, gguf_meta, gpu, protocol
 from .adapter_registry import AdapterRegistry, AdapterRejected
+from .code_identity import code_identity
 from .engine_pool import (BACKGROUND, FOREGROUND, request_priority)
 from .engine_pool import (AdmissionClosed, EnginePool, EngineStartError, InsufficientVram,
                           ModelNotFound, find_engine_binary)
@@ -233,8 +234,11 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         return PlainTextResponse("J-Prime Engine is running")
 
     @app.get("/api/version")
-    async def version() -> Dict[str, str]:
-        return {"version": f"jprime-engine-{__version__}"}
+    async def version() -> Dict[str, Any]:
+        # "code": what this process runs, so a launcher can replace an engine
+        # started before the checkout changed (code_identity).
+        return {"version": f"jprime-engine-{__version__}",
+                "code": await asyncio.to_thread(code_identity)}
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:

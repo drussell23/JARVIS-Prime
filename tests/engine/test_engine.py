@@ -924,3 +924,21 @@ def test_a_pinned_model_stays_resident_after_requests_that_name_no_keep_alive(po
     pinned, stated, unpinned = asyncio.run(go())
     assert pinned is None
     assert stated is not None and unpinned is not None
+
+
+def test_version_reports_the_code_this_engine_runs(pool_factory):
+    # A launcher replaces an engine started before the checkout changed; it
+    # can only tell from what the engine says it loaded and when it started.
+    from fastapi.testclient import TestClient
+    import os
+    from pathlib import Path
+    import jarvis_prime.engine.app as app_mod
+    pool, _, _ = pool_factory()
+    with TestClient(app_mod.create_app(pool)) as c:
+        v = c.get("/api/version").json()
+    code = v["code"]
+    assert v["version"].startswith("jprime-engine-")
+    assert code["pid"] == os.getpid() and code["started_at"]
+    assert Path(code["root"]) == Path(app_mod.__file__).resolve().parents[2]
+    assert "jarvis_prime/engine/app.py" in code["sources"]
+    assert all(not s.startswith("..") and s.endswith(".py") for s in code["sources"])
