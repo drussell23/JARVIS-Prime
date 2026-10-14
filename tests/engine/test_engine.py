@@ -880,3 +880,24 @@ def test_a_foreground_companion_does_not_plan_slots_on_the_primarys_memory(pool_
 
     got, expected, _ = asyncio.run(go())
     assert got == expected
+
+
+# ------------------------------------------------------------ health contract
+def test_health_satisfies_the_trinity_contract_and_follows_the_lease(pool_factory, monkeypatch):
+    """JARVIS's boot gate requires `ready_for_inference` (startup_contracts
+    "prime:/health"); a lent GPU must read not-ready, not merely degraded."""
+    from fastapi.testclient import TestClient
+    import jarvis_prime.engine.app as app_mod
+
+    monkeypatch.setattr(app_mod, "find_engine_binary", lambda: "llama-server")
+    pool, _, _ = pool_factory()
+    app = app_mod.create_app(pool)
+    with TestClient(app) as c:
+        h = c.get("/health").json()
+        assert h["ready_for_inference"] is True and h["model_loaded"] is False
+        assert "inference" in h["capabilities"]
+    from jarvis_prime.engine.lease import TrainingLease
+    monkeypatch.setattr(TrainingLease, "admitting", property(lambda self: False))  # lent to training
+    with TestClient(app_mod.create_app(pool)) as c:
+        h = c.get("/health").json()
+        assert h["ready_for_inference"] is False and h["capabilities"] == []

@@ -239,16 +239,26 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
     @app.get("/health")
     async def health() -> Dict[str, Any]:
         mem = await asyncio.to_thread(gpu.query)
+        specs = await asyncio.to_thread(pool.store.all_specs)
         binary = find_engine_binary()
+        resident = pool.resident()
+        # Trinity health contract (JARVIS startup_contracts "prime:/health").
+        # Models load on demand, so readiness is "a request would be served":
+        # an engine binary, a declared model, and the GPU not lent to training.
+        ready = bool(binary) and bool(specs) and lease.admitting
         return {
             "service": "jarvis_prime", "component": "engine", "version": __version__,
             "status": "healthy" if binary else "degraded",
+            "ready_for_inference": ready,
+            "model_loaded": bool(resident),
+            "capabilities": (["inference"] if ready else [])
+                            + (["vision"] if ready and any(s.has_vision for s in specs) else []),
             "engine": "llama.cpp", "engine_binary": str(binary) if binary else None,
             "default_model": default_model or None,
             "lease": lease.status(),
             "evaluation_scopes": sorted(n for n, d in evaluation.items() if d > time.monotonic()),
             "resident": [{"name": e.spec.name, "ctx": e.ctx, "size_vram": e.size_vram_bytes,
-                          "inflight": e.inflight} for e in pool.resident()],
+                          "inflight": e.inflight} for e in resident],
             "gpu": {"name": mem.name, "total_mib": mem.total_mib, "free_mib": mem.free_mib} if mem else None,
         }
 
