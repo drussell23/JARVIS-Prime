@@ -850,3 +850,33 @@ def test_a_swapped_out_primary_is_reserved_when_a_companion_loads(pool_factory, 
     reserve = pool.estimate_mib(primary, pool._wanted_ctx(primary, None), 1)
     assert pool.coresident_reserve_mib(exclude="qwen3-coder:30b") == reserve
     assert pool.coresident_reserve_mib(exclude="qwen3-coder-ov:30b") == 0
+
+
+def test_a_foreground_companion_does_not_plan_slots_on_the_primarys_memory(pool_factory, monkeypatch):
+    """Live 2026-10-13: vision admitted by a foreground request beside the idle
+    pinned primary sized 4 slots (~11 GB) from the primary's VRAM. Memory of a
+    model that belongs resident is not spare for slot planning."""
+    total = 26000                              # the primary leaves ~4 GB free
+    pool, _, gpu_state = _slots_pool(pool_factory, monkeypatch, 0, total_mib=total, model_mib=18000)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        companion = pool.store.resolve("qwen3-coder:30b")
+        free_now = total - gpu_state["used"]
+        primary = pool.store.resolve("qwen3-coder-ov:30b")
+        # Planning budget = genuinely free memory; the resident primary is
+        # neither spare nor (being resident) reserved twice.
+        expected = pool.slots_for(companion, 8192, budget_mib=free_now)
+        greedy = pool.slots_for(companion, 8192, budget_mib=free_now + 18000)
+        assert greedy > expected, "the scenario must distinguish the two budgets"
+        token = ep.request_priority.set(ep.FOREGROUND)
+        try:
+            async with pool.acquire("qwen3-coder:30b", 8192) as eng:
+                return eng.parallel, expected, primary
+        finally:
+            ep.request_priority.reset(token)
+
+    got, expected, _ = asyncio.run(go())
+    assert got == expected

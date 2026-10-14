@@ -462,11 +462,19 @@ class EnginePool:
             return set()
         return set(self.config.pinned)
 
-    def _evictable_mib(self, keep: str) -> int:
-        """VRAM ``_make_room`` could free for *keep*: idle engines it may evict."""
+    def _evictable_mib(self, keep: str, *, for_sizing: bool = False) -> int:
+        """VRAM ``_make_room`` could free for *keep*: idle engines it may evict.
+
+        ``for_sizing``: the memory a slot count may be planned on. A model that
+        BELONGS resident (pinned, co-resident) may still be swapped out for a
+        foreground request, but its memory is not spare: the vision model sized
+        its slots from the idle primary's VRAM (4 slots, ~11 GB) and pushed it
+        out on every return. Its footprint is the reservation's to hold.
+        """
         protected = self._protected_for(keep)
+        belongs = (self.config.coresident | self.config.pinned) if for_sizing else frozenset()
         return sum(e.size_vram_bytes // _MIB for n, e in self.engines.items()
-                   if n != keep and e.inflight == 0 and n not in protected)
+                   if n != keep and e.inflight == 0 and n not in protected and n not in belongs)
 
     async def _make_room(self, need_mib: int, keep: str) -> None:
         while True:
@@ -523,7 +531,7 @@ class EnginePool:
 
     async def _load(self, spec: ModelSpec, ctx: int) -> Engine:
         mem = await asyncio.to_thread(self._gpu)
-        budget = (mem.free_mib + self._evictable_mib(spec.name)) if mem is not None else None
+        budget = (mem.free_mib + self._evictable_mib(spec.name, for_sizing=True)) if mem is not None else None
         slots = self.slots_for(spec, ctx, budget_mib=budget)
         await self._make_room(self.estimate_mib(spec, ctx, slots), keep=spec.name)
         before = await asyncio.to_thread(self._gpu)
