@@ -28,6 +28,9 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, default=None, help="context for a model loaded with no num_ctx")
     ap.add_argument("--parallel", default=None,
                     help="generation slots per engine: a count, or 'auto' to size them from free VRAM")
+    ap.add_argument("--coresident", default=None,
+                    help="comma-separated models that must fit beside whatever is loaded "
+                         "(their footprint is reserved when slots are sized)")
     ap.add_argument("--log-level", default=os.environ.get("JPRIME_ENGINE_LOG_LEVEL", "info"))
     ap.add_argument("--log-file", default=os.environ.get("JPRIME_ENGINE_LOG_FILE", ""),
                     help="write logs here instead of stderr (a detached engine has no console)")
@@ -37,6 +40,8 @@ def main() -> None:
         os.environ["JPRIME_ENGINE_DEFAULT_CTX"] = str(args.ctx)
     if args.parallel:
         os.environ["JPRIME_ENGINE_PARALLEL"] = args.parallel
+    if args.coresident and args.coresident.strip():
+        os.environ["JPRIME_ENGINE_CORESIDENT"] = args.coresident
     if args.preload:
         os.environ["JPRIME_ENGINE_PRELOAD"] = args.preload
     if args.default_model:

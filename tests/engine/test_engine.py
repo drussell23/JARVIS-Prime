@@ -749,3 +749,155 @@ def test_unset_slots_are_auto_and_a_count_or_auto_is_honoured(monkeypatch):
     for raw, want in (("auto", 0), ("AUTO", 0), ("3", 3), ("0", 1), ("junk", 1)):
         monkeypatch.setenv("JPRIME_ENGINE_PARALLEL", raw)
         assert ep._parallel_setting() == want, raw
+
+
+# ---------------------------------------------------------------- co-residency + foreground
+
+def test_a_coresident_companion_is_reserved_when_slots_are_sized(pool_factory, monkeypatch):
+    """2026-10-13: the primary spent the whole card on KV slots and the vision
+    model it serves beside could never load. A declared companion's footprint
+    is held back from the primary's slot budget."""
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    kv_slot = _KV_PER_TOKEN * 32768
+    companion = pool.store.resolve("qwen3-coder:30b")
+    reserve = pool.estimate_mib(companion, pool._wanted_ctx(companion, None), 1)
+    # A budget half a reservation above room for exactly two slots: the
+    # reservation must cost the primary a slot.
+    fixed_mib = -(-(spec.size_bytes + ep._COMPUTE_BYTES) // ep._MIB)
+    budget = pool.config.vram_headroom_mib + fixed_mib + 2 * (kv_slot // ep._MIB) + reserve // 2
+
+    def expected(reserve_mib):
+        spare = ((budget - pool.config.vram_headroom_mib - reserve_mib) * ep._MIB
+                 - spec.size_bytes - ep._COMPUTE_BYTES)
+        return max(1, min(pool.config.parallel_max, int(spare // kv_slot)))
+
+    alone = pool.slots_for(spec, 32768, budget_mib=budget)
+    assert alone == expected(0) < pool.config.parallel_max
+    pool.config.coresident = frozenset({"qwen3-coder:30b"})
+    assert pool.coresident_reserve_mib(exclude=spec.name) == reserve > 0
+    beside = pool.slots_for(spec, 32768, budget_mib=budget)
+    assert beside == expected(reserve) < alone
+    # A model never reserves room against itself.
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder:30b") == 0
+
+
+def test_a_resident_companion_is_not_reserved_twice(pool_factory, monkeypatch):
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 1)
+    pool.config.coresident = frozenset({"qwen3-coder:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder:30b", 8192):
+            pass
+    asyncio.run(go())
+    # Loaded: the card's free memory already reflects it.
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder-ov:30b") == 0
+
+
+def test_a_foreground_request_may_evict_an_idle_pinned_model(pool_factory):
+    """A person waiting ("can you see my screen?") outranks a cold reload of
+    the idle primary; background work still never does."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def load_primary():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+
+    async def background_then_foreground():
+        with pytest.raises(InsufficientVram, match="pinned"):
+            async with pool.acquire("qwen3-coder:30b", 8192):
+                pass
+        token = ep.request_priority.set(ep.FOREGROUND)
+        try:
+            async with pool.acquire("qwen3-coder:30b", 8192):
+                pass
+        finally:
+            ep.request_priority.reset(token)
+
+    asyncio.run(load_primary())
+    asyncio.run(background_then_foreground())
+    assert list(pool.engines) == ["qwen3-coder:30b"]
+
+
+def test_priority_is_read_from_the_request_header(pool_factory):
+    from fastapi.testclient import TestClient
+
+    from jarvis_prime.engine.app import create_app
+
+    pool, _, _ = pool_factory()
+    app = create_app(pool)
+    seen = []
+
+    @app.get("/_probe_priority")
+    async def _probe():
+        seen.append(ep.request_priority.get())
+        return {}
+
+    with TestClient(app) as c:
+        c.get("/_probe_priority")
+        c.get("/_probe_priority", headers={"X-JPrime-Priority": "foreground"})
+        c.get("/_probe_priority", headers={"X-JPrime-Priority": "urgent!!"})
+    assert seen == [ep.BACKGROUND, ep.FOREGROUND, ep.BACKGROUND]
+
+
+def test_a_swapped_out_primary_is_reserved_when_a_companion_loads(pool_factory, monkeypatch):
+    """A model admitted while the pinned primary is out must not size its
+    slots from the memory the primary vacated."""
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+    primary = pool.store.resolve("qwen3-coder-ov:30b")
+    reserve = pool.estimate_mib(primary, pool._wanted_ctx(primary, None), 1)
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder:30b") == reserve
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder-ov:30b") == 0
+
+
+def test_a_foreground_companion_does_not_plan_slots_on_the_primarys_memory(pool_factory, monkeypatch):
+    """Live 2026-10-13: vision admitted by a foreground request beside the idle
+    pinned primary sized 4 slots (~11 GB) from the primary's VRAM. Memory of a
+    model that belongs resident is not spare for slot planning."""
+    total = 26000                              # the primary leaves ~4 GB free
+    pool, _, gpu_state = _slots_pool(pool_factory, monkeypatch, 0, total_mib=total, model_mib=18000)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+        companion = pool.store.resolve("qwen3-coder:30b")
+        free_now = total - gpu_state["used"]
+        primary = pool.store.resolve("qwen3-coder-ov:30b")
+        # Planning budget = genuinely free memory; the resident primary is
+        # neither spare nor (being resident) reserved twice.
+        expected = pool.slots_for(companion, 8192, budget_mib=free_now)
+        greedy = pool.slots_for(companion, 8192, budget_mib=free_now + 18000)
+        assert greedy > expected, "the scenario must distinguish the two budgets"
+        token = ep.request_priority.set(ep.FOREGROUND)
+        try:
+            async with pool.acquire("qwen3-coder:30b", 8192) as eng:
+                return eng.parallel, expected, primary
+        finally:
+            ep.request_priority.reset(token)
+
+    got, expected, _ = asyncio.run(go())
+    assert got == expected
+
+
+# ------------------------------------------------------------ health contract
+def test_health_satisfies_the_trinity_contract_and_follows_the_lease(pool_factory, monkeypatch):
+    """JARVIS's boot gate requires `ready_for_inference` (startup_contracts
+    "prime:/health"); a lent GPU must read not-ready, not merely degraded."""
+    from fastapi.testclient import TestClient
+    import jarvis_prime.engine.app as app_mod
+
+    monkeypatch.setattr(app_mod, "find_engine_binary", lambda: "llama-server")
+    pool, _, _ = pool_factory()
+    app = app_mod.create_app(pool)
+    with TestClient(app) as c:
+        h = c.get("/health").json()
+        assert h["ready_for_inference"] is True and h["model_loaded"] is False
+        assert "inference" in h["capabilities"]
+    from jarvis_prime.engine.lease import TrainingLease
+    monkeypatch.setattr(TrainingLease, "admitting", property(lambda self: False))  # lent to training
+    with TestClient(app_mod.create_app(pool)) as c:
+        h = c.get("/health").json()
+        assert h["ready_for_inference"] is False and h["capabilities"] == []
