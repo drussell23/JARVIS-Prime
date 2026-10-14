@@ -430,13 +430,17 @@ class EnginePool:
         return max(1, min(c.parallel_max, int(spare // kv_slot)))
 
     def coresident_reserve_mib(self, *, exclude: str = "") -> int:
-        """VRAM to hold back for declared co-resident models not loaded yet.
+        """VRAM to hold back for models that belong resident but are not loaded.
 
-        A resident one is already reflected in the card's free memory; an
-        undeclared or unknown name reserves nothing.
+        Those are the declared co-resident companions AND the pinned models
+        (the preloaded primary): a vision model admitted while the primary
+        was swapped out sized its slots from the memory the primary vacated
+        (4 slots, ~11 GB) and evicted it again on its return. A resident one
+        is already reflected in the card's free memory; an unknown name
+        reserves nothing.
         """
         total = 0
-        for name in self.config.coresident:
+        for name in self.config.coresident | self.config.pinned:
             if name == exclude:
                 continue
             eng = self.engines.get(name)

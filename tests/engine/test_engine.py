@@ -839,3 +839,14 @@ def test_priority_is_read_from_the_request_header(pool_factory):
         c.get("/_probe_priority", headers={"X-JPrime-Priority": "foreground"})
         c.get("/_probe_priority", headers={"X-JPrime-Priority": "urgent!!"})
     assert seen == [ep.BACKGROUND, ep.FOREGROUND, ep.BACKGROUND]
+
+
+def test_a_swapped_out_primary_is_reserved_when_a_companion_loads(pool_factory, monkeypatch):
+    """A model admitted while the pinned primary is out must not size its
+    slots from the memory the primary vacated."""
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+    primary = pool.store.resolve("qwen3-coder-ov:30b")
+    reserve = pool.estimate_mib(primary, pool._wanted_ctx(primary, None), 1)
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder:30b") == reserve
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder-ov:30b") == 0
