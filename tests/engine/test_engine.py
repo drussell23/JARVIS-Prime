@@ -896,6 +896,10 @@ def test_health_satisfies_the_trinity_contract_and_follows_the_lease(pool_factor
         h = c.get("/health").json()
         assert h["ready_for_inference"] is True and h["model_loaded"] is False
         assert "inference" in h["capabilities"]
+        # The Body's hot-swap gate compares protocols; "version" is the
+        # package (0.1.0) and read as a protocol it is a major mismatch.
+        from jarvis_prime.reasoning.protocol import PROTOCOL_VERSION
+        assert h["protocol_version"] == PROTOCOL_VERSION
     from jarvis_prime.engine.lease import TrainingLease
     monkeypatch.setattr(TrainingLease, "admitting", property(lambda self: False))  # lent to training
     with TestClient(app_mod.create_app(pool)) as c:

@@ -36,6 +36,7 @@ from .engine_pool import (AdmissionClosed, EnginePool, EngineStartError, Insuffi
                           ModelNotFound, find_engine_binary)
 from .lease import LeaseConflict, LeaseState, LeaseTokenMismatch, TrainingLease
 from .model_store import ModelSpec, canonical_name
+from ..reasoning.protocol import PROTOCOL_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,9 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         ready = bool(binary) and bool(specs) and lease.admitting
         return {
             "service": "jarvis_prime", "component": "engine", "version": __version__,
+            # The Mind-Body protocol this engine speaks; a Body's hot-swap gate
+            # compares it, never the package version above.
+            "protocol_version": PROTOCOL_VERSION,
             "status": "healthy" if binary else "degraded",
             "ready_for_inference": ready,
             "model_loaded": bool(resident),
