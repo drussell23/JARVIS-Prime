@@ -27,6 +27,9 @@ param(
   # Generation slots: a count, or 'auto' (sized from free VRAM). Empty leaves
   # the engine's own JPRIME_ENGINE_PARALLEL / default (auto) in force.
   [string]$Parallel = '',
+  # Models that must fit BESIDE whatever is loaded (comma-separated); their
+  # footprint is reserved when slots are sized. Empty declares none.
+  [string]$Coresident = '',
   [int]$WaitSeconds = 60
 )
 $ErrorActionPreference = 'Stop'
@@ -74,6 +77,7 @@ switch ($Action) {
     $cmd = "`"$Py`" -m jarvis_prime.engine --port $Port --ctx $Ctx --log-file `"$log`""
     if ($Preload) { $cmd += " --preload $Preload" }
     if ($Parallel) { $cmd += " --parallel $Parallel" }
+    if ($Coresident) { $cmd += " --coresident $Coresident" }
     # Win32_Process.Create, not Start-Process: the engine must share NO handles
     # with this shell. Start-Process with redirection creates the child with
     # handle inheritance on, so an engine launched from WSL through interop

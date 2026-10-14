@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 
 from . import __version__, gguf_meta, gpu, protocol
 from .adapter_registry import AdapterRegistry, AdapterRejected
+from .engine_pool import (BACKGROUND, FOREGROUND, request_priority)
 from .engine_pool import (AdmissionClosed, EnginePool, EngineStartError, InsufficientVram,
                           ModelNotFound, find_engine_binary)
 from .lease import LeaseConflict, LeaseState, LeaseTokenMismatch, TrainingLease
@@ -116,6 +117,17 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
             await pool.shutdown()
 
     app = FastAPI(title="J-Prime Engine", version=__version__, lifespan=lifespan)
+
+    @app.middleware("http")
+    async def _request_priority(request: Request, call_next):
+        """Carry the caller's declared priority (X-JPrime-Priority) to the
+        pool's admission for this request only; absent or unknown = background."""
+        declared = request.headers.get("x-jprime-priority", "").strip().lower()
+        token = request_priority.set(FOREGROUND if declared == FOREGROUND else BACKGROUND)
+        try:
+            return await call_next(request)
+        finally:
+            request_priority.reset(token)
 
     def _model_of(body: Dict[str, Any]) -> str:
         name = str(body.get("model") or body.get("name") or "").strip()

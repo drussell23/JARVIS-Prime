@@ -749,3 +749,93 @@ def test_unset_slots_are_auto_and_a_count_or_auto_is_honoured(monkeypatch):
     for raw, want in (("auto", 0), ("AUTO", 0), ("3", 3), ("0", 1), ("junk", 1)):
         monkeypatch.setenv("JPRIME_ENGINE_PARALLEL", raw)
         assert ep._parallel_setting() == want, raw
+
+
+# ---------------------------------------------------------------- co-residency + foreground
+
+def test_a_coresident_companion_is_reserved_when_slots_are_sized(pool_factory, monkeypatch):
+    """2026-10-13: the primary spent the whole card on KV slots and the vision
+    model it serves beside could never load. A declared companion's footprint
+    is held back from the primary's slot budget."""
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 0)
+    spec = pool.store.resolve("qwen3-coder-ov:30b")
+    kv_slot = _KV_PER_TOKEN * 32768
+    companion = pool.store.resolve("qwen3-coder:30b")
+    reserve = pool.estimate_mib(companion, pool._wanted_ctx(companion, None), 1)
+    # A budget half a reservation above room for exactly two slots: the
+    # reservation must cost the primary a slot.
+    fixed_mib = -(-(spec.size_bytes + ep._COMPUTE_BYTES) // ep._MIB)
+    budget = pool.config.vram_headroom_mib + fixed_mib + 2 * (kv_slot // ep._MIB) + reserve // 2
+
+    def expected(reserve_mib):
+        spare = ((budget - pool.config.vram_headroom_mib - reserve_mib) * ep._MIB
+                 - spec.size_bytes - ep._COMPUTE_BYTES)
+        return max(1, min(pool.config.parallel_max, int(spare // kv_slot)))
+
+    alone = pool.slots_for(spec, 32768, budget_mib=budget)
+    assert alone == expected(0) < pool.config.parallel_max
+    pool.config.coresident = frozenset({"qwen3-coder:30b"})
+    assert pool.coresident_reserve_mib(exclude=spec.name) == reserve > 0
+    beside = pool.slots_for(spec, 32768, budget_mib=budget)
+    assert beside == expected(reserve) < alone
+    # A model never reserves room against itself.
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder:30b") == 0
+
+
+def test_a_resident_companion_is_not_reserved_twice(pool_factory, monkeypatch):
+    pool, _, _ = _slots_pool(pool_factory, monkeypatch, 1)
+    pool.config.coresident = frozenset({"qwen3-coder:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder:30b", 8192):
+            pass
+    asyncio.run(go())
+    # Loaded: the card's free memory already reflects it.
+    assert pool.coresident_reserve_mib(exclude="qwen3-coder-ov:30b") == 0
+
+
+def test_a_foreground_request_may_evict_an_idle_pinned_model(pool_factory):
+    """A person waiting ("can you see my screen?") outranks a cold reload of
+    the idle primary; background work still never does."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def load_primary():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):
+            pass
+
+    async def background_then_foreground():
+        with pytest.raises(InsufficientVram, match="pinned"):
+            async with pool.acquire("qwen3-coder:30b", 8192):
+                pass
+        token = ep.request_priority.set(ep.FOREGROUND)
+        try:
+            async with pool.acquire("qwen3-coder:30b", 8192):
+                pass
+        finally:
+            ep.request_priority.reset(token)
+
+    asyncio.run(load_primary())
+    asyncio.run(background_then_foreground())
+    assert list(pool.engines) == ["qwen3-coder:30b"]
+
+
+def test_priority_is_read_from_the_request_header(pool_factory):
+    from fastapi.testclient import TestClient
+
+    from jarvis_prime.engine.app import create_app
+
+    pool, _, _ = pool_factory()
+    app = create_app(pool)
+    seen = []
+
+    @app.get("/_probe_priority")
+    async def _probe():
+        seen.append(ep.request_priority.get())
+        return {}
+
+    with TestClient(app) as c:
+        c.get("/_probe_priority")
+        c.get("/_probe_priority", headers={"X-JPrime-Priority": "foreground"})
+        c.get("/_probe_priority", headers={"X-JPrime-Priority": "urgent!!"})
+    assert seen == [ep.BACKGROUND, ep.FOREGROUND, ep.BACKGROUND]

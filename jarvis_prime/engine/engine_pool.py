@@ -38,6 +38,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
@@ -53,6 +54,16 @@ _MIB = 1024 * 1024
 #: llama.cpp compute buffers beside weights and KV (a floor, not a measurement).
 _COMPUTE_BYTES = 512 * _MIB
 _IS_WINDOWS = sys.platform == "win32"
+
+#: Who is waiting on the request in flight, as its caller declared it
+#: (HTTP header ``X-JPrime-Priority``, set per request by the app). A
+#: ``foreground`` request has a person waiting on it -- "can you see my
+#: screen?" -- and may evict an IDLE pinned model when nothing else frees
+#: the room; ``background`` work (screen monitoring, sensors, batch jobs)
+#: never costs the primary a cold reload. Busy engines are never evicted.
+FOREGROUND = "foreground"
+BACKGROUND = "background"
+request_priority: ContextVar[str] = ContextVar("jprime_request_priority", default=BACKGROUND)
 
 
 class ModelNotFound(LookupError):
@@ -159,6 +170,14 @@ class EngineConfig:
     pinned: frozenset = field(default_factory=lambda: frozenset(
         canonical_name(n) for n in (os.environ.get("JPRIME_ENGINE_PINNED", "").split(",")
                                     + [os.environ.get("JPRIME_ENGINE_PRELOAD", "")]) if n.strip()))
+    #: Models that must be able to load BESIDE whatever else is resident
+    #: (JPRIME_ENGINE_CORESIDENT, comma-separated): their estimated footprint
+    #: is reserved when any other model's generation slots are sized, so the
+    #: primary does not spend the whole card on KV slots and leave a declared
+    #: companion (the vision model) nowhere to go.
+    coresident: frozenset = field(default_factory=lambda: frozenset(
+        canonical_name(n) for n in os.environ.get("JPRIME_ENGINE_CORESIDENT", "").split(",")
+        if n.strip()))
     #: A load's VRAM delta is attributed to it only if it covers at least this
     #: fraction of the files it mapped (weights are fully offloaded).
     min_attributable_fraction: float = field(default_factory=lambda: float(
@@ -405,12 +424,43 @@ class EnginePool:
         kv_slot = gguf_meta.kv_bytes_per_token(gguf_meta.read_metadata(spec.model_path)) * ctx
         if not budget_mib or kv_slot <= 0:
             return 1
-        spare = budget_mib * _MIB - c.vram_headroom_mib * _MIB - spec.size_bytes - _COMPUTE_BYTES
+        reserve_mib = self.coresident_reserve_mib(exclude=spec.name)
+        spare = ((budget_mib - c.vram_headroom_mib - reserve_mib) * _MIB
+                 - spec.size_bytes - _COMPUTE_BYTES)
         return max(1, min(c.parallel_max, int(spare // kv_slot)))
+
+    def coresident_reserve_mib(self, *, exclude: str = "") -> int:
+        """VRAM to hold back for declared co-resident models not loaded yet.
+
+        A resident one is already reflected in the card's free memory; an
+        undeclared or unknown name reserves nothing.
+        """
+        total = 0
+        for name in self.config.coresident:
+            if name == exclude:
+                continue
+            eng = self.engines.get(name)
+            if eng is not None and eng.alive():
+                continue
+            spec = self.store.resolve(name)
+            if spec is None:
+                continue
+            total += self.estimate_mib(spec, self._wanted_ctx(spec, None), 1)
+        return total
+
+    def _protected_for(self, keep: str) -> set:
+        """Resident models that may NOT be evicted to admit *keep*.
+
+        Pinned models are protected from an unpinned requester -- unless the
+        request in flight is foreground (a person is waiting on it).
+        """
+        if keep in self.config.pinned or request_priority.get() == FOREGROUND:
+            return set()
+        return set(self.config.pinned)
 
     def _evictable_mib(self, keep: str) -> int:
         """VRAM ``_make_room`` could free for *keep*: idle engines it may evict."""
-        protected = set() if keep in self.config.pinned else set(self.config.pinned)
+        protected = self._protected_for(keep)
         return sum(e.size_vram_bytes // _MIB for n, e in self.engines.items()
                    if n != keep and e.inflight == 0 and n not in protected)
 
@@ -421,8 +471,8 @@ class EnginePool:
                 return
             # A best-effort model never evicts the primary: a screenshot read
             # must not cost the generation lane a cold reload. A pinned
-            # requester may evict anything idle.
-            protected = set() if keep in self.config.pinned else set(self.config.pinned)
+            # requester, or a foreground one, may evict anything idle.
+            protected = self._protected_for(keep)
             idle = [e for n, e in self.engines.items()
                     if n != keep and e.inflight == 0 and n not in protected]
             if not idle:
@@ -434,8 +484,8 @@ class EnginePool:
                     raise InsufficientVram(f"need ~{need_mib} MiB, {mem.free_mib} MiB free, and {why}")
                 return  # nothing of ours to evict; let the engine try (another process owns the VRAM)
             victim = min(idle, key=lambda e: e.last_used)
-            logger.info("[Engine] evicting %s to admit ~%d MiB (free %d MiB)",
-                        victim.spec.name, need_mib, mem.free_mib)
+            logger.info("[Engine] evicting %s to admit %s ~%d MiB (free %d MiB, priority %s)",
+                        victim.spec.name, keep, need_mib, mem.free_mib, request_priority.get())
             await self._unload_locked(victim.spec.name)  # caller holds _load_lock
 
     # ---------------------------------------------------------------- loading
