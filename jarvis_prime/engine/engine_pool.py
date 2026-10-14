@@ -613,7 +613,15 @@ class EnginePool:
         finally:
             eng.inflight -= 1
             eng.last_used = time.monotonic()
-            ttl = parse_keep_alive(keep_alive, self.config.default_keep_alive_s)
+            # A pinned model (the preloaded primary, JPRIME_ENGINE_PINNED) stays
+            # resident until evicted -- the operator's declaration -- unless the
+            # request itself states a keep_alive. Applying the default TTL to
+            # every request that named none turned "resident" into "unloaded
+            # five minutes after any request": from the first ordinary call
+            # after a preload, the 30B expired after every quiet spell all
+            # day, and each next command paid a ~13 s reload.
+            pinned_default = keep_alive is None and canonical_name(name) in self.config.pinned
+            ttl = None if pinned_default else parse_keep_alive(keep_alive, self.config.default_keep_alive_s)
             if ttl is None:
                 eng.expires_at = eng.expires_wall = None
             else:

@@ -901,3 +901,26 @@ def test_health_satisfies_the_trinity_contract_and_follows_the_lease(pool_factor
     with TestClient(app_mod.create_app(pool)) as c:
         h = c.get("/health").json()
         assert h["ready_for_inference"] is False and h["capabilities"] == []
+
+
+def test_a_pinned_model_stays_resident_after_requests_that_name_no_keep_alive(pool_factory):
+    # Live 2026-10-14: the preloaded 30B "keep_alive expired -- unloading"
+    # five minutes after every ordinary request, all day; each next command
+    # paid a ~13 s reload. A pinned model is resident until evicted.
+    pool, _, _ = pool_factory()
+    pool.config.pinned = frozenset({"qwen3-coder-ov:30b"})
+
+    async def go():
+        async with pool.acquire("qwen3-coder-ov:30b", 8192):        # an ordinary request
+            pass
+        pinned = pool.engines["qwen3-coder-ov:30b"].expires_at
+        async with pool.acquire("qwen3-coder-ov:30b", 8192, "30s"):  # a request that says how long
+            pass
+        stated = pool.engines["qwen3-coder-ov:30b"].expires_at
+        async with pool.acquire("qwen3-coder:30b", 8192):            # unpinned: the default TTL
+            pass
+        return pinned, stated, pool.engines["qwen3-coder:30b"].expires_at
+
+    pinned, stated, unpinned = asyncio.run(go())
+    assert pinned is None
+    assert stated is not None and unpinned is not None
