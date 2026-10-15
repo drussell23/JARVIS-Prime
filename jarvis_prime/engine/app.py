@@ -22,7 +22,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -45,6 +45,25 @@ _FOREVER = "2318-01-01T00:00:00Z"  # how Ollama reports keep_alive -1
 
 def _err(status: int, msg: str) -> JSONResponse:
     return JSONResponse({"error": msg}, status_code=status)
+
+
+class _ClaimedStream(StreamingResponse):
+    """A stream that owns an engine claim and returns it however the response
+    ends -- finished, failed, the client gone, or the body never started (a
+    generator that never ran never reaches its own ``finally``)."""
+
+    def __init__(self, content: AsyncIterator[bytes], *, release: Callable[[], None],
+                 media_type: str) -> None:
+        super().__init__(content, media_type=media_type)
+        self._release: Optional[Callable[[], None]] = release
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            release, self._release = self._release, None
+            if release is not None:
+                release()
 
 
 def _mtime(path: Any) -> Optional[float]:
@@ -344,32 +363,43 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         async with pool.acquire(name, num_ctx, keep_alive) as eng:
             return await state["client"].post(eng.base_url + path, json=body)
 
-    async def _upstream_stream(name: str, num_ctx: Optional[int], keep_alive: Any, path: str,
-                               body: Dict[str, Any],
+    async def _upstream_stream(eng: Any, path: str, body: Dict[str, Any],
                                translator: Optional[protocol.OllamaStreamTranslator]) -> AsyncIterator[bytes]:
-        async with pool.acquire(name, num_ctx, keep_alive) as eng:
-            async with state["client"].stream("POST", eng.base_url + path, json=body) as r:
-                if r.status_code != 200:
-                    detail = (await r.aread()).decode(errors="replace")[:2000]
-                    if translator is None:
-                        yield f"data: {{\"error\": {detail!r}}}\n\n".encode()
-                    else:
-                        yield (json.dumps({"error": detail}) + "\n").encode()
-                    return
+        async with state["client"].stream("POST", eng.base_url + path, json=body) as r:
+            if r.status_code != 200:
+                detail = (await r.aread()).decode(errors="replace")[:2000]
                 if translator is None:
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-                    return
-                buf = b""
+                    yield f"data: {{\"error\": {detail!r}}}\n\n".encode()
+                else:
+                    yield (json.dumps({"error": detail}) + "\n").encode()
+                return
+            if translator is None:
                 async for chunk in r.aiter_raw():
-                    buf += chunk
-                    events, buf = protocol.parse_sse(buf)
-                    for ev in events:
-                        if ev is None:
-                            continue
-                        for line in translator.feed(ev):
-                            yield line
-                yield translator.final()
+                    yield chunk
+                return
+            buf = b""
+            async for chunk in r.aiter_raw():
+                buf += chunk
+                events, buf = protocol.parse_sse(buf)
+                for ev in events:
+                    if ev is None:
+                        continue
+                    for line in translator.feed(ev):
+                        yield line
+            yield translator.final()
+
+    async def _stream(name: str, num_ctx: Optional[int], keep_alive: Any, path: str,
+                      body: Dict[str, Any], translator: Optional[protocol.OllamaStreamTranslator],
+                      media_type: str) -> Response:
+        """Admit first (so 404/503/500 surface as a status, not mid-stream),
+        then stream on that same claim. Admitting once and claiming again
+        inside the stream left the freshly loaded engine idle in between --
+        and another admission evicted it there (2026-10-14 12:22:51: the
+        vision model loaded for "can you see my screen?" was unloaded 0.1 s
+        later, before its request ever ran)."""
+        eng = await pool.claim(name, num_ctx)
+        return _ClaimedStream(_upstream_stream(eng, path, body, translator),
+                              release=lambda: pool.release(eng, keep_alive), media_type=media_type)
 
     def _passthrough(r: httpx.Response) -> Response:
         return Response(content=r.content, status_code=r.status_code,
@@ -382,11 +412,9 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         body, num_ctx, keep_alive = protocol.prepare_openai_chat(raw, spec.defaults)
         body["model"] = spec.name
         _evaluation_scope(body, spec.name)
-        await pool.ensure(spec.name, num_ctx)  # surface 404/503/500 before streaming starts
         if body.get("stream"):
-            return StreamingResponse(
-                _upstream_stream(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body, None),
-                media_type="text/event-stream")
+            return await _stream(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body, None,
+                                 "text/event-stream")
         return _passthrough(await _upstream_json(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body))
 
     @app.post("/v1/completions")
@@ -396,11 +424,9 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         body, num_ctx, keep_alive = protocol.prepare_openai_chat(raw, spec.defaults)
         body["model"] = spec.name
         _evaluation_scope(body, spec.name)
-        await pool.ensure(spec.name, num_ctx)
         if body.get("stream"):
-            return StreamingResponse(
-                _upstream_stream(spec.name, num_ctx, keep_alive, "/v1/completions", body, None),
-                media_type="text/event-stream")
+            return await _stream(spec.name, num_ctx, keep_alive, "/v1/completions", body, None,
+                                 "text/event-stream")
         return _passthrough(await _upstream_json(spec.name, num_ctx, keep_alive, "/v1/completions", body))
 
     @app.post("/api/chat")
@@ -416,12 +442,10 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
             return JSONResponse({"model": spec.name, "created_at": protocol._now_iso(),
                                  "message": {"role": "assistant", "content": ""},
                                  "done": True, "done_reason": "load"})
-        await pool.ensure(spec.name, num_ctx)
         if stream:
             tr = protocol.OllamaStreamTranslator(spec.name, "chat")
-            return StreamingResponse(
-                _upstream_stream(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body, tr),
-                media_type="application/x-ndjson")
+            return await _stream(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body, tr,
+                                 "application/x-ndjson")
         t0 = time.monotonic()
         r = await _upstream_json(spec.name, num_ctx, keep_alive, "/v1/chat/completions", body)
         if r.status_code != 200:
@@ -448,13 +472,11 @@ def create_app(pool: Optional[EnginePool] = None) -> FastAPI:
         body, num_ctx, keep_alive, stream = protocol.prepare_ollama_generate(raw, spec.defaults)
         body["model"] = spec.name
         _evaluation_scope(body, spec.name)
-        await pool.ensure(spec.name, num_ctx)
         if stream:
             body["stream_options"] = {"include_usage": True}
             tr = protocol.OllamaStreamTranslator(spec.name, "generate")
-            return StreamingResponse(
-                _upstream_stream(spec.name, num_ctx, keep_alive, "/v1/completions", body, tr),
-                media_type="application/x-ndjson")
+            return await _stream(spec.name, num_ctx, keep_alive, "/v1/completions", body, tr,
+                                 "application/x-ndjson")
         t0 = time.monotonic()
         r = await _upstream_json(spec.name, num_ctx, keep_alive, "/v1/completions", body)
         if r.status_code != 200:

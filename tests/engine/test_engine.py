@@ -301,14 +301,118 @@ def test_measured_footprint_replaces_the_estimate(pool_factory):
 
 
 def test_busy_engines_are_never_evicted(pool_factory):
+    """Held for the whole wait: the admission gives up when its wait expires,
+    and the busy engine is still the one resident."""
     pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.admission_wait_s = 0.2
 
     async def go():
         async with pool.acquire("qwen3-coder-ov:30b", 8192):
-            with pytest.raises(InsufficientVram):
+            with pytest.raises(InsufficientVram, match="waiting for"):
                 async with pool.acquire("qwen3-coder:30b", 8192):
                     pass
     asyncio.run(go())
+    assert list(pool.engines) == ["qwen3-coder-ov:30b"]
+
+
+def test_an_admission_waits_for_a_busy_engine_instead_of_failing(pool_factory):
+    """2026-10-14 12:23:10: "search for dogs" got a 503 ("every resident model
+    is busy") while the vision model answered "can you see my screen?". The
+    room was only held for the length of that generation."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+
+    async def go():
+        busy = await pool.claim("qwen3-coder-ov:30b", 8192)
+        waiting = asyncio.ensure_future(pool.claim("qwen3-coder:30b", 8192))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()                      # waiting, not refused
+        pool.release(busy)                             # the generation ends
+        eng = await asyncio.wait_for(waiting, 5)
+        pool.release(eng)
+        return eng
+    eng = asyncio.run(go())
+    assert eng.spec.name == "qwen3-coder:30b" and list(pool.engines) == ["qwen3-coder:30b"]
+
+
+def test_a_loaded_engine_is_claimed_before_another_admission_can_evict_it(pool_factory):
+    """12:22:51: the vision model loaded for a person's question was evicted
+    0.1 s later by a queued background admission, before its request ran --
+    the claim was taken AFTER the admission released its lock."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.admission_wait_s = 0.3
+
+    async def go():
+        first, second = await asyncio.gather(pool.claim("qwen3-coder:30b", 8192),
+                                             pool.claim("qwen3-coder-ov:30b", 8192),
+                                             return_exceptions=True)
+        return first, second
+    first, second = asyncio.run(go())
+    assert first.spec.name == "qwen3-coder:30b" and first.inflight == 1 and first.alive()
+    assert isinstance(second, InsufficientVram)        # it waited; it never evicted the claimed one
+
+
+def test_a_waiting_admission_is_not_starved_by_new_claims(pool_factory):
+    """While an admission waits for an engine to go idle, new claims of no
+    higher priority on that engine queue behind it -- otherwise a steady
+    stream (screen monitoring) would hold the room forever."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    order = []
+
+    async def go():
+        busy = await pool.claim("qwen3-coder-ov:30b", 8192)
+        waiter = asyncio.ensure_future(pool.claim("qwen3-coder:30b", 8192))
+        await asyncio.sleep(0.05)
+        latecomer = asyncio.ensure_future(pool.claim("qwen3-coder-ov:30b", 8192))
+        await asyncio.sleep(0.05)
+        assert not latecomer.done()                    # queued behind the waiter
+        pool.release(busy)
+        got = await asyncio.wait_for(waiter, 5)
+        order.append(got.spec.name)
+        pool.release(got)
+        late = await asyncio.wait_for(latecomer, 5)
+        order.append(late.spec.name)
+        pool.release(late)
+    asyncio.run(go())
+    assert order == ["qwen3-coder:30b", "qwen3-coder-ov:30b"]
+
+
+def test_a_refusal_waiting_cannot_change_is_immediate(pool_factory):
+    """A model larger than the card even with every busy engine gone is
+    refused at once; waiting would only delay the same answer."""
+    pool, _, _ = pool_factory(total_mib=6000, model_mib=1500)
+    pool.config.admission_wait_s = 30
+
+    async def go():
+        busy = await pool.claim("qwen3-coder-ov:30b", 8192)
+        try:
+            t0 = asyncio.get_running_loop().time()
+            with pytest.raises(InsufficientVram, match="would not hold"):
+                await pool.claim("qwen3-coder:30b", 262144)
+            return asyncio.get_running_loop().time() - t0
+        finally:
+            pool.release(busy)
+    assert asyncio.run(go()) < 5
+
+
+def test_a_claimed_stream_returns_its_claim_even_if_never_started():
+    """A body generator that never ran never reaches its own finally; the
+    response owns the claim instead."""
+    from jarvis_prime.engine.app import _ClaimedStream
+    released = []
+
+    async def body():
+        yield b"x"
+
+    async def send(_msg):
+        raise OSError("client gone")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    resp = _ClaimedStream(body(), release=lambda: released.append(1), media_type="text/plain")
+    with pytest.raises(Exception):
+        asyncio.run(resp({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send))
+    assert released == [1]
 
 
 def test_keep_alive_zero_unloads_when_idle_and_unknown_model_404(pool_factory):

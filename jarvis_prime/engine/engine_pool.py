@@ -3,7 +3,13 @@
 ## Lifecycle
 
 * ``acquire(name, num_ctx, keep_alive)`` makes the model resident (loading it
-  if needed) and holds an in-flight reference for the duration of a request.
+  if needed) and holds an in-flight reference for the duration of a request
+  (``claim``/``release`` when the hold outlives one block, e.g. a stream).
+  The reference is taken inside the admission itself: a model loaded for a
+  request can never be seen idle and evicted before that request uses it.
+* When the room a load needs is held by generations in flight, the admission
+  waits for them to finish (woken by each release), and later claims of no
+  higher priority on those engines queue behind it so it cannot starve.
 * A model stays resident until its ``keep_alive`` expires with nothing in
   flight, it is explicitly unloaded (``keep_alive: 0``), or VRAM is needed
   for another model (least-recently-used idle engine is evicted first).
@@ -76,6 +82,24 @@ class InsufficientVram(RuntimeError):
 
 class EngineStartError(RuntimeError):
     pass
+
+
+class _RoomHeld(RuntimeError):
+    """The room a load needs is held by generations in flight, and is ours to
+    evict once they finish: the admission waits for a release rather than
+    failing (internal; :meth:`EnginePool.claim` turns an expired wait into
+    :class:`InsufficientVram`)."""
+
+
+@dataclass
+class _Waiter:
+    """An admission waiting for room, as later claims must see it (fairness)."""
+    name: str
+    priority: str
+
+
+def _rank(priority: str) -> int:
+    return 1 if priority == FOREGROUND else 0
 
 
 class AdmissionClosed(RuntimeError):
@@ -162,6 +186,12 @@ class EngineConfig:
     parallel_max: int = field(default_factory=lambda: max(1, _env_int("JPRIME_ENGINE_PARALLEL_MAX", 4)))
     flash_attn: str = field(default_factory=lambda: os.environ.get("JPRIME_ENGINE_FLASH_ATTN", "on"))
     load_timeout_s: float = field(default_factory=lambda: float(_env_int("JPRIME_ENGINE_LOAD_TIMEOUT_S", 300)))
+    #: How long an admission waits for generations in flight to free the room
+    #: it needs (``JPRIME_ENGINE_ADMISSION_WAIT_S``). Unset is one load
+    #: timeout: the wait is for a release followed by a load, and the caller's
+    #: own timeout or disconnect ends it sooner.
+    admission_wait_s: Optional[float] = field(default_factory=lambda: (
+        float(_env_int("JPRIME_ENGINE_ADMISSION_WAIT_S", 0)) or None))
     default_keep_alive_s: Optional[float] = field(
         default_factory=lambda: parse_keep_alive(os.environ.get("JPRIME_ENGINE_KEEP_ALIVE", "5m"), 300.0))
     vram_headroom_mib: int = field(default_factory=lambda: _env_int("JPRIME_ENGINE_VRAM_HEADROOM_MIB", 1024))
@@ -325,6 +355,11 @@ class EnginePool:
         self.engines: Dict[str, Engine] = {}
         self._measured: Dict[Any, int] = {}   # (name, ctx) -> MiB a load actually took
         self._load_lock = asyncio.Lock()
+        #: Set (and replaced) whenever room may have changed hands -- a claim
+        #: released, an engine unloaded or found dead -- so a waiting
+        #: admission re-plans instead of polling.
+        self._changed = asyncio.Event()
+        self._waiters: List[_Waiter] = []
         self._reaper: Optional[asyncio.Task] = None
         #: Set by the owner of exclusivity (the training lease). Returns None
         #: when generations may proceed, else (reason, retry_after_s).
@@ -392,6 +427,7 @@ class EnginePool:
                                  name, eng.proc.returncode, eng.log_path)
                     self.engines.pop(name, None)
                     self._record_pids()
+                    self._notify()
                 elif eng.inflight == 0 and eng.expires_at is not None and now >= eng.expires_at:
                     logger.info("[Engine] %s keep_alive expired -- unloading", name)
                     await self.unload(name)
@@ -452,13 +488,14 @@ class EnginePool:
             total += self.estimate_mib(spec, self._wanted_ctx(spec, None), 1)
         return total
 
-    def _protected_for(self, keep: str) -> set:
+    def _protected_for(self, keep: str, priority: Optional[str] = None) -> set:
         """Resident models that may NOT be evicted to admit *keep*.
 
         Pinned models are protected from an unpinned requester -- unless the
-        request in flight is foreground (a person is waiting on it).
+        request (the one in flight, or the waiter named by *priority*) is
+        foreground (a person is waiting on it).
         """
-        if keep in self.config.pinned or request_priority.get() == FOREGROUND:
+        if keep in self.config.pinned or (priority or request_priority.get()) == FOREGROUND:
             return set()
         return set(self.config.pinned)
 
@@ -489,12 +526,20 @@ class EnginePool:
                     if n != keep and e.inflight == 0 and n not in protected]
             if not idle:
                 others = [n for n in self.engines if n != keep]
-                if others:
-                    held = [n for n in others if n in protected]
-                    why = (f"resident pinned model(s) {held} are never evicted for {keep}" if held
-                           else "every resident model is busy")
-                    raise InsufficientVram(f"need ~{need_mib} MiB, {mem.free_mib} MiB free, and {why}")
-                return  # nothing of ours to evict; let the engine try (another process owns the VRAM)
+                if not others:
+                    return  # nothing of ours to evict; let the engine try (another process owns the VRAM)
+                held = [n for n in others if n in protected]
+                busy = [n for n in others if n not in protected]
+                # Busy engines are never evicted, but they finish: when what
+                # they hold would make the room, the admission waits for them
+                # instead of failing a request that a few seconds would serve.
+                busy_mib = sum(self.engines[n].size_vram_bytes // _MIB for n in busy)
+                if busy and mem.free_mib + busy_mib >= need_mib + self.config.vram_headroom_mib:
+                    raise _RoomHeld(f"need ~{need_mib} MiB, {mem.free_mib} MiB free; "
+                                    f"waiting for {busy} to finish")
+                why = (f"resident pinned model(s) {held} are never evicted for {keep}" if held
+                       else f"even with {busy} unloaded the card would not hold it")
+                raise InsufficientVram(f"need ~{need_mib} MiB, {mem.free_mib} MiB free, and {why}")
             victim = min(idle, key=lambda e: e.last_used)
             logger.info("[Engine] evicting %s to admit %s ~%d MiB (free %d MiB, priority %s)",
                         victim.spec.name, keep, need_mib, mem.free_mib, request_priority.get())
@@ -573,15 +618,31 @@ class EnginePool:
                     time.time() - eng.started_at, eng.size_vram_bytes // _MIB)
         return eng
 
-    async def ensure(self, name: str, num_ctx: Optional[int] = None) -> Engine:
-        closed = self.admission_gate() if self.admission_gate else None
-        if closed:
-            raise AdmissionClosed(*closed)
-        spec = self.store.resolve(name)
-        if spec is None:
-            raise ModelNotFound(f"model '{name}' not found")
+    def _notify(self) -> None:
+        """Room may have changed hands: wake every waiting admission."""
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+    def _yields_to_waiter(self, name: str, priority: str) -> bool:
+        """Whether a new claim on resident *name* must queue behind a waiting
+        admission. A waiter is waiting for engines like this one to go idle;
+        if every new claim of equal or lower priority were admitted straight
+        onto them, a steady stream (screen monitoring) would starve it."""
+        return any(w.name != name and _rank(w.priority) >= _rank(priority)
+                   and name not in self._protected_for(w.name, w.priority)
+                   for w in self._waiters)
+
+    async def _admit(self, spec: ModelSpec, num_ctx: Optional[int]) -> Optional[Engine]:
+        """One admission attempt under the load lock. Returns the engine with
+        a claim already counted -- taken before the lock is released, so no
+        other admission can see it idle and evict it between its load and its
+        use -- or ``None`` when this claim must queue behind a waiter. Raises
+        :class:`_RoomHeld` when in-flight generations hold the room."""
         key = spec.name
         async with self._load_lock:
+            closed = self.admission_gate() if self.admission_gate else None
+            if closed:
+                raise AdmissionClosed(*closed)
             want = self._wanted_ctx(spec, num_ctx)
             eng = self.engines.get(key)
             if eng is not None and eng.alive():
@@ -591,6 +652,10 @@ class EnginePool:
                     logger.info("[Engine] %s definition changed -- reloading", key)
                     await self._unload_locked(key)
                 elif eng.ctx >= want or eng.inflight > 0:
+                    if self._yields_to_waiter(key, request_priority.get()):
+                        return None
+                    eng.inflight += 1
+                    eng.expires_at = None
                     return eng
                 else:
                     logger.info("[Engine] %s ctx %d < requested %d -- reloading larger", key, eng.ctx, want)
@@ -598,35 +663,88 @@ class EnginePool:
             elif eng is not None:
                 self.engines.pop(key, None)
             eng = await self._load(spec, want)
+            eng.inflight += 1
             self.engines[key] = eng
             self._record_pids()
             return eng
 
-    @asynccontextmanager
-    async def acquire(self, name: str, num_ctx: Optional[int] = None,
-                      keep_alive: Any = None) -> AsyncIterator[Engine]:
-        eng = await self.ensure(name, num_ctx)
-        eng.inflight += 1
-        eng.expires_at = None
+    async def claim(self, name: str, num_ctx: Optional[int] = None) -> Engine:
+        """Make *name* resident and hold a generation claim on it.
+
+        The caller MUST :meth:`release` it. When the room is held by
+        generations in flight, the claim waits for them (woken by each
+        release, never polling) up to ``admission_wait_s``; a refusal that
+        waiting cannot change -- a pinned model in the way, a model the card
+        cannot hold, a closed admission -- is raised at once."""
+        spec = self.store.resolve(name)
+        if spec is None:
+            raise ModelNotFound(f"model '{name}' not found")
+        wait_s = self.config.admission_wait_s or self.config.load_timeout_s
+        deadline = time.monotonic() + wait_s
+        waiter: Optional[_Waiter] = None
         try:
-            yield eng
+            while True:
+                changed = self._changed  # captured before the attempt: no lost wake-up
+                try:
+                    eng = await self._admit(spec, num_ctx)
+                    if eng is not None:
+                        return eng
+                    reason = f"queued behind {[w.name for w in self._waiters]}"
+                except _RoomHeld as held:
+                    reason = str(held)
+                    if waiter is None:
+                        waiter = _Waiter(spec.name, request_priority.get())
+                        self._waiters.append(waiter)
+                        logger.info("[Engine] %s admission waiting (%s): %s", spec.name,
+                                    waiter.priority, reason)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InsufficientVram(f"{reason} -- still held after {wait_s:.0f}s")
+                try:
+                    await asyncio.wait_for(changed.wait(), remaining)
+                except asyncio.TimeoutError:
+                    pass
         finally:
-            eng.inflight -= 1
-            eng.last_used = time.monotonic()
-            # A pinned model (the preloaded primary, JPRIME_ENGINE_PINNED) stays
-            # resident until evicted -- the operator's declaration -- unless the
-            # request itself states a keep_alive. Applying the default TTL to
-            # every request that named none turned "resident" into "unloaded
-            # five minutes after any request": from the first ordinary call
-            # after a preload, the 30B expired after every quiet spell all
-            # day, and each next command paid a ~13 s reload.
-            pinned_default = keep_alive is None and canonical_name(name) in self.config.pinned
+            if waiter is not None:
+                self._waiters.remove(waiter)
+                self._notify()  # claims queued behind this waiter re-plan
+
+    def release(self, eng: Engine, keep_alive: Any = None) -> None:
+        """Return a claim taken by :meth:`claim`, starting the keep-alive clock."""
+        eng.inflight -= 1
+        eng.last_used = time.monotonic()
+        # A pinned model (the preloaded primary, JPRIME_ENGINE_PINNED) stays
+        # resident until evicted -- the operator's declaration -- unless the
+        # request itself states a keep_alive. Applying the default TTL to
+        # every request that named none turned "resident" into "unloaded
+        # five minutes after any request": from the first ordinary call
+        # after a preload, the 30B expired after every quiet spell all
+        # day, and each next command paid a ~13 s reload.
+        if eng.inflight == 0:
+            pinned_default = keep_alive is None and eng.spec.name in self.config.pinned
             ttl = None if pinned_default else parse_keep_alive(keep_alive, self.config.default_keep_alive_s)
             if ttl is None:
                 eng.expires_at = eng.expires_wall = None
             else:
                 eng.expires_at = eng.last_used + ttl
                 eng.expires_wall = time.time() + ttl
+        self._notify()
+
+    async def ensure(self, name: str, num_ctx: Optional[int] = None) -> Engine:
+        """Make *name* resident without holding it (a load or a probe)."""
+        eng = await self.claim(name, num_ctx)
+        eng.inflight -= 1
+        self._notify()
+        return eng
+
+    @asynccontextmanager
+    async def acquire(self, name: str, num_ctx: Optional[int] = None,
+                      keep_alive: Any = None) -> AsyncIterator[Engine]:
+        eng = await self.claim(name, num_ctx)
+        try:
+            yield eng
+        finally:
+            self.release(eng, keep_alive)
 
     # -------------------------------------------------------------- unloading
     @staticmethod
@@ -647,6 +765,7 @@ class EnginePool:
         await asyncio.to_thread(self._terminate, eng)
         self._record_pids()
         logger.info("[Engine] unloaded %s", eng.spec.name)
+        self._notify()
         return True
 
     async def unload(self, name: str) -> bool:
